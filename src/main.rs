@@ -5,6 +5,8 @@ use color_eyre::Result;
 mod config;
 #[allow(dead_code)]
 mod dag;
+#[allow(dead_code)]
+mod llm;
 
 #[derive(Parser)]
 #[command(name = "koto", about = "Reproducible AI agent teams")]
