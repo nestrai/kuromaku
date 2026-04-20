@@ -1,0 +1,742 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>koto.yaml — reference card</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Caveat:wght@400;600;700&family=Kalam:wght@400;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet" />
+<style>
+  :root {
+    --ink: #1a1a1a;
+    --ink-soft: #2a2a2a;
+    --pencil: #6b6b6b;
+    --pencil-light: #a8a8a8;
+    --paper: #fbfaf5;
+    --paper-grid: #e9e5d8;
+    --req: #c0392b;
+    --opt: #2c6fb8;
+    --flow: #1d7a4a;
+    --parallel: #b8860b;
+    --hl: #fff2a8;
+    --hand: 'Kalam', 'Caveat', cursive;
+    --note: 'Caveat', cursive;
+    --mono: 'JetBrains Mono', ui-monospace, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background:
+      repeating-linear-gradient(0deg, transparent 0 31px, var(--paper-grid) 31px 32px),
+      repeating-linear-gradient(90deg, transparent 0 31px, var(--paper-grid) 31px 32px),
+      var(--paper);
+    color: var(--ink);
+    font-family: var(--hand);
+    font-size: 16px;
+    line-height: 1.45;
+    min-height: 100vh;
+  }
+  .page {
+    max-width: 1480px;
+    margin: 0 auto;
+    padding: 48px 56px 160px;
+  }
+  .brief {
+    display: grid;
+    grid-template-columns: 1.3fr 1fr;
+    gap: 40px;
+    align-items: end;
+    margin-bottom: 56px;
+    border-bottom: 1.5px dashed var(--pencil-light);
+    padding-bottom: 36px;
+  }
+  .brief h1 {
+    font-family: var(--note);
+    font-weight: 700;
+    font-size: 72px;
+    line-height: 0.95;
+    margin: 0 0 8px;
+    letter-spacing: -0.5px;
+  }
+  .brief h1 .mono-inline {
+    font-family: var(--mono);
+    font-size: 58px;
+    font-weight: 500;
+    padding: 0 8px;
+    background: var(--hl);
+    box-decoration-break: clone;
+  }
+  .brief .sub {
+    font-family: var(--note);
+    font-size: 26px;
+    color: var(--pencil);
+    margin-top: 4px;
+  }
+  .brief .meta {
+    font-family: var(--hand);
+    font-size: 15px;
+    color: var(--ink-soft);
+    line-height: 1.55;
+  }
+  .brief .meta b { background: var(--hl); padding: 0 3px; }
+  .brief .meta .row { display: flex; gap: 24px; flex-wrap: wrap; margin-top: 10px; }
+  .brief .meta .row > div { border-left: 2px solid var(--ink); padding-left: 10px; }
+  .brief .meta .row .k { font-family: var(--note); font-size: 18px; color: var(--pencil); display: block; }
+  .brief .meta .row .v { font-family: var(--mono); font-size: 13px; }
+
+  .legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 22px;
+    font-family: var(--hand);
+    font-size: 14px;
+    margin-bottom: 40px;
+    padding: 14px 18px;
+    background: #fffdf3;
+    border: 1.5px solid var(--ink);
+    border-radius: 4px;
+    box-shadow: 3px 3px 0 var(--ink);
+  }
+  .legend b { font-family: var(--note); font-size: 20px; margin-right: 8px; }
+  .legend .sw { display: inline-flex; align-items: center; gap: 8px; }
+  .legend .dot { width: 14px; height: 14px; border-radius: 3px; border: 1.5px solid var(--ink); }
+  .legend .dot.req { background: var(--req); }
+  .legend .dot.opt { background: var(--opt); }
+  .legend .dot.flow { background: var(--flow); }
+  .legend .dot.hl { background: var(--hl); }
+
+  /* Section headers */
+  .section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 18px;
+    margin: 56px 0 20px;
+    padding-bottom: 10px;
+    border-bottom: 2px solid var(--ink);
+  }
+  .section-head .num {
+    font-family: var(--note);
+    font-size: 64px;
+    font-weight: 700;
+    line-height: 0.8;
+    color: var(--ink);
+  }
+  .section-head h2 {
+    font-family: var(--note);
+    font-weight: 700;
+    font-size: 40px;
+    margin: 0;
+    line-height: 1;
+  }
+  .section-head .tag {
+    font-family: var(--hand);
+    font-size: 14px;
+    color: var(--pencil);
+    margin-left: auto;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+
+  /* Common card */
+  .card {
+    background: #fffef8;
+    border: 1.5px solid var(--ink);
+    border-radius: 6px;
+    box-shadow: 4px 4px 0 var(--ink);
+    padding: 20px 22px;
+    position: relative;
+  }
+  .card .label {
+    position: absolute;
+    top: -14px;
+    left: 18px;
+    background: var(--paper);
+    padding: 0 10px;
+    font-family: var(--note);
+    font-size: 22px;
+    font-weight: 700;
+  }
+  .card .sublabel {
+    font-family: var(--hand);
+    font-size: 13px;
+    color: var(--pencil);
+    margin-bottom: 10px;
+  }
+
+  /* YAML blocks */
+  pre.yaml {
+    font-family: var(--mono);
+    font-size: 13.5px;
+    line-height: 1.65;
+    margin: 0;
+    white-space: pre;
+    color: var(--ink);
+    tab-size: 2;
+    overflow: auto;
+  }
+  .yaml .key { color: var(--ink); font-weight: 500; }
+  .yaml .val { color: var(--ink-soft); }
+  .yaml .str { color: #6b4a1f; }
+  .yaml .comment { color: var(--pencil); font-style: italic; }
+  .yaml .req-key { color: var(--req); font-weight: 700; position: relative; }
+  .yaml .opt-key { color: var(--opt); }
+  .yaml .stage-kw { background: var(--hl); padding: 0 2px; }
+  .yaml .needs { color: var(--flow); font-weight: 600; }
+  .yaml .arrow { color: var(--flow); }
+
+  /* Annotations */
+  .ann {
+    font-family: var(--note);
+    font-size: 18px;
+    color: var(--ink-soft);
+  }
+  .ann.red { color: var(--req); }
+  .ann.blue { color: var(--opt); }
+  .ann.green { color: var(--flow); }
+  .ann.amber { color: var(--parallel); }
+
+  /* ANATOMY */
+  .anatomy-grid {
+    display: grid;
+    grid-template-columns: minmax(520px, 1fr) 420px;
+    gap: 60px;
+    align-items: start;
+  }
+  .anatomy-yaml {
+    position: relative;
+    padding: 28px 30px;
+  }
+  .anatomy-yaml .title-strip {
+    position: absolute;
+    top: -16px; left: 20px;
+    background: var(--ink); color: var(--paper);
+    font-family: var(--mono);
+    font-size: 13px;
+    padding: 4px 12px;
+    letter-spacing: 1px;
+  }
+  .callouts {
+    position: relative;
+  }
+  .callout {
+    position: relative;
+    padding: 10px 12px 10px 14px;
+    margin-bottom: 12px;
+    background: #fffef8;
+    border: 1.5px solid var(--ink);
+    border-radius: 4px;
+    font-family: var(--hand);
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .callout .n {
+    display: inline-block;
+    width: 22px; height: 22px;
+    border-radius: 50%;
+    background: var(--ink);
+    color: var(--paper);
+    font-family: var(--note);
+    font-size: 16px;
+    text-align: center;
+    line-height: 22px;
+    margin-right: 8px;
+    vertical-align: 2px;
+  }
+  .callout b { font-family: var(--mono); font-size: 13px; background: var(--hl); padding: 0 3px; }
+  .callout.req { border-left: 6px solid var(--req); }
+  .callout.opt { border-left: 6px solid var(--opt); }
+  .callout.flow { border-left: 6px solid var(--flow); }
+
+  /* BLUEPRINT STAGE DIAGRAM */
+  .stages-diagram {
+    padding: 30px 28px;
+    min-height: 360px;
+  }
+  .stage-row {
+    display: grid;
+    grid-template-columns: 110px 1fr 110px;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 10px;
+  }
+  .stage-label {
+    font-family: var(--note);
+    font-size: 20px;
+    text-align: right;
+  }
+  .stage-label small { display:block; font-family: var(--hand); font-size: 12px; color: var(--pencil); }
+  .stage-box {
+    border: 1.5px solid var(--ink);
+    background: #fffef8;
+    border-radius: 5px;
+    padding: 10px 14px;
+    font-family: var(--mono);
+    font-size: 13px;
+    box-shadow: 2px 2px 0 var(--ink);
+    position: relative;
+    min-height: 56px;
+  }
+  .stage-box .role { font-family: var(--hand); font-size: 13px; color: var(--pencil); font-style: italic; }
+  .stage-box.parallel-group {
+    border-style: dashed;
+    border-color: var(--parallel);
+    padding: 14px;
+    background: #fffbe8;
+    display: flex;
+    gap: 12px;
+  }
+  .stage-box.parallel-group .stage-box {
+    flex: 1;
+    box-shadow: 1.5px 1.5px 0 var(--ink);
+  }
+  .stage-box.parallel-group::before {
+    content: 'default (no needs)';
+    position: absolute;
+    top: -12px; left: 10px;
+    background: var(--parallel);
+    color: #fff;
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 2px 8px;
+    border-radius: 3px;
+    letter-spacing: 1px;
+  }
+  .artifact-flow {
+    position: relative;
+    height: 28px;
+    margin: 2px 0;
+  }
+  .artifact-flow::before {
+    content: '';
+    position: absolute;
+    left: 50%;
+    top: 0; bottom: 0;
+    width: 2px;
+    background: repeating-linear-gradient(to bottom, var(--flow) 0 4px, transparent 4px 8px);
+  }
+  .artifact-flow .tag {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--flow);
+    background: var(--paper);
+    padding: 0 6px;
+    border: 1.5px solid var(--flow);
+    border-radius: 3px;
+    white-space: nowrap;
+  }
+  .artifact-flow::after {
+    content: '\u25bc';
+    position: absolute;
+    left: 50%;
+    bottom: -2px;
+    transform: translateX(-50%);
+    color: var(--flow);
+    font-size: 12px;
+  }
+
+  /* SCHEMA TABLE */
+  .schema-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 28px;
+  }
+  table.schema {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 12.5px;
+  }
+  table.schema th {
+    text-align: left;
+    font-family: var(--note);
+    font-size: 16px;
+    font-weight: 700;
+    padding: 4px 8px 6px;
+    border-bottom: 2px solid var(--ink);
+    color: var(--pencil);
+    text-transform: uppercase;
+    letter-spacing: 1px;
+  }
+  table.schema td {
+    padding: 7px 8px;
+    border-bottom: 1px dashed var(--pencil-light);
+    vertical-align: top;
+  }
+  table.schema td.req { color: var(--req); font-weight: 600; }
+  table.schema td.opt { color: var(--opt); }
+  table.schema td.type { font-size: 11px; color: var(--pencil); }
+  table.schema td.note { font-family: var(--hand); font-size: 13px; color: var(--ink-soft); }
+  table.schema tr.group td {
+    background: #f3efe0;
+    font-family: var(--note);
+    font-size: 18px;
+    padding: 6px 8px;
+    color: var(--ink);
+    font-weight: 700;
+    border-bottom: 2px solid var(--ink);
+    border-top: 2px solid var(--ink);
+  }
+  .pill {
+    display: inline-block;
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    border: 1px solid currentColor;
+    letter-spacing: 0.5px;
+  }
+  .pill.req { color: var(--req); background: #fde8e4; }
+  .pill.opt { color: var(--opt); background: #e4edf8; }
+
+  /* HERO */
+  .hero-grid {
+    display: grid;
+    grid-template-columns: 0.7fr 1.3fr;
+    gap: 32px;
+    align-items: start;
+  }
+  .example-block { padding: 22px 24px; }
+  .example-block h3 {
+    font-family: var(--note);
+    font-size: 28px;
+    margin: 0 0 2px;
+  }
+  .example-block .desc {
+    font-family: var(--hand);
+    font-size: 13px;
+    color: var(--pencil);
+    margin-bottom: 14px;
+  }
+  .example-block .lines {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--pencil);
+    margin-top: 10px;
+  }
+
+  /* small screen fallback */
+  @media (max-width: 1100px) {
+    .anatomy-grid, .schema-grid, .hero-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<div class="page">
+
+  <!-- BRIEF -->
+  <header class="brief">
+    <div>
+      <h1><span class="mono-inline">koto.yaml</span><br/>reference card</h1>
+      <div class="sub">how developers read the spec at a glance</div>
+    </div>
+    <div class="meta">
+      <div><b>koto</b> -- a CLI for reproducible AI agent teams. Think <i>docker-compose for agents</i>. Define your team in YAML, run <code>koto up</code>.</div>
+      <div class="row">
+        <div><span class="k">format</span><span class="v">YAML</span></div>
+        <div><span class="k">audience</span><span class="v">CI/CD devs</span></div>
+        <div><span class="k">sections</span><span class="v">header / agents / flow / state</span></div>
+        <div><span class="k">min config</span><span class="v">4 lines</span></div>
+      </div>
+    </div>
+  </header>
+
+  <!-- LEGEND -->
+  <div class="legend">
+    <b>Legend</b>
+    <span class="sw"><span class="dot req"></span> required field</span>
+    <span class="sw"><span class="dot opt"></span> optional (has default)</span>
+    <span class="sw"><span class="dot flow"></span> artifact flow / dependency</span>
+    <span class="sw"><span class="dot hl"></span> orchestration keyword</span>
+  </div>
+
+  <!-- SECTION A: ANATOMY -->
+  <div class="section-head">
+    <div class="num">A.</div>
+    <h2>Anatomy -- annotated YAML</h2>
+    <div class="tag">documentation / readme hero</div>
+  </div>
+  <p class="ann" style="max-width:780px;margin:0 0 18px;">A single labelled block where every field is numbered, and the right rail explains each one. Default behaviour: stages run in parallel. Use <code>needs</code> for sequencing.</p>
+
+  <div class="anatomy-grid">
+    <div class="card anatomy-yaml">
+      <div class="title-strip">koto.yaml</div>
+<pre class="yaml">
+<span class="comment"># -- HEADER -----------------------------------------</span>
+<span class="req-key">version</span>: <span class="str">"1"</span>                       <span class="comment"># 1 schema version</span>
+<span class="req-key">name</span>:    <span class="str">blog-pipeline</span>             <span class="comment"># 2 project name</span>
+
+<span class="comment"># -- AGENTS -----------------------------------------</span>
+<span class="req-key">agents</span>:                                <span class="comment"># 3 the ensemble</span>
+  - <span class="req-key">id</span>:      researcher              <span class="comment"># 4 unique handle</span>
+    <span class="req-key">role</span>:    <span class="str">"Research latest AI news"</span>
+    <span class="opt-key">model</span>:   claude-sonnet-4-5       <span class="comment"># 5 default</span>
+    <span class="opt-key">context</span>: [<span class="str">"sources/**/*.md"</span>]     <span class="comment"># 6 file globs</span>
+
+  - <span class="req-key">id</span>:   writer
+    <span class="req-key">role</span>: <span class="str">"Draft blog post"</span>
+  - <span class="req-key">id</span>:   editor
+    <span class="req-key">role</span>: <span class="str">"Copy-edit &amp; fact-check"</span>
+  - <span class="req-key">id</span>:   seo
+    <span class="req-key">role</span>: <span class="str">"Optimise headline &amp; meta"</span>
+
+<span class="comment"># -- FLOW -------------------------------------------</span>
+<span class="stage-kw">flow</span>:                                  <span class="comment"># 7 orchestration</span>
+  <span class="req-key">stages</span>:                              <span class="comment"># 8 default: parallel</span>
+    - <span class="req-key">id</span>: research
+      <span class="req-key">agent</span>: researcher
+      <span class="opt-key">output</span>: research.md              <span class="comment"># 9 artifact out</span>
+
+    - <span class="req-key">id</span>: draft                       <span class="comment"># 10 runs parallel to seo</span>
+      <span class="req-key">agent</span>: writer
+      <span class="needs">needs</span>: [research]                <span class="comment"># 11 waits for research</span>
+      <span class="opt-key">input</span>:  research.md              <span class="comment"># 12 artifact in</span>
+      <span class="opt-key">output</span>: draft.md
+
+    - <span class="req-key">id</span>: seo-check                   <span class="comment"># 10 runs parallel to draft</span>
+      <span class="req-key">agent</span>: seo
+      <span class="needs">needs</span>: [research]
+
+    - <span class="req-key">id</span>: edit
+      <span class="req-key">agent</span>: editor
+      <span class="needs">needs</span>: [draft, seo-check]        <span class="comment"># 13 waits for both</span>
+      <span class="opt-key">input</span>:  draft.md
+      <span class="opt-key">output</span>: final.md
+
+<span class="comment"># -- STATE ------------------------------------------</span>
+<span class="opt-key">state</span>:                                 <span class="comment"># 14 defaults to local</span>
+  <span class="req-key">backend</span>: local
+  <span class="opt-key">path</span>:    .koto/state
+</pre>
+    </div>
+
+    <div class="callouts">
+      <div class="callout req"><span class="n">1</span><b>version</b> -- locks the schema. Always <b>"1"</b> today. Required so breaking changes can ship later.</div>
+      <div class="callout req"><span class="n">2</span><b>name</b> -- human-readable project id. Shows up in <b>koto ls</b> and state file.</div>
+      <div class="callout req"><span class="n">3</span><b>agents</b> -- list of the players in the ensemble. At least one.</div>
+      <div class="callout req"><span class="n">4</span><b>id</b> -- unique handle used in flow stages. snake_case recommended.</div>
+      <div class="callout opt"><span class="n">5</span><b>model</b> -- picks an LLM. Defaults to <b>claude-sonnet-4-5</b>.</div>
+      <div class="callout opt"><span class="n">6</span><b>context</b> -- file globs mounted read-only for the agent.</div>
+      <div class="callout"><span class="n">7</span><b>flow</b> -- how agents are orchestrated. Absent = all agents run once in parallel.</div>
+      <div class="callout req"><span class="n">8</span><b>stages</b> -- list of work units. Default: all run in parallel. Use <b>needs</b> for ordering.</div>
+      <div class="callout flow"><span class="n">9</span><b>output</b> -- file this stage writes to the shared workspace.</div>
+      <div class="callout"><span class="n">10</span>Stages without mutual <b>needs</b> run concurrently -- draft and seo-check start at the same time.</div>
+      <div class="callout flow"><span class="n">11</span><b>needs</b> -- declares which stages must finish first. The only sequencing mechanism.</div>
+      <div class="callout flow"><span class="n">12</span><b>input</b> -- file(s) mounted for this stage. Declares the data dependency.</div>
+      <div class="callout flow"><span class="n">13</span>Multiple <b>needs</b> = wait for all. edit starts only after both draft and seo-check finish.</div>
+      <div class="callout opt"><span class="n">14</span><b>state</b> -- where run state lives. <b>local</b> (default) or remote s3/gcs/http.</div>
+    </div>
+  </div>
+
+  <!-- SECTION B: BLUEPRINT -->
+  <div class="section-head">
+    <div class="num">B.</div>
+    <h2>Blueprint -- flow as a diagram</h2>
+    <div class="tag">mental model</div>
+  </div>
+  <p class="ann" style="max-width:780px;margin:0 0 18px;">YAML on the left, the stage graph on the right. Stages without <code>needs</code> run in parallel by default. Only <code>needs</code> creates ordering.</p>
+
+  <div class="anatomy-grid">
+    <div class="card" style="padding:26px 28px;">
+      <div class="label">koto.yaml (flow only)</div>
+<pre class="yaml">
+<span class="stage-kw">flow</span>:
+  stages:
+    - id: research
+      agent: researcher
+      output: <span class="str">research.md</span>
+
+    - id: draft
+      agent: writer
+      <span class="needs">needs</span>: [research]
+      input: <span class="str">research.md</span>
+      output: <span class="str">draft.md</span>
+
+    - id: images
+      agent: illustrator
+      <span class="needs">needs</span>: [research]
+      input: <span class="str">research.md</span>
+      output: <span class="str">images/*.png</span>
+
+    - id: edit
+      agent: editor
+      <span class="needs">needs</span>: [draft, images]
+      input: [<span class="str">draft.md</span>, <span class="str">images/*.png</span>]
+      output: <span class="str">final.md</span>
+
+    - id: publish
+      agent: publisher
+      <span class="needs">needs</span>: [edit]
+      input: <span class="str">final.md</span>
+</pre>
+    </div>
+
+    <div class="card stages-diagram">
+      <div class="label">rendered flow</div>
+      <div class="sublabel">top to bottom = execution order / green dashes = artifacts / needs = sequencing</div>
+
+      <div class="stage-row">
+        <div class="stage-label">stage 1<small>no needs = starts first</small></div>
+        <div class="stage-box">
+          research<div class="role">agent: researcher</div>
+        </div>
+        <div class="ann green">-> research.md</div>
+      </div>
+
+      <div class="artifact-flow"><span class="tag">research.md</span></div>
+
+      <div class="stage-row">
+        <div class="stage-label">stage 2<small>needs: [research]</small></div>
+        <div class="stage-box parallel-group">
+          <div class="stage-box">draft<div class="role">agent: writer</div></div>
+          <div class="stage-box">images<div class="role">agent: illustrator</div></div>
+        </div>
+        <div class="ann amber">same needs = parallel</div>
+      </div>
+
+      <div class="artifact-flow"><span class="tag">draft.md + images/*</span></div>
+
+      <div class="stage-row">
+        <div class="stage-label">stage 3<small>needs: [draft, images]</small></div>
+        <div class="stage-box">
+          edit<div class="role">agent: editor</div>
+        </div>
+        <div class="ann green">-> final.md</div>
+      </div>
+
+      <div class="artifact-flow"><span class="tag">final.md</span></div>
+
+      <div class="stage-row">
+        <div class="stage-label">stage 4<small>needs: [edit]</small></div>
+        <div class="stage-box">
+          publish<div class="role">agent: publisher</div>
+        </div>
+        <div class="ann">done</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- SECTION C: SCHEMA TABLE -->
+  <div class="section-head">
+    <div class="num">C.</div>
+    <h2>Schema card -- field table</h2>
+    <div class="tag">cheat sheet</div>
+  </div>
+  <p class="ann" style="max-width:780px;margin:0 0 18px;">Every field, its type, whether it's required, and a one-line note.</p>
+
+  <div class="schema-grid">
+    <div class="card" style="padding: 18px 20px;">
+      <table class="schema">
+        <thead><tr><th>field</th><th>type</th><th>req</th><th>notes</th></tr></thead>
+        <tbody>
+          <tr class="group"><td colspan="4">header</td></tr>
+          <tr><td>version</td><td class="type">string "1"</td><td><span class="pill req">req</span></td><td class="note">schema lock</td></tr>
+          <tr><td>name</td><td class="type">string</td><td><span class="pill req">req</span></td><td class="note">project id</td></tr>
+
+          <tr class="group"><td colspan="4">agents[]</td></tr>
+          <tr><td>.id</td><td class="type">string</td><td><span class="pill req">req</span></td><td class="note">unique per file</td></tr>
+          <tr><td>.role</td><td class="type">string</td><td><span class="pill req">req</span></td><td class="note">natural-lang job description</td></tr>
+          <tr><td>.model</td><td class="type">string</td><td><span class="pill opt">opt</span></td><td class="note">default: claude-sonnet-4-5</td></tr>
+          <tr><td>.context</td><td class="type">string[] (globs)</td><td><span class="pill opt">opt</span></td><td class="note">read-only files mounted</td></tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="card" style="padding: 18px 20px;">
+      <table class="schema">
+        <thead><tr><th>field</th><th>type</th><th>req</th><th>notes</th></tr></thead>
+        <tbody>
+          <tr class="group"><td colspan="4">flow</td></tr>
+          <tr><td>.stages[]</td><td class="type">Stage[]</td><td><span class="pill req">req</span></td><td class="note">default: all parallel</td></tr>
+          <tr><td>.stages[].id</td><td class="type">string</td><td><span class="pill req">req</span></td><td class="note">referenced by <code>needs</code></td></tr>
+          <tr><td>.stages[].agent</td><td class="type">agent-id</td><td><span class="pill req">req</span></td><td class="note">which agent runs this</td></tr>
+          <tr><td>.stages[].needs</td><td class="type">string[]</td><td><span class="pill opt">opt</span></td><td class="note">stages that must finish first</td></tr>
+          <tr><td>.stages[].input</td><td class="type">string | string[]</td><td><span class="pill opt">opt</span></td><td class="note">artifacts consumed</td></tr>
+          <tr><td>.stages[].output</td><td class="type">string | string[]</td><td><span class="pill opt">opt</span></td><td class="note">artifacts produced</td></tr>
+          <tr><td>.stages[].task</td><td class="type">string</td><td><span class="pill opt">opt</span></td><td class="note">override task description</td></tr>
+
+          <tr class="group"><td colspan="4">state</td></tr>
+          <tr><td>.backend</td><td class="type">"local" | "s3" | "gcs"</td><td><span class="pill opt">opt</span></td><td class="note">default: local</td></tr>
+          <tr><td>.path / .bucket</td><td class="type">string</td><td><span class="pill opt">opt</span></td><td class="note">backend-specific</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- SECTION D: HERO EXAMPLES -->
+  <div class="section-head">
+    <div class="num">D.</div>
+    <h2>Hero -- minimal &amp; full, side by side</h2>
+    <div class="tag">readme top-fold</div>
+  </div>
+  <p class="ann" style="max-width:780px;margin:0 0 18px;">The "zero-to-sixty" pitch. 4-line hello-world on the left; the full multi-agent flow on the right.</p>
+
+  <div class="hero-grid">
+    <div class="card example-block">
+      <h3>minimal</h3>
+      <div class="desc">4 lines. one agent. no flow needed.</div>
+<pre class="yaml">
+<span class="req-key">version</span>: <span class="str">"1"</span>
+<span class="req-key">name</span>:    hello
+<span class="req-key">agents</span>:
+  - { <span class="req-key">id</span>: bot, <span class="req-key">role</span>: <span class="str">"say hi"</span> }
+</pre>
+      <div class="lines">$ koto up  ->  runs bot once, prints output</div>
+    </div>
+
+    <div class="card example-block">
+      <h3>full</h3>
+      <div class="desc">4 agents / 4 stages / parallel by default / needs for sequencing</div>
+<pre class="yaml">
+<span class="req-key">version</span>: <span class="str">"1"</span>
+<span class="req-key">name</span>:    blog-pipeline
+
+<span class="req-key">agents</span>:
+  - { <span class="req-key">id</span>: researcher,  <span class="req-key">role</span>: <span class="str">"Research latest AI news"</span>,
+      <span class="opt-key">context</span>: [<span class="str">"sources/**/*.md"</span>] }
+  - { <span class="req-key">id</span>: writer,      <span class="req-key">role</span>: <span class="str">"Draft blog post"</span> }
+  - { <span class="req-key">id</span>: illustrator, <span class="req-key">role</span>: <span class="str">"Generate hero images"</span>,
+      <span class="opt-key">model</span>: claude-opus-4-5 }
+  - { <span class="req-key">id</span>: editor,      <span class="req-key">role</span>: <span class="str">"Copy-edit &amp; fact-check"</span> }
+
+<span class="stage-kw">flow</span>:
+  stages:
+    - <span class="req-key">id</span>: research
+      <span class="req-key">agent</span>: researcher
+      <span class="opt-key">output</span>: <span class="str">research.md</span>
+
+    - <span class="req-key">id</span>: draft
+      <span class="req-key">agent</span>: writer
+      <span class="needs">needs</span>: [research]
+      <span class="opt-key">input</span>: <span class="str">research.md</span>
+      <span class="opt-key">output</span>: <span class="str">draft.md</span>
+
+    - <span class="req-key">id</span>: images
+      <span class="req-key">agent</span>: illustrator
+      <span class="needs">needs</span>: [research]
+      <span class="opt-key">input</span>: <span class="str">research.md</span>
+      <span class="opt-key">output</span>: <span class="str">img/*.png</span>
+
+    - <span class="req-key">id</span>: edit
+      <span class="req-key">agent</span>: editor
+      <span class="needs">needs</span>: [draft, images]
+      <span class="opt-key">input</span>:  [<span class="str">draft.md</span>, <span class="str">img/*.png</span>]
+      <span class="opt-key">output</span>: <span class="str">final.md</span>
+
+<span class="opt-key">state</span>:
+  <span class="req-key">backend</span>: local
+  <span class="opt-key">path</span>:    .koto/state
+</pre>
+      <div class="lines">$ koto up  ->  research -> (draft | images) -> edit</div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>
