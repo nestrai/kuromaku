@@ -1,6 +1,9 @@
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 
+#[allow(dead_code)]
+mod config;
+
 #[derive(Parser)]
 #[command(name = "koto", about = "Reproducible AI agent teams")]
 struct Cli {

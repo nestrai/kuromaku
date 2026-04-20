@@ -12,6 +12,7 @@ serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
 color-eyre = "0.6"
+thiserror = "2"
 
 [dev-dependencies]
 assert_cmd = "2"
