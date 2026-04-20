@@ -7,6 +7,8 @@ mod config;
 mod dag;
 #[allow(dead_code)]
 mod llm;
+#[allow(dead_code)]
+mod ui;
 
 #[derive(Parser)]
 #[command(name = "koto", about = "Reproducible AI agent teams")]
