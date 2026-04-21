@@ -2,38 +2,35 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::config::{Agent, Backend, FlowConfig, Stage, TaskSource};
+use crate::config::{Agent, Backend, Step};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorTarget};
 use crate::llm::{self, LlmRequest, Message, Role};
 use crate::skills;
-use crate::state::{self, StageOutput};
-use crate::ui::{self, StageInfo, StageState};
+use crate::stack::{self, StepOutput};
+use crate::ui::{self, StepInfo, StepState};
 
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
-    #[error("stage '{stage}' references unknown agent '{agent}'")]
-    UnknownAgent { stage: String, agent: String },
+    #[error("step '{step}' references unknown agent '{agent}'")]
+    UnknownAgent { step: String, agent: String },
 
-    #[error("stage '{stage}' failed: {source}")]
+    #[error("step '{step}' failed: {source}")]
     LlmFailed {
-        stage: String,
+        step: String,
         source: llm::LlmError,
     },
 
-    #[error("stage '{stage}' execution failed: {source}")]
+    #[error("step '{step}' execution failed: {source}")]
     ExecutorFailed {
-        stage: String,
+        step: String,
         source: executor::ExecutorError,
     },
 
-    #[error("state error in stage '{stage}': {source}")]
-    State {
-        stage: String,
-        source: state::StateError,
+    #[error("stack error in step '{step}': {source}")]
+    Stack {
+        step: String,
+        source: stack::StackError,
     },
-
-    #[error("template tasks are not yet supported (stage '{0}')")]
-    TemplateNotSupported(String),
 
     #[error("rules file not found: {0}")]
     RulesNotFound(String),
@@ -42,15 +39,22 @@ pub enum RunError {
     Skill(#[from] skills::SkillsError),
 }
 
-/// Result of running a single stage, used for the summary table.
-pub struct StageRunResult {
-    pub stage_id: String,
-    pub agent_id: String,
+/// Result of running a single step, used for the summary table.
+pub struct StepRunResult {
+    pub step_id: String,
+    pub agent_name: String,
     pub backend: Backend,
     pub duration: std::time::Duration,
     pub tokens_in: Option<u32>,
     pub tokens_out: Option<u32>,
     pub output_file: String,
+}
+
+/// Generate an auto-named output filename: `<flow>-<timestamp>-<step>-<agent>.md`
+fn auto_output_filename(flow_name: &str, step_id: &str, agent_name: &str) -> String {
+    let now = chrono::Local::now();
+    let ts = now.format("%Y%m%d-%H%M");
+    format!("{flow_name}-{ts}-{step_id}-{agent_name}.md")
 }
 
 /// Load `.koto/Guide.md` if it exists.
@@ -69,7 +73,7 @@ pub fn load_rules_for_agents(
     let rules_dir = koto_dir.join("rules");
 
     for agent in agents {
-        if let Some(ref rules_name) = agent.rules {
+        for rules_name in &agent.rules {
             if cache.contains_key(rules_name) {
                 continue;
             }
@@ -101,76 +105,83 @@ fn build_system_prompt(
         parts.push(guide_content);
     }
 
-    let rules_content;
-    if let Some(ref rules_name) = agent.rules
-        && let Some(content) = rules_cache.get(rules_name)
-    {
-        rules_content = content.clone();
-        parts.push(&rules_content);
+    // Append all rules in order
+    for rules_name in &agent.rules {
+        if let Some(content) = rules_cache.get(rules_name) {
+            parts.push(content);
+        }
     }
 
     // Append skills content in order
-    let skill_contents: Vec<&str> = agent
-        .skills
-        .iter()
-        .filter_map(|name| skills_cache.get(name).map(|s| s.as_str()))
-        .collect();
-    for content in &skill_contents {
-        parts.push(content);
+    for skill_name in &agent.skills {
+        if let Some(content) = skills_cache.get(skill_name) {
+            parts.push(content);
+        }
     }
 
     parts.push(&agent.role);
     parts.join("\n\n")
 }
 
-/// Build the user-facing prompt with context from prior stages.
+/// Build the user-facing prompt with context from prior steps.
 fn build_user_prompt(
-    task_text: &str,
-    stage: &Stage,
-    state_path: &Path,
+    task: &str,
+    step: &Step,
+    stack_path: &Path,
 ) -> Result<String, RunError> {
     let mut context_parts: Vec<String> = Vec::new();
-    for input_id in &stage.input {
-        let prior = state::read_stage(state_path, input_id).map_err(|e| RunError::State {
-            stage: stage.id.clone(),
+    for input_id in &step.input {
+        let prior = stack::read_step(stack_path, input_id).map_err(|e| RunError::Stack {
+            step: step.id.clone(),
             source: e,
         })?;
-        let output_label = prior.stage_id.clone();
+        let output_label = prior.step_id.clone();
         ui::print_context_injection(&output_label, &format!("{input_id}.json"), "");
         context_parts.push(format!(
-            "--- Output from stage '{output_label}' ---\n{}\n---",
+            "--- Output from step '{output_label}' ---\n{}\n---",
             prior.response
         ));
     }
 
-    let mut user_content = task_text.to_string();
+    let mut user_content = task.to_string();
+
+    // If step has a focus, prepend it
+    if let Some(ref focus) = step.focus {
+        user_content = format!("{user_content}\n\nFocus: {focus}");
+    }
+
     if !context_parts.is_empty() {
         user_content = format!(
-            "{user_content}\n\nContext from previous stages:\n\n{}",
+            "{user_content}\n\nContext from previous steps:\n\n{}",
             context_parts.join("\n\n")
         );
     }
     Ok(user_content)
 }
 
-/// Run a stage via the Executor (CLI backends: claude-cli, ollama).
-async fn run_stage_via_executor(
+/// Run a step via the Executor (CLI backends: claude-cli, ollama).
+async fn run_step_via_executor(
     executor: &dyn ExecutorBoxed,
-    stage: &Stage,
+    step: &Step,
     flow_name: &str,
     system_prompt: &str,
     user_content: &str,
     model: &str,
     backend: Backend,
 ) -> Result<(String, Option<llm::Usage>), RunError> {
-    let task_id = format!("koto-{flow_name}-{}", stage.id);
+    // Build unique session name: koto-<project>-<flow>-<step>-<short-id>
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let short_id = &chrono::Utc::now().timestamp_millis().to_string()[8..];
+    let task_id = format!("koto-{project}-{flow_name}-{}-{short_id}", step.id);
 
     let command = match backend {
         Backend::ClaudeCli => {
             executor::build_claude_command(model, Some(system_prompt), user_content)
         }
         Backend::Ollama => {
-            // For ollama, fold system prompt into user content
             let mut prompt = String::new();
             prompt.push_str(&format!("System: {system_prompt}\n\n"));
             prompt.push_str(&format!("User: {user_content}"));
@@ -189,7 +200,7 @@ async fn run_stage_via_executor(
         .spawn_boxed(task)
         .await
         .map_err(|e| RunError::ExecutorFailed {
-            stage: stage.id.clone(),
+            step: step.id.clone(),
             source: e,
         })?;
 
@@ -197,91 +208,102 @@ async fn run_stage_via_executor(
         .wait_boxed(&handle)
         .await
         .map_err(|e| RunError::ExecutorFailed {
-            stage: stage.id.clone(),
+            step: step.id.clone(),
             source: e,
         })?;
 
     Ok((output.stdout, None))
 }
 
-/// Run a stage via the API client directly (no executor needed).
-async fn run_stage_via_api(
+/// Run a step via the API client directly (no executor needed).
+async fn run_step_via_api(
     request: LlmRequest,
-    stage_id: &str,
+    step_id: &str,
 ) -> Result<(String, Option<llm::Usage>), RunError> {
     let client = llm::ApiClient::from_env();
     let response = client
         .send(request)
         .await
         .map_err(|e| RunError::LlmFailed {
-            stage: stage_id.to_string(),
+            step: step_id.to_string(),
             source: e,
         })?;
     Ok((response.content, response.usage))
 }
 
-/// Run stages sequentially in topological order.
+/// Run steps sequentially in topological order.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_stages(
-    config: &FlowConfig,
-    stages: &[&Stage],
-    state_path: &Path,
+pub async fn run_steps(
+    steps: &[&Step],
+    agents: &[Agent],
+    task: &str,
+    stack_path: &Path,
     flow_name: &str,
     guide: &Option<String>,
     rules_cache: &HashMap<String, String>,
     skills_cache: &HashMap<String, String>,
     executor_target: &ExecutorTarget,
-) -> Result<Vec<StageRunResult>, RunError> {
-    let agents: HashMap<&str, &Agent> = config.agents.iter().map(|a| (a.id.as_str(), a)).collect();
-    let total = stages.len();
+) -> Result<Vec<StepRunResult>, RunError> {
+    let agent_map: HashMap<&str, &Agent> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
+    let total = steps.len();
     let mut results = Vec::with_capacity(total);
 
-    // Create executor for CLI backends
     let executor = executor::create_executor(executor_target);
 
-    for (i, stage) in stages.iter().enumerate() {
-        let agent = agents
-            .get(stage.agent.as_str())
+    for (i, step) in steps.iter().enumerate() {
+        let agent = agent_map
+            .get(step.agent.as_str())
             .ok_or_else(|| RunError::UnknownAgent {
-                stage: stage.id.clone(),
-                agent: stage.agent.clone(),
+                step: step.id.clone(),
+                agent: step.agent.clone(),
             })?;
 
-        let effective_model = stage.model.as_deref().unwrap_or(&agent.model);
-        let effective_backend = stage.backend.unwrap_or(agent.backend);
+        let effective_model = step.model.as_deref().unwrap_or(&agent.model);
+        let effective_backend = step.backend.unwrap_or(agent.backend);
 
-        let stage_info = StageInfo {
-            id: stage.id.clone(),
-            agent: agent.id.clone(),
-            role: agent.role.clone(),
+        let step_info = StepInfo {
+            id: step.id.clone(),
+            agent: agent.name.clone(),
             model: effective_model.to_string(),
             backend: effective_backend,
-            input: stage.input.clone(),
-            output: stage.output.clone().unwrap_or_else(|| "stdout".to_string()),
-            state: StageState::Running,
+            input: step.input.clone(),
+            state: StepState::Running,
         };
 
-        ui::print_stage_banner(i + 1, total, &stage_info);
+        ui::print_step_banner(i + 1, total, &step_info);
 
-        let task_text = match &stage.task {
-            TaskSource::Inline(text) => text.clone(),
-            TaskSource::Template { .. } => {
-                return Err(RunError::TemplateNotSupported(stage.id.clone()));
-            }
+        // First step gets the task as prompt, subsequent steps get focus or a default
+        let step_task = if i == 0 {
+            task.to_string()
+        } else if let Some(ref focus) = step.focus {
+            focus.clone()
+        } else {
+            task.to_string()
         };
 
-        let user_content = build_user_prompt(&task_text, stage, state_path)?;
+        let user_content = build_user_prompt(&step_task, step, stack_path)?;
 
-        ui::print_thinking(&task_text);
+        // Pre-compute output path and show it immediately so user can tail -f
+        let output_file = auto_output_filename(flow_name, &step.id, &agent.name);
+        let output_path = stack_path.join(&output_file);
+        if let Some(parent) = output_path.parent() {
+            std::fs::create_dir_all(parent).ok();
+        }
+
+        ui::print_thinking(&step_task);
+        eprintln!(
+            "      output: {}",
+            output_path.canonicalize().unwrap_or(output_path.clone()).display()
+        );
 
         let system_prompt = build_system_prompt(agent, guide, rules_cache, skills_cache);
 
         let start = Instant::now();
 
         let (content, usage) = if executor::backend_needs_executor(effective_backend) {
-            run_stage_via_executor(
+            run_step_via_executor(
                 executor.as_ref(),
-                stage,
+                step,
                 flow_name,
                 &system_prompt,
                 &user_content,
@@ -299,52 +321,50 @@ pub async fn run_stages(
                 }],
                 max_tokens: 4096,
             };
-            run_stage_via_api(request, &stage.id).await?
+            run_step_via_api(request, &step.id).await?
         };
 
         let duration = start.elapsed();
 
-        // Save state
+        // Save to stack
         let timestamp = chrono::Utc::now().to_rfc3339();
-        let stage_output = StageOutput {
-            stage_id: stage.id.clone(),
+        let step_output = StepOutput {
+            step_id: step.id.clone(),
             agent_id: agent.id.clone(),
             model: effective_model.to_string(),
             prompt: user_content,
             response: content.clone(),
             timestamp,
         };
-        state::write_stage(state_path, &stage_output).map_err(|e| RunError::State {
-            stage: stage.id.clone(),
+        stack::write_step(stack_path, &step_output).map_err(|e| RunError::Stack {
+            step: step.id.clone(),
             source: e,
         })?;
 
-        // Write output file if specified
-        let output_file = stage.output.clone().unwrap_or_else(|| "stdout".to_string());
-        if let Some(ref path) = stage.output {
-            let output_path = state_path.join(path);
-            if let Some(parent) = output_path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            std::fs::write(&output_path, &content).map_err(|e| RunError::State {
-                stage: stage.id.clone(),
-                source: state::StateError::Write(e),
-            })?;
-        }
+        // Write artifact to pre-computed output path
+        std::fs::write(&output_path, &content).map_err(|e| RunError::Stack {
+            step: step.id.clone(),
+            source: stack::StackError::Write(e),
+        })?;
 
         let tokens_in = usage.as_ref().map(|u| u.input_tokens);
         let tokens_out = usage.as_ref().map(|u| u.output_tokens);
 
-        ui::print_stage_done(
+        let display_path = output_path
+            .canonicalize()
+            .unwrap_or(output_path.clone())
+            .display()
+            .to_string();
+        ui::print_step_done(
             &format_duration(duration),
             &tokens_in.map_or("—".to_string(), |t| t.to_string()),
             &tokens_out.map_or("—".to_string(), |t| t.to_string()),
-            &output_file,
+            &display_path,
         );
 
-        results.push(StageRunResult {
-            stage_id: stage.id.clone(),
-            agent_id: agent.id.clone(),
+        results.push(StepRunResult {
+            step_id: step.id.clone(),
+            agent_name: agent.name.clone(),
             backend: effective_backend,
             duration,
             tokens_in,
@@ -376,18 +396,18 @@ fn backend_name(backend: Backend) -> &'static str {
 }
 
 /// Build the summary table from run results.
-pub fn build_summary(results: &[StageRunResult]) -> Vec<ui::StageResult> {
+pub fn build_summary(results: &[StepRunResult]) -> Vec<ui::StepResult> {
     results
         .iter()
-        .map(|r| ui::StageResult {
-            id: r.stage_id.clone(),
-            agent: r.agent_id.clone(),
+        .map(|r| ui::StepResult {
+            id: r.step_id.clone(),
+            agent: r.agent_name.clone(),
             backend: backend_name(r.backend).to_string(),
             duration: format_duration(r.duration),
             tokens_in: r.tokens_in.map_or("—".to_string(), |t| t.to_string()),
             tokens_out: r.tokens_out.map_or("—".to_string(), |t| t.to_string()),
             output: r.output_file.clone(),
-            state: StageState::Done,
+            state: StepState::Done,
         })
         .collect()
 }
@@ -429,14 +449,14 @@ mod tests {
 
     #[test]
     fn build_summary_maps_fields() {
-        let results = vec![StageRunResult {
-            stage_id: "design".to_string(),
-            agent_id: "architect".to_string(),
+        let results = vec![StepRunResult {
+            step_id: "design".to_string(),
+            agent_name: "Levi".to_string(),
             backend: Backend::Api,
             duration: std::time::Duration::from_secs(5),
             tokens_in: Some(1200),
             tokens_out: Some(800),
-            output_file: "design.md".to_string(),
+            output_file: "dev-20260421-1052-design-Levi.md".to_string(),
         }];
         let summary = build_summary(&results);
         assert_eq!(summary.len(), 1);
@@ -449,11 +469,13 @@ mod tests {
     fn build_system_prompt_with_all_parts() {
         let agent = Agent {
             id: "dev".to_string(),
+            name: "Dev".to_string(),
             role: "You are a developer".to_string(),
             model: "sonnet".to_string(),
             backend: Backend::ClaudeCli,
-            rules: Some("rust-developer".to_string()),
+            rules: vec!["rust-developer".to_string()],
             skills: vec!["error-handling".to_string()],
+            env: HashMap::new(),
         };
         let guide = Some("Project guide content".to_string());
         let mut rules_cache = HashMap::new();
@@ -475,14 +497,45 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_without_guide_or_rules() {
+    fn build_system_prompt_multiple_rules() {
         let agent = Agent {
             id: "dev".to_string(),
+            name: "Dev".to_string(),
             role: "You are a developer".to_string(),
             model: "sonnet".to_string(),
             backend: Backend::ClaudeCli,
-            rules: None,
+            rules: vec!["rust".to_string(), "cli-ux".to_string()],
             skills: vec![],
+            env: HashMap::new(),
+        };
+        let guide = None;
+        let mut rules_cache = HashMap::new();
+        rules_cache.insert("rust".to_string(), "Rust rules".to_string());
+        rules_cache.insert("cli-ux".to_string(), "CLI UX rules".to_string());
+        let skills_cache = HashMap::new();
+
+        let prompt = build_system_prompt(&agent, &guide, &rules_cache, &skills_cache);
+        assert!(prompt.contains("Rust rules"));
+        assert!(prompt.contains("CLI UX rules"));
+        // Rules should come before role
+        let rust_pos = prompt.find("Rust rules").unwrap();
+        let cli_pos = prompt.find("CLI UX rules").unwrap();
+        let role_pos = prompt.find("You are a developer").unwrap();
+        assert!(rust_pos < cli_pos);
+        assert!(cli_pos < role_pos);
+    }
+
+    #[test]
+    fn build_system_prompt_without_guide_or_rules() {
+        let agent = Agent {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            role: "You are a developer".to_string(),
+            model: "sonnet".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: vec![],
+            skills: vec![],
+            env: HashMap::new(),
         };
         let guide = None;
         let rules_cache = HashMap::new();
@@ -516,11 +569,13 @@ mod tests {
 
         let agents = vec![Agent {
             id: "dev".to_string(),
+            name: "Dev".to_string(),
             role: "dev".to_string(),
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
-            rules: Some("rust-developer".to_string()),
+            rules: vec!["rust-developer".to_string()],
             skills: vec![],
+            env: HashMap::new(),
         }];
 
         let cache = load_rules_for_agents(&agents, dir.path()).unwrap();
@@ -528,18 +583,53 @@ mod tests {
     }
 
     #[test]
+    fn load_rules_for_agents_multiple_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("rust.md"), "Rust rules").unwrap();
+        std::fs::write(rules_dir.join("cli.md"), "CLI rules").unwrap();
+
+        let agents = vec![Agent {
+            id: "dev".to_string(),
+            name: "Dev".to_string(),
+            role: "dev".to_string(),
+            model: "m".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: vec!["rust".to_string(), "cli".to_string()],
+            skills: vec![],
+            env: HashMap::new(),
+        }];
+
+        let cache = load_rules_for_agents(&agents, dir.path()).unwrap();
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.get("rust").unwrap(), "Rust rules");
+        assert_eq!(cache.get("cli").unwrap(), "CLI rules");
+    }
+
+    #[test]
     fn load_rules_for_agents_missing_file_errors() {
         let dir = tempfile::tempdir().unwrap();
         let agents = vec![Agent {
             id: "dev".to_string(),
+            name: "Dev".to_string(),
             role: "dev".to_string(),
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
-            rules: Some("nonexistent".to_string()),
+            rules: vec!["nonexistent".to_string()],
             skills: vec![],
+            env: HashMap::new(),
         }];
 
         let err = load_rules_for_agents(&agents, dir.path()).unwrap_err();
         assert!(err.to_string().contains("nonexistent"));
+    }
+
+    #[test]
+    fn auto_output_filename_format() {
+        let name = auto_output_filename("development", "design", "Levi");
+        assert!(name.starts_with("development-"));
+        assert!(name.contains("-design-Levi.md"));
+        assert!(name.ends_with(".md"));
     }
 }

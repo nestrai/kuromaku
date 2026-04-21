@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::path::Path;
 
+use indexmap::IndexMap;
 use serde::Deserialize;
 
 // --- Errors ---
@@ -64,19 +65,18 @@ impl<'de> Deserialize<'de> for Version {
 
 // --- Raw serde structs (what we deserialize from YAML) ---
 
-/// We use `flatten` + `HashMap` to capture unknown fields for warnings.
+/// Flow config file format (lives in .koto/flows/<name>.yaml).
 #[derive(Debug, Deserialize)]
 pub struct RawFlowConfig {
     pub version: Version,
     pub name: String,
     #[serde(default)]
     pub defaults: Option<RawDefaults>,
-    pub agents: Vec<RawAgent>,
-    pub stages: Vec<RawStage>,
+    pub flow: IndexMap<String, RawStep>,
     #[serde(default)]
-    pub state: Option<RawStateConfig>,
+    pub stack: Option<RawStackConfig>,
     #[serde(flatten)]
-    pub unknown: std::collections::HashMap<String, serde_yaml::Value>,
+    pub unknown: HashMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,47 +84,47 @@ pub struct RawDefaults {
     pub model: Option<String>,
     pub backend: Option<Backend>,
     #[serde(flatten)]
-    pub unknown: std::collections::HashMap<String, serde_yaml::Value>,
+    pub unknown: HashMap<String, serde_yaml::Value>,
 }
 
+/// A step in the flow map. The key in the map is the step ID.
 #[derive(Debug, Deserialize)]
-pub struct RawAgent {
-    pub id: String,
-    pub role: String,
-    pub model: Option<String>,
-    pub backend: Option<Backend>,
-    pub rules: Option<String>,
-    #[serde(default)]
-    pub skills: Vec<String>,
-    #[serde(flatten)]
-    pub unknown: std::collections::HashMap<String, serde_yaml::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct RawStage {
-    pub id: String,
+pub struct RawStep {
     pub agent: String,
-    pub task: Option<String>,
-    pub uses: Option<String>,
-    #[serde(default)]
-    pub with: Option<std::collections::HashMap<String, serde_yaml::Value>>,
+    pub focus: Option<String>,
     #[serde(default)]
     pub input: Vec<String>,
     #[serde(default)]
     pub needs: Vec<String>,
-    pub output: Option<String>,
     pub model: Option<String>,
     pub backend: Option<Backend>,
     #[serde(flatten)]
-    pub unknown: std::collections::HashMap<String, serde_yaml::Value>,
+    pub unknown: HashMap<String, serde_yaml::Value>,
+}
+
+/// Agent file format (lives in .koto/agents/<id>.yaml).
+#[derive(Debug, Deserialize)]
+pub struct RawAgentFile {
+    pub name: String,
+    pub role: String,
+    #[serde(default)]
+    pub rules: Vec<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    pub model: Option<String>,
+    pub backend: Option<Backend>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(flatten)]
+    pub unknown: HashMap<String, serde_yaml::Value>,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct RawStateConfig {
+pub struct RawStackConfig {
     pub backend: Option<String>,
     pub path: Option<String>,
     #[serde(flatten)]
-    pub unknown: std::collections::HashMap<String, serde_yaml::Value>,
+    pub unknown: HashMap<String, serde_yaml::Value>,
 }
 
 // --- Resolved structs (after validation and defaults) ---
@@ -134,9 +134,8 @@ pub struct FlowConfig {
     pub version: String,
     pub name: String,
     pub defaults: Defaults,
-    pub agents: Vec<Agent>,
-    pub stages: Vec<Stage>,
-    pub state: StateConfig,
+    pub steps: Vec<Step>,
+    pub stack: StackConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,36 +147,28 @@ pub struct Defaults {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Agent {
     pub id: String,
+    pub name: String,
     pub role: String,
     pub model: String,
     pub backend: Backend,
-    pub rules: Option<String>,
+    pub rules: Vec<String>,
     pub skills: Vec<String>,
+    pub env: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TaskSource {
-    Inline(String),
-    Template {
-        uses: String,
-        with: std::collections::HashMap<String, serde_yaml::Value>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Stage {
+pub struct Step {
     pub id: String,
     pub agent: String,
-    pub task: TaskSource,
+    pub focus: Option<String>,
     pub input: Vec<String>,
     pub needs: Vec<String>,
-    pub output: Option<String>,
     pub model: Option<String>,
     pub backend: Option<Backend>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StateConfig {
+pub struct StackConfig {
     pub backend: String,
     pub path: String,
 }
@@ -186,47 +177,87 @@ pub struct StateConfig {
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5";
 const DEFAULT_BACKEND: Backend = Backend::ClaudeCli;
-const DEFAULT_STATE_BACKEND: &str = "local";
-const DEFAULT_STATE_PATH: &str = ".koto/state";
+const DEFAULT_STACK_BACKEND: &str = "local";
 
 // --- Loading ---
 
-pub fn load_config(path: &Path) -> Result<FlowConfig, ConfigError> {
+pub fn load_flow(path: &Path) -> Result<FlowConfig, ConfigError> {
     let contents = std::fs::read_to_string(path)?;
-    load_config_from_str(&contents)
+    load_flow_from_str(&contents)
 }
 
-pub fn load_config_from_str(contents: &str) -> Result<FlowConfig, ConfigError> {
+pub fn load_flow_from_str(contents: &str) -> Result<FlowConfig, ConfigError> {
     let raw: RawFlowConfig = serde_yaml::from_str(contents)?;
     warn_unknown_fields("top-level", &raw.unknown);
     if let Some(ref defaults) = raw.defaults {
         warn_unknown_fields("defaults", &defaults.unknown);
     }
-    for agent in &raw.agents {
-        warn_unknown_fields(&format!("agent '{}'", agent.id), &agent.unknown);
+    for (id, step) in &raw.flow {
+        warn_unknown_fields(&format!("step '{id}'"), &step.unknown);
     }
-    for stage in &raw.stages {
-        warn_unknown_fields(&format!("stage '{}'", stage.id), &stage.unknown);
-    }
-    if let Some(ref state) = raw.state {
-        warn_unknown_fields("state", &state.unknown);
+    if let Some(ref stack) = raw.stack {
+        warn_unknown_fields("stack", &stack.unknown);
     }
     validate_and_resolve(raw)
 }
 
-fn warn_unknown_fields(
-    context: &str,
-    fields: &std::collections::HashMap<String, serde_yaml::Value>,
-) {
+/// Load a single agent file from .koto/agents/<agent_id>.yaml.
+pub fn load_agent_file(
+    koto_dir: &Path,
+    agent_id: &str,
+    defaults: &Defaults,
+) -> Result<Agent, ConfigError> {
+    let path = koto_dir.join("agents").join(format!("{agent_id}.yaml"));
+    if !path.exists() {
+        return Err(ConfigError::Validation(format!(
+            "agent file not found: {} (expected at {})",
+            agent_id,
+            path.display()
+        )));
+    }
+    let contents = std::fs::read_to_string(&path)?;
+    let raw: RawAgentFile = serde_yaml::from_str(&contents)?;
+    warn_unknown_fields(&format!("agent file '{agent_id}'"), &raw.unknown);
+
+    Ok(Agent {
+        id: agent_id.to_string(),
+        name: raw.name,
+        role: raw.role,
+        model: raw.model.unwrap_or_else(|| defaults.model.clone()),
+        backend: raw.backend.unwrap_or(defaults.backend),
+        rules: raw.rules,
+        skills: raw.skills,
+        env: raw.env,
+    })
+}
+
+/// Load all agents referenced by the flow steps.
+pub fn load_agents_for_flow(
+    koto_dir: &Path,
+    config: &FlowConfig,
+) -> Result<Vec<Agent>, ConfigError> {
+    let mut agents: Vec<Agent> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for step in &config.steps {
+        if seen.insert(step.agent.clone()) {
+            let agent = load_agent_file(koto_dir, &step.agent, &config.defaults)?;
+            agents.push(agent);
+        }
+    }
+
+    Ok(agents)
+}
+
+fn warn_unknown_fields(context: &str, fields: &HashMap<String, serde_yaml::Value>) {
     for key in fields.keys() {
-        eprintln!("warning: unknown field '{}' in {}", key, context);
+        eprintln!("warning: unknown field '{key}' in {context}");
     }
 }
 
 // --- Validation and resolution ---
 
 fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
-    // Version check
     if raw.version.0 != "1" {
         return Err(ConfigError::Validation(format!(
             "unsupported version '{}', expected '1'",
@@ -234,7 +265,6 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
         )));
     }
 
-    // Resolve defaults
     let defaults = Defaults {
         model: raw
             .defaults
@@ -248,83 +278,26 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
             .unwrap_or(DEFAULT_BACKEND),
     };
 
-    // Check for duplicate agent IDs
-    let mut agent_ids = HashSet::new();
-    for agent in &raw.agents {
-        if !agent_ids.insert(&agent.id) {
-            return Err(ConfigError::Validation(format!(
-                "duplicate agent id '{}'",
-                agent.id
-            )));
-        }
-    }
+    // Collect step IDs for reference validation
+    let step_ids: std::collections::HashSet<&str> =
+        raw.flow.keys().map(|k| k.as_str()).collect();
 
-    // Check for duplicate stage IDs
-    let mut stage_ids = HashSet::new();
-    for stage in &raw.stages {
-        if !stage_ids.insert(&stage.id) {
-            return Err(ConfigError::Validation(format!(
-                "duplicate stage id '{}'",
-                stage.id
-            )));
-        }
-    }
-
-    // Validate stages reference valid agents and stage IDs
-    for stage in &raw.stages {
-        if !agent_ids.contains(&stage.agent) {
-            return Err(ConfigError::Validation(format!(
-                "stage '{}' references unknown agent '{}'",
-                stage.id, stage.agent
-            )));
-        }
-
-        for dep in stage.input.iter().chain(stage.needs.iter()) {
-            if !stage_ids.contains(dep) {
+    // Validate step references
+    for (id, step) in &raw.flow {
+        for dep in step.input.iter().chain(step.needs.iter()) {
+            if !step_ids.contains(dep.as_str()) {
                 return Err(ConfigError::Validation(format!(
-                    "stage '{}' references unknown stage '{}' in input/needs",
-                    stage.id, dep
+                    "step '{id}' references unknown step '{dep}' in input/needs"
                 )));
             }
         }
-
-        // task XOR uses
-        match (&stage.task, &stage.uses) {
-            (None, None) => {
-                return Err(ConfigError::Validation(format!(
-                    "stage '{}' must have either 'task' or 'uses'",
-                    stage.id
-                )));
-            }
-            (Some(_), Some(_)) => {
-                return Err(ConfigError::Validation(format!(
-                    "stage '{}' cannot have both 'task' and 'uses'",
-                    stage.id
-                )));
-            }
-            _ => {}
-        }
     }
 
-    // Resolve agents
-    let agents: Vec<Agent> = raw
-        .agents
+    // Resolve steps -- input implies needs
+    let steps: Vec<Step> = raw
+        .flow
         .into_iter()
-        .map(|a| Agent {
-            model: a.model.unwrap_or_else(|| defaults.model.clone()),
-            backend: a.backend.unwrap_or(defaults.backend),
-            id: a.id,
-            role: a.role,
-            rules: a.rules,
-            skills: a.skills,
-        })
-        .collect();
-
-    // Resolve stages -- input implies needs
-    let stages: Vec<Stage> = raw
-        .stages
-        .into_iter()
-        .map(|s| {
+        .map(|(id, s)| {
             let mut needs: Vec<String> = s.needs;
             for input_dep in &s.input {
                 if !needs.contains(input_dep) {
@@ -332,49 +305,37 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
                 }
             }
 
-            let task = match (s.task, s.uses) {
-                (Some(t), None) => TaskSource::Inline(t),
-                (None, Some(u)) => TaskSource::Template {
-                    uses: u,
-                    with: s.with.unwrap_or_default(),
-                },
-                _ => unreachable!(), // validated above
-            };
-
-            Stage {
-                id: s.id,
+            Step {
+                id,
                 agent: s.agent,
-                task,
+                focus: s.focus,
                 input: s.input,
                 needs,
-                output: s.output,
                 model: s.model,
                 backend: s.backend,
             }
         })
         .collect();
 
-    // Resolve state
-    let state = StateConfig {
+    let stack = StackConfig {
         backend: raw
-            .state
+            .stack
             .as_ref()
             .and_then(|s| s.backend.clone())
-            .unwrap_or_else(|| DEFAULT_STATE_BACKEND.to_string()),
+            .unwrap_or_else(|| DEFAULT_STACK_BACKEND.to_string()),
         path: raw
-            .state
+            .stack
             .as_ref()
             .and_then(|s| s.path.clone())
-            .unwrap_or_else(|| DEFAULT_STATE_PATH.to_string()),
+            .unwrap_or_default(),
     };
 
     Ok(FlowConfig {
         version: raw.version.0,
         name: raw.name,
         defaults,
-        agents,
-        stages,
-        state,
+        steps,
+        stack,
     })
 }
 
@@ -392,84 +353,64 @@ defaults:
   model: claude-opus-4-5
   backend: api
 
-agents:
-  - id: architect
-    role: "You are a software architect"
-    model: claude-opus-4-5
-    backend: api
-  - id: reviewer
-    role: "You are a code reviewer"
-
-stages:
-  - id: design
+flow:
+  design:
     agent: architect
-    task: "Design the system architecture"
-    output: design.md
-  - id: review
+  review:
     agent: reviewer
-    task: "Review the architecture"
     input: [design]
-    needs: [design]
+    focus: "Check architecture decisions"
 
-state:
+stack:
   backend: local
-  path: .koto/state
+  path: /tmp/test-stack
 "#;
 
     const MINIMAL_CONFIG: &str = r#"
 version: "1"
 name: minimal
 
-agents:
-  - id: dev
-    role: "You are a developer"
-
-stages:
-  - id: code
+flow:
+  code:
     agent: dev
-    task: "Write code"
 "#;
 
     #[test]
     fn full_config_parses() {
-        let config = load_config_from_str(FULL_CONFIG).unwrap();
+        let config = load_flow_from_str(FULL_CONFIG).unwrap();
         assert_eq!(config.name, "planning-team");
         assert_eq!(config.version, "1");
-        assert_eq!(config.agents.len(), 2);
-        assert_eq!(config.stages.len(), 2);
-        assert_eq!(config.agents[0].model, "claude-opus-4-5");
-        assert_eq!(config.agents[1].model, "claude-opus-4-5"); // from defaults
-        assert_eq!(config.state.backend, "local");
-        assert_eq!(config.state.path, ".koto/state");
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(config.steps[0].id, "design");
+        assert_eq!(config.steps[0].agent, "architect");
+        assert_eq!(config.steps[1].id, "review");
+        assert_eq!(config.steps[1].focus.as_deref(), Some("Check architecture decisions"));
+        assert_eq!(config.stack.backend, "local");
+        assert_eq!(config.stack.path, "/tmp/test-stack");
     }
 
     #[test]
     fn minimal_config_parses() {
-        let config = load_config_from_str(MINIMAL_CONFIG).unwrap();
+        let config = load_flow_from_str(MINIMAL_CONFIG).unwrap();
         assert_eq!(config.name, "minimal");
-        assert_eq!(config.agents.len(), 1);
-        assert_eq!(config.stages.len(), 1);
-        // Global defaults applied
-        assert_eq!(config.agents[0].model, DEFAULT_MODEL);
-        assert_eq!(config.agents[0].backend, Backend::ClaudeCli);
+        assert_eq!(config.steps.len(), 1);
+        assert_eq!(config.steps[0].id, "code");
+        assert_eq!(config.steps[0].agent, "dev");
         assert_eq!(config.defaults.model, DEFAULT_MODEL);
-        assert_eq!(config.state.backend, DEFAULT_STATE_BACKEND);
-        assert_eq!(config.state.path, DEFAULT_STATE_PATH);
+        assert_eq!(config.defaults.backend, Backend::ClaudeCli);
+        assert_eq!(config.stack.backend, DEFAULT_STACK_BACKEND);
+        assert_eq!(config.stack.path, "");
     }
 
     #[test]
     fn missing_required_field_name() {
         let yaml = r#"
 version: "1"
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
+flow:
+  code:
     agent: dev
-    task: "do it"
 "#;
-        let err = load_config_from_str(yaml).unwrap_err();
+        let err = load_flow_from_str(yaml).unwrap_err();
         assert!(
             err.to_string().contains("name"),
             "error should mention 'name': {}",
@@ -478,39 +419,15 @@ stages:
     }
 
     #[test]
-    fn missing_required_field_agents() {
+    fn missing_required_field_flow() {
         let yaml = r#"
 version: "1"
 name: test
-stages:
-  - id: code
-    agent: dev
-    task: "do it"
 "#;
-        let err = load_config_from_str(yaml).unwrap_err();
+        let err = load_flow_from_str(yaml).unwrap_err();
         assert!(
-            err.to_string().contains("agents"),
-            "error should mention 'agents': {}",
-            err
-        );
-    }
-
-    #[test]
-    fn missing_agent_role() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-stages:
-  - id: code
-    agent: dev
-    task: "do it"
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("role"),
-            "error should mention 'role': {}",
+            err.to_string().contains("flow"),
+            "error should mention 'flow': {}",
             err
         );
     }
@@ -521,61 +438,13 @@ stages:
 version: "1"
 name: test
 extra_field: hello
-agents:
-  - id: dev
-    role: "dev"
+flow:
+  code:
+    agent: dev
     unknown_prop: 42
-stages:
-  - id: code
-    agent: dev
-    task: "do it"
 "#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         assert_eq!(config.name, "test");
-    }
-
-    #[test]
-    fn duplicate_agent_id_errors() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "developer"
-  - id: dev
-    role: "another dev"
-stages:
-  - id: code
-    agent: dev
-    task: "do it"
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("duplicate agent id 'dev'"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn stage_references_nonexistent_agent() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
-    agent: ghost
-    task: "do it"
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown agent 'ghost'"),
-            "got: {}",
-            err
-        );
     }
 
     #[test]
@@ -583,20 +452,15 @@ stages:
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: first
+flow:
+  first:
     agent: dev
-    task: "do first thing"
-  - id: second
+  second:
     agent: dev
-    task: "do second thing"
     input: [first]
 "#;
-        let config = load_config_from_str(yaml).unwrap();
-        let second = &config.stages[1];
+        let config = load_flow_from_str(yaml).unwrap();
+        let second = &config.steps[1];
         assert_eq!(second.input, vec!["first"]);
         assert!(second.needs.contains(&"first".to_string()));
     }
@@ -606,130 +470,45 @@ stages:
         let yaml = r#"
 version: 1
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
+flow:
+  code:
     agent: dev
-    task: "do it"
 "#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         assert_eq!(config.version, "1");
     }
 
     #[test]
-    fn version_as_string() {
-        let config = load_config_from_str(MINIMAL_CONFIG).unwrap();
-        assert_eq!(config.version, "1");
-    }
-
-    #[test]
-    fn model_defaults_applied() {
+    fn step_references_nonexistent_step_in_needs() {
         let yaml = r#"
 version: "1"
 name: test
-defaults:
-  model: custom-model
-agents:
-  - id: dev
-    role: "dev"
-  - id: senior
-    role: "senior"
-    model: override-model
-stages:
-  - id: code
+flow:
+  code:
     agent: dev
-    task: "do it"
-"#;
-        let config = load_config_from_str(yaml).unwrap();
-        assert_eq!(config.agents[0].model, "custom-model"); // from defaults
-        assert_eq!(config.agents[1].model, "override-model"); // agent override
-    }
-
-    #[test]
-    fn task_and_uses_both_present_errors() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
-    agent: dev
-    task: "do it"
-    uses: some-template
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("cannot have both 'task' and 'uses'"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn neither_task_nor_uses_errors() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
-    agent: dev
-"#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("must have either 'task' or 'uses'"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn stage_references_nonexistent_stage_in_needs() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
-    agent: dev
-    task: "do it"
     needs: [phantom]
 "#;
-        let err = load_config_from_str(yaml).unwrap_err();
+        let err = load_flow_from_str(yaml).unwrap_err();
         assert!(
-            err.to_string().contains("unknown stage 'phantom'"),
+            err.to_string().contains("unknown step 'phantom'"),
             "got: {}",
             err
         );
     }
 
     #[test]
-    fn stage_references_nonexistent_stage_in_input() {
+    fn step_references_nonexistent_step_in_input() {
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
+flow:
+  code:
     agent: dev
-    task: "do it"
     input: [phantom]
 "#;
-        let err = load_config_from_str(yaml).unwrap_err();
+        let err = load_flow_from_str(yaml).unwrap_err();
         assert!(
-            err.to_string().contains("unknown stage 'phantom'"),
+            err.to_string().contains("unknown step 'phantom'"),
             "got: {}",
             err
         );
@@ -740,48 +519,13 @@ stages:
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-    backend: claude-cli
-  - id: local
-    role: "local model"
-    backend: ollama
-stages:
-  - id: code
+flow:
+  code:
     agent: dev
-    task: "do it"
     backend: api
 "#;
-        let config = load_config_from_str(yaml).unwrap();
-        assert_eq!(config.agents[0].backend, Backend::ClaudeCli);
-        assert_eq!(config.agents[1].backend, Backend::Ollama);
-        assert_eq!(config.stages[0].backend, Some(Backend::Api));
-    }
-
-    #[test]
-    fn uses_template_parses() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
-    agent: dev
-    uses: code-review
-    with:
-      language: rust
-"#;
-        let config = load_config_from_str(yaml).unwrap();
-        match &config.stages[0].task {
-            TaskSource::Template { uses, with } => {
-                assert_eq!(uses, "code-review");
-                assert!(with.contains_key("language"));
-            }
-            _ => panic!("expected Template task source"),
-        }
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps[0].backend, Some(Backend::Api));
     }
 
     #[test]
@@ -789,15 +533,11 @@ stages:
         let yaml = r#"
 version: "2"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
+flow:
+  code:
     agent: dev
-    task: "do it"
 "#;
-        let err = load_config_from_str(yaml).unwrap_err();
+        let err = load_flow_from_str(yaml).unwrap_err();
         assert!(
             err.to_string().contains("unsupported version '2'"),
             "got: {}",
@@ -806,53 +546,127 @@ stages:
     }
 
     #[test]
-    fn duplicate_stage_id_errors() {
+    fn focus_field_parses() {
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: code
-    agent: dev
-    task: "first"
-  - id: code
-    agent: dev
-    task: "second"
+flow:
+  review:
+    agent: reviewer
+    focus: "Check error handling"
 "#;
-        let err = load_config_from_str(yaml).unwrap_err();
-        assert!(
-            err.to_string().contains("duplicate stage id 'code'"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn skills_field_parses() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-    skills: [domain-cli, error-handling]
-stages:
-  - id: code
-    agent: dev
-    task: "do it"
-"#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         assert_eq!(
-            config.agents[0].skills,
-            vec!["domain-cli", "error-handling"]
+            config.steps[0].focus.as_deref(),
+            Some("Check error handling")
         );
     }
 
     #[test]
-    fn skills_field_defaults_to_empty() {
-        let config = load_config_from_str(MINIMAL_CONFIG).unwrap();
-        assert!(config.agents[0].skills.is_empty());
+    fn preserves_insertion_order() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  design:
+    agent: architect
+  implement:
+    agent: developer
+    input: [design]
+  review:
+    agent: reviewer
+    input: [implement]
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps[0].id, "design");
+        assert_eq!(config.steps[1].id, "implement");
+        assert_eq!(config.steps[2].id, "review");
+    }
+
+    #[test]
+    fn load_agent_file_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("kai.yaml"),
+            r#"
+name: Kai
+role: "Senior Rust developer"
+rules: [rust-developer, cli-ux]
+skills: [testing-patterns]
+model: claude-sonnet-4-5
+env:
+  CARGO_TERM_COLOR: always
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "default-model".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let agent = load_agent_file(dir.path(), "kai", &defaults).unwrap();
+        assert_eq!(agent.id, "kai");
+        assert_eq!(agent.name, "Kai");
+        assert_eq!(agent.role, "Senior Rust developer");
+        assert_eq!(agent.rules, vec!["rust-developer", "cli-ux"]);
+        assert_eq!(agent.skills, vec!["testing-patterns"]);
+        assert_eq!(agent.model, "claude-sonnet-4-5");
+        assert_eq!(agent.backend, Backend::ClaudeCli);
+        assert_eq!(agent.env.get("CARGO_TERM_COLOR").unwrap(), "always");
+    }
+
+    #[test]
+    fn load_agent_file_uses_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("alex.yaml"),
+            r#"
+name: Alex
+role: "Code reviewer"
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "claude-opus-4-5".to_string(),
+            backend: Backend::Api,
+        };
+        let agent = load_agent_file(dir.path(), "alex", &defaults).unwrap();
+        assert_eq!(agent.model, "claude-opus-4-5");
+        assert_eq!(agent.backend, Backend::Api);
+        assert!(agent.rules.is_empty());
+        assert!(agent.skills.is_empty());
+    }
+
+    #[test]
+    fn load_agent_file_missing_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let defaults = Defaults {
+            model: "m".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let err = load_agent_file(dir.path(), "ghost", &defaults).unwrap_err();
+        assert!(err.to_string().contains("agent file not found"));
+    }
+
+    #[test]
+    fn model_defaults_applied_to_flow() {
+        let yaml = r#"
+version: "1"
+name: test
+defaults:
+  model: custom-model
+  backend: api
+flow:
+  code:
+    agent: dev
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.defaults.model, "custom-model");
+        assert_eq!(config.defaults.backend, Backend::Api);
     }
 }

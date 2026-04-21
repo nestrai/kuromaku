@@ -13,7 +13,7 @@ mod executor;
 mod llm;
 mod runner;
 mod skills;
-mod state;
+mod stack;
 #[allow(dead_code)]
 mod ui;
 
@@ -34,6 +34,10 @@ enum Command {
         /// Flow name (looks in .koto/flows/<name>.yaml)
         flow: Option<String>,
 
+        /// Task to execute
+        #[arg(short = 't', long)]
+        task: String,
+
         /// Path to the flow config file (overrides flow name lookup)
         #[arg(short, long)]
         file: Option<String>,
@@ -47,7 +51,7 @@ enum Command {
     Pull,
     /// Stop the agent team
     Down,
-    /// Show running agents and state
+    /// Show running agents and stack
     Status,
 }
 
@@ -59,9 +63,10 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Up {
             flow,
+            task,
             file,
             executor,
-        } => run_up(flow.as_deref(), file.as_deref(), executor.as_deref()).await?,
+        } => run_up(flow.as_deref(), &task, file.as_deref(), executor.as_deref()).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
             println!("koto down: not yet implemented");
@@ -97,7 +102,7 @@ fn resolve_flow_path(flow: Option<&str>, file: Option<&str>) -> Result<PathBuf> 
         return Ok(path);
     }
 
-    // No args: list available flows
+    // No args: auto-select if only one flow exists
     let flows_dir = Path::new(FLOWS_DIR);
     if !flows_dir.exists() {
         return Err(eyre!(
@@ -127,6 +132,12 @@ fn resolve_flow_path(flow: Option<&str>, file: Option<&str>) -> Result<PathBuf> 
         ));
     }
 
+    // Auto-select if only one flow
+    if flows.len() == 1 {
+        let name = &flows[0];
+        return Ok(PathBuf::from(FLOWS_DIR).join(format!("{name}.yaml")));
+    }
+
     flows.sort();
     let list = flows
         .iter()
@@ -134,38 +145,65 @@ fn resolve_flow_path(flow: Option<&str>, file: Option<&str>) -> Result<PathBuf> 
         .collect::<Vec<_>>()
         .join("\n");
     Err(eyre!(
-        "no flow specified\n\navailable flows:\n{list}\n\nusage: koto up <flow-name>"
+        "multiple flows found, specify one:\n\n{list}\n\nusage: koto up <flow-name> -t \"task\""
     ))
 }
 
-async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) -> Result<()> {
+/// Resolve the stack path: explicit config > default (~/.koto/stacks/<project>/).
+fn resolve_stack_path(config_path: &str) -> PathBuf {
+    if !config_path.is_empty() {
+        return PathBuf::from(config_path);
+    }
+
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "default".to_string());
+
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".koto")
+        .join("stacks")
+        .join(project)
+}
+
+async fn run_up(
+    flow: Option<&str>,
+    task: &str,
+    file: Option<&str>,
+    executor: Option<&str>,
+) -> Result<()> {
     let flow_start = Instant::now();
     let path = resolve_flow_path(flow, file)?;
     let display_path = path.display().to_string();
 
     ui::print_command(&format!("koto up {}", flow.unwrap_or(&display_path)));
 
-    let flow_config = config::load_config(&path)?;
+    let flow_config = config::load_flow(&path)?;
 
     // Derive flow name for tmux sessions
     let flow_name = flow
         .map(|s| s.to_string())
         .unwrap_or_else(|| flow_config.name.clone());
 
+    // Load agents referenced by the flow
+    let koto_dir = Path::new(KOTO_DIR);
+    let agents = config::load_agents_for_flow(koto_dir, &flow_config)?;
+
     ui::print_flow_start(
         &flow_config.name,
         &display_path,
-        flow_config.stages.len(),
-        flow_config.agents.len(),
+        flow_config.steps.len(),
+        agents.len(),
     );
 
     // Validate DAG and get execution order
-    let stages = dag::validate_dag(&flow_config)?;
+    let steps = dag::validate_dag(&flow_config)?;
 
     // Resolve and print backends
     let mut seen_backends = std::collections::HashSet::new();
     let mut backend_list: Vec<(&str, &str)> = Vec::new();
-    for agent in &flow_config.agents {
+    for agent in &agents {
         let name = match agent.backend {
             config::Backend::Api => "api",
             config::Backend::ClaudeCli => "claude-cli",
@@ -178,16 +216,15 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
     ui::print_backends_ok(&backend_list);
 
     // Resolve executor: --executor flag > KOTO_EXECUTOR env var > default (local)
-    let koto_dir = Path::new(KOTO_DIR);
     let executor_target = executor::resolve_executor_target(executor, koto_dir)?;
 
     // Load guide and rules context
     let guide = runner::load_guide(koto_dir);
-    let rules_cache = runner::load_rules_for_agents(&flow_config.agents, koto_dir)?;
+    let rules_cache = runner::load_rules_for_agents(&agents, koto_dir)?;
 
     // Check and load skills
     let skills_dir = koto_dir.join("skills");
-    let skill_names = skills::collect_skill_names(&flow_config.agents);
+    let skill_names = skills::collect_skill_names(&agents);
     let skills_cache = if skill_names.is_empty() {
         std::collections::HashMap::new()
     } else {
@@ -201,12 +238,15 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
         skills::load_skills_for_agents(&skill_names, &skills_dir)?
     };
 
-    // Run stages
-    let state_path = Path::new(&flow_config.state.path);
-    let results = runner::run_stages(
-        &flow_config,
-        &stages,
-        state_path,
+    // Resolve stack path
+    let stack_path = resolve_stack_path(&flow_config.stack.path);
+
+    // Run steps
+    let results = runner::run_steps(
+        &steps,
+        &agents,
+        task,
+        &stack_path,
         &flow_name,
         &guide,
         &rules_cache,
@@ -227,7 +267,7 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
         &total_in.to_string(),
         &total_out.to_string(),
         "—",
-        &flow_config.state.path,
+        &stack_path.display().to_string(),
     );
 
     Ok(())

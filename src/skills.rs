@@ -194,6 +194,7 @@ pub fn collect_skill_names(agents: &[crate::config::Agent]) -> Vec<String> {
     names
 }
 
+
 /// Check that all referenced skill directories exist.
 /// Returns the list of missing skills.
 pub fn check_skills_available(skill_names: &[String], skills_dir: &Path) -> Vec<String> {
