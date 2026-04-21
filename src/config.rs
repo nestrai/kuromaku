@@ -70,6 +70,7 @@ impl<'de> Deserialize<'de> for Version {
 pub struct RawFlowConfig {
     pub version: Version,
     pub name: String,
+    pub prompt: Option<String>,
     #[serde(default)]
     pub defaults: Option<RawDefaults>,
     pub flow: IndexMap<String, RawStep>,
@@ -134,6 +135,7 @@ pub struct RawStackConfig {
 pub struct FlowConfig {
     pub version: String,
     pub name: String,
+    pub prompt: Option<String>,
     pub defaults: Defaults,
     pub steps: Vec<Step>,
     pub stack: StackConfig,
@@ -336,6 +338,7 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
     Ok(FlowConfig {
         version: raw.version.0,
         name: raw.name,
+        prompt: raw.prompt,
         defaults,
         steps,
         stack,

@@ -176,6 +176,7 @@ flow:
         let config = FlowConfig {
             version: "1".to_string(),
             name: "test".to_string(),
+            prompt: None,
             defaults: crate::config::Defaults {
                 model: "m".to_string(),
                 backend: crate::config::Backend::Api,

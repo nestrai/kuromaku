@@ -34,9 +34,13 @@ enum Command {
         /// Flow name (looks in .koto/flows/<name>.yaml)
         flow: Option<String>,
 
-        /// Task to execute
+        /// Task prompt or template arguments (key=value pairs fill {{key}} placeholders in the flow prompt)
         #[arg(short = 't', long)]
-        task: String,
+        task: Option<String>,
+
+        /// Template arguments as key=value pairs (e.g. pr=67 branch=main)
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
 
         /// Path to the flow config file (overrides flow name lookup)
         #[arg(short, long)]
@@ -64,9 +68,19 @@ async fn main() -> Result<()> {
         Command::Up {
             flow,
             task,
+            args,
             file,
             executor,
-        } => run_up(flow.as_deref(), &task, file.as_deref(), executor.as_deref()).await?,
+        } => {
+            run_up(
+                flow.as_deref(),
+                task.as_deref(),
+                &args,
+                file.as_deref(),
+                executor.as_deref(),
+            )
+            .await?
+        }
         Command::Pull => run_pull()?,
         Command::Down => {
             println!("koto down: not yet implemented");
@@ -167,9 +181,88 @@ fn resolve_stack_path(config_path: &str) -> PathBuf {
         .join(project)
 }
 
+/// Resolve the task prompt from CLI flag, flow default, and key=value args.
+///
+/// Priority: `-t "prompt"` overrides flow default. If the flow has a `prompt:`
+/// field with `{{key}}` placeholders, key=value trailing args fill them.
+fn resolve_task(
+    task_flag: Option<&str>,
+    flow_prompt: &Option<String>,
+    args: &[String],
+) -> Result<String> {
+    // -t flag takes precedence
+    if let Some(task) = task_flag {
+        return Ok(task.to_string());
+    }
+
+    // Flow has a default prompt with placeholders
+    if let Some(prompt) = flow_prompt {
+        let vars = parse_key_value_args(args)?;
+        let resolved = substitute_placeholders(prompt, &vars)?;
+        return Ok(resolved);
+    }
+
+    Err(eyre!(
+        "no task specified\n\nhint: use -t \"task\" or define a prompt in the flow YAML"
+    ))
+}
+
+/// Parse `key=value` pairs from trailing CLI args.
+fn parse_key_value_args(args: &[String]) -> Result<std::collections::HashMap<String, String>> {
+    let mut map = std::collections::HashMap::new();
+    for arg in args {
+        let (key, value) = arg.split_once('=').ok_or_else(|| {
+            eyre!(
+                "invalid argument '{arg}': expected key=value format\n\nhint: e.g. pr=67 branch=main"
+            )
+        })?;
+        map.insert(key.to_string(), value.to_string());
+    }
+    Ok(map)
+}
+
+/// Replace `{{key}}` placeholders in a prompt with values from the map.
+fn substitute_placeholders(
+    prompt: &str,
+    vars: &std::collections::HashMap<String, String>,
+) -> Result<String> {
+    let re = regex_lite::Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap();
+    let mut result = prompt.to_string();
+    let mut missing: Vec<String> = Vec::new();
+
+    for cap in re.captures_iter(prompt) {
+        let key = &cap[1];
+        match vars.get(key) {
+            Some(value) => {
+                result = result.replace(&format!("{{{{{key}}}}}"), value);
+            }
+            None => {
+                if !missing.contains(&key.to_string()) {
+                    missing.push(key.to_string());
+                }
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(eyre!(
+            "missing template arguments: {}\n\nhint: pass them as key=value, e.g. {}",
+            missing.join(", "),
+            missing
+                .iter()
+                .map(|k| format!("{k}=<value>"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+
+    Ok(result)
+}
+
 async fn run_up(
     flow: Option<&str>,
-    task: &str,
+    task: Option<&str>,
+    args: &[String],
     file: Option<&str>,
     executor: Option<&str>,
 ) -> Result<()> {
@@ -180,6 +273,9 @@ async fn run_up(
     ui::print_command(&format!("koto up {}", flow.unwrap_or(&display_path)));
 
     let flow_config = config::load_flow(&path)?;
+
+    // Resolve task prompt: -t flag > flow default prompt with {{key}} substitution
+    let resolved_task = resolve_task(task, &flow_config.prompt, args)?;
 
     // Derive flow name for tmux sessions
     let flow_name = flow
@@ -245,7 +341,7 @@ async fn run_up(
     let results = runner::run_steps(
         &steps,
         &agents,
-        task,
+        &resolved_task,
         &stack_path,
         &flow_name,
         &guide,
@@ -305,5 +401,82 @@ fn format_elapsed(d: std::time::Duration) -> String {
         format!("{}m{:02}s", secs / 60, secs % 60)
     } else {
         format!("{}.{:01}s", secs, d.subsec_millis() / 100)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_key_value_args_valid() {
+        let args = vec!["pr=67".to_string(), "branch=main".to_string()];
+        let map = parse_key_value_args(&args).unwrap();
+        assert_eq!(map.get("pr").unwrap(), "67");
+        assert_eq!(map.get("branch").unwrap(), "main");
+    }
+
+    #[test]
+    fn parse_key_value_args_empty() {
+        let map = parse_key_value_args(&[]).unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn parse_key_value_args_invalid() {
+        let args = vec!["nope".to_string()];
+        assert!(parse_key_value_args(&args).is_err());
+    }
+
+    #[test]
+    fn substitute_single_placeholder() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("pr".to_string(), "67".to_string());
+        let result = substitute_placeholders("Review PR #{{pr}}", &vars).unwrap();
+        assert_eq!(result, "Review PR #67");
+    }
+
+    #[test]
+    fn substitute_multiple_placeholders() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("pr".to_string(), "67".to_string());
+        vars.insert("repo".to_string(), "ikno".to_string());
+        let result = substitute_placeholders("Review PR #{{pr}} in {{repo}}", &vars).unwrap();
+        assert_eq!(result, "Review PR #67 in ikno");
+    }
+
+    #[test]
+    fn substitute_no_placeholders() {
+        let vars = std::collections::HashMap::new();
+        let result = substitute_placeholders("Just a plain task", &vars).unwrap();
+        assert_eq!(result, "Just a plain task");
+    }
+
+    #[test]
+    fn substitute_missing_placeholder_errors() {
+        let vars = std::collections::HashMap::new();
+        let err = substitute_placeholders("Review PR #{{pr}}", &vars).unwrap_err();
+        assert!(err.to_string().contains("pr"));
+    }
+
+    #[test]
+    fn resolve_task_flag_wins() {
+        let result =
+            resolve_task(Some("manual task"), &Some("default {{pr}}".to_string()), &[]).unwrap();
+        assert_eq!(result, "manual task");
+    }
+
+    #[test]
+    fn resolve_task_flow_prompt_with_args() {
+        let args = vec!["pr=42".to_string()];
+        let result =
+            resolve_task(None, &Some("Review PR #{{pr}}".to_string()), &args).unwrap();
+        assert_eq!(result, "Review PR #42");
+    }
+
+    #[test]
+    fn resolve_task_no_task_no_prompt_errors() {
+        let err = resolve_task(None, &None, &[]).unwrap_err();
+        assert!(err.to_string().contains("no task specified"));
     }
 }
