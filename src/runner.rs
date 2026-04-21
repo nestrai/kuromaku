@@ -26,6 +26,9 @@ pub enum RunError {
 
     #[error("template tasks are not yet supported (stage '{0}')")]
     TemplateNotSupported(String),
+
+    #[error("rules file not found: {0}")]
+    RulesNotFound(String),
 }
 
 /// Result of running a single stage, used for the summary table.
@@ -39,11 +42,73 @@ pub struct StageRunResult {
     pub output_file: String,
 }
 
+/// Load `.koto/Guide.md` if it exists.
+pub fn load_guide(koto_dir: &Path) -> Option<String> {
+    let guide_path = koto_dir.join("Guide.md");
+    std::fs::read_to_string(&guide_path).ok()
+}
+
+/// Pre-load rules files for all agents that reference them.
+/// Returns a map from rules name -> content.
+pub fn load_rules_for_agents(
+    agents: &[Agent],
+    koto_dir: &Path,
+) -> Result<HashMap<String, String>, RunError> {
+    let mut cache: HashMap<String, String> = HashMap::new();
+    let rules_dir = koto_dir.join("rules");
+
+    for agent in agents {
+        if let Some(ref rules_name) = agent.rules {
+            if cache.contains_key(rules_name) {
+                continue;
+            }
+            let rules_path = rules_dir.join(format!("{rules_name}.md"));
+            let content = std::fs::read_to_string(&rules_path).map_err(|_| {
+                RunError::RulesNotFound(format!(
+                    "rules file '{}' not found (expected at {})",
+                    rules_name,
+                    rules_path.display()
+                ))
+            })?;
+            cache.insert(rules_name.clone(), content);
+        }
+    }
+
+    Ok(cache)
+}
+
+/// Build the full system prompt: Guide + Rules + Role.
+fn build_system_prompt(
+    agent: &Agent,
+    guide: &Option<String>,
+    rules_cache: &HashMap<String, String>,
+) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+
+    if let Some(guide_content) = guide {
+        parts.push(guide_content);
+    }
+
+    let rules_content;
+    if let Some(ref rules_name) = agent.rules
+        && let Some(content) = rules_cache.get(rules_name)
+    {
+        rules_content = content.clone();
+        parts.push(&rules_content);
+    }
+
+    parts.push(&agent.role);
+    parts.join("\n\n")
+}
+
 /// Run stages sequentially in topological order.
 pub async fn run_stages(
     config: &FlowConfig,
     stages: &[&Stage],
     state_path: &Path,
+    flow_name: &str,
+    guide: &Option<String>,
+    rules_cache: &HashMap<String, String>,
 ) -> Result<Vec<StageRunResult>, RunError> {
     let agents: HashMap<&str, &Agent> = config.agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let total = stages.len();
@@ -106,9 +171,11 @@ pub async fn run_stages(
 
         ui::print_thinking(&task_text);
 
+        let system_prompt = build_system_prompt(agent, guide, rules_cache);
+
         let request = LlmRequest {
             model: effective_model.to_string(),
-            system: Some(agent.role.clone()),
+            system: Some(system_prompt),
             messages: vec![Message {
                 role: Role::User,
                 content: user_content.clone(),
@@ -116,7 +183,7 @@ pub async fn run_stages(
             max_tokens: 4096,
         };
 
-        let client = llm::create_client(effective_backend);
+        let client = llm::create_client(effective_backend, flow_name, &stage.id);
         let start = Instant::now();
         let response = client
             .send_boxed(request)
@@ -266,5 +333,92 @@ mod tests {
         assert_eq!(summary[0].id, "design");
         assert_eq!(summary[0].backend, "api");
         assert_eq!(summary[0].tokens_in, "1200");
+    }
+
+    #[test]
+    fn build_system_prompt_with_all_parts() {
+        let agent = Agent {
+            id: "dev".to_string(),
+            role: "You are a developer".to_string(),
+            model: "sonnet".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: Some("rust-developer".to_string()),
+        };
+        let guide = Some("Project guide content".to_string());
+        let mut rules_cache = HashMap::new();
+        rules_cache.insert(
+            "rust-developer".to_string(),
+            "Rust rules content".to_string(),
+        );
+
+        let prompt = build_system_prompt(&agent, &guide, &rules_cache);
+        assert!(prompt.starts_with("Project guide content"));
+        assert!(prompt.contains("Rust rules content"));
+        assert!(prompt.ends_with("You are a developer"));
+    }
+
+    #[test]
+    fn build_system_prompt_without_guide_or_rules() {
+        let agent = Agent {
+            id: "dev".to_string(),
+            role: "You are a developer".to_string(),
+            model: "sonnet".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: None,
+        };
+        let guide = None;
+        let rules_cache = HashMap::new();
+
+        let prompt = build_system_prompt(&agent, &guide, &rules_cache);
+        assert_eq!(prompt, "You are a developer");
+    }
+
+    #[test]
+    fn load_guide_returns_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(load_guide(dir.path()).is_none());
+    }
+
+    #[test]
+    fn load_guide_reads_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let guide_path = dir.path().join("Guide.md");
+        std::fs::write(&guide_path, "# My Project\nContext here").unwrap();
+        let content = load_guide(dir.path()).unwrap();
+        assert!(content.contains("My Project"));
+    }
+
+    #[test]
+    fn load_rules_for_agents_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let rules_dir = dir.path().join("rules");
+        std::fs::create_dir_all(&rules_dir).unwrap();
+        std::fs::write(rules_dir.join("rust-developer.md"), "Use iterators").unwrap();
+
+        let agents = vec![Agent {
+            id: "dev".to_string(),
+            role: "dev".to_string(),
+            model: "m".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: Some("rust-developer".to_string()),
+        }];
+
+        let cache = load_rules_for_agents(&agents, dir.path()).unwrap();
+        assert_eq!(cache.get("rust-developer").unwrap(), "Use iterators");
+    }
+
+    #[test]
+    fn load_rules_for_agents_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents = vec![Agent {
+            id: "dev".to_string(),
+            role: "dev".to_string(),
+            model: "m".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: Some("nonexistent".to_string()),
+        }];
+
+        let err = load_rules_for_agents(&agents, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("nonexistent"));
     }
 }

@@ -23,6 +23,9 @@ pub enum LlmError {
 
     #[error("unexpected response format: {0}")]
     ResponseFormat(String),
+
+    #[error("tmux error: {0}")]
+    Tmux(String),
 }
 
 // --- Message types ---
@@ -73,10 +76,10 @@ pub trait LlmClient: Send + Sync {
 
 // --- Factory ---
 
-pub fn create_client(backend: Backend) -> Box<dyn LlmClientBoxed> {
+pub fn create_client(backend: Backend, flow_name: &str, stage_id: &str) -> Box<dyn LlmClientBoxed> {
     match backend {
         Backend::Api => Box::new(ApiClient::from_env()),
-        Backend::ClaudeCli => Box::new(CliClient::claude()),
+        Backend::ClaudeCli => Box::new(TmuxCliClient::new(flow_name, stage_id)),
         Backend::Ollama => Box::new(CliClient::ollama()),
     }
 }
@@ -240,73 +243,146 @@ impl LlmClient for ApiClient {
     }
 }
 
-// --- CliClient (claude CLI, ollama) ---
+// --- TmuxCliClient (claude CLI in a tmux session) ---
+
+#[derive(Debug, Clone)]
+pub struct TmuxCliClient {
+    session_name: String,
+    claude_bin: String,
+}
+
+impl TmuxCliClient {
+    pub fn new(flow_name: &str, stage_id: &str) -> Self {
+        Self {
+            session_name: format!("koto-{flow_name}-{stage_id}"),
+            claude_bin: std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string()),
+        }
+    }
+
+    fn build_claude_command(&self, request: &LlmRequest) -> String {
+        let mut parts = vec![self.claude_bin.clone()];
+        parts.push("--model".to_string());
+        parts.push(shell_escape(&request.model));
+        parts.push("--output-format".to_string());
+        parts.push("text".to_string());
+
+        if let Some(ref system) = request.system {
+            parts.push("--system-prompt".to_string());
+            parts.push(shell_escape(system));
+        }
+
+        if let Some(last_user) = request.messages.iter().rev().find(|m| m.role == Role::User) {
+            parts.push("--prompt".to_string());
+            parts.push(shell_escape(&last_user.content));
+        }
+
+        parts.join(" ")
+    }
+}
+
+fn shell_escape(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+impl LlmClient for TmuxCliClient {
+    async fn send(&self, request: LlmRequest) -> Result<LlmResponse, LlmError> {
+        let model = request.model.clone();
+        let output_file = std::env::temp_dir().join(format!("{}.out", self.session_name));
+
+        // Build the command that writes output to a temp file
+        let claude_cmd = self.build_claude_command(&request);
+        let tmux_cmd = format!("{claude_cmd} > '{}' 2>&1", output_file.display());
+
+        // Print tmux session info
+        eprintln!("      tmux session: {}", self.session_name);
+        eprintln!("      attach: tmux attach -t {}", self.session_name);
+
+        // Kill any existing session with this name (ignore errors)
+        let _ = tokio::process::Command::new("tmux")
+            .args(["kill-session", "-t", &self.session_name])
+            .output()
+            .await;
+
+        // Create new tmux session running the command
+        let create_output = tokio::process::Command::new("tmux")
+            .args(["new-session", "-d", "-s", &self.session_name, &tmux_cmd])
+            .output()
+            .await?;
+
+        if !create_output.status.success() {
+            let stderr = String::from_utf8_lossy(&create_output.stderr).to_string();
+            return Err(LlmError::Tmux(format!(
+                "failed to create tmux session '{}': {}",
+                self.session_name, stderr
+            )));
+        }
+
+        // Wait for the tmux session to finish
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+            let check = tokio::process::Command::new("tmux")
+                .args(["has-session", "-t", &self.session_name])
+                .output()
+                .await?;
+
+            if !check.status.success() {
+                // Session ended
+                break;
+            }
+        }
+
+        // Read the output file
+        let content = tokio::fs::read_to_string(&output_file).await.map_err(|e| {
+            LlmError::Tmux(format!(
+                "failed to read output from tmux session '{}': {}",
+                self.session_name, e
+            ))
+        })?;
+
+        // Clean up the temp file
+        let _ = tokio::fs::remove_file(&output_file).await;
+
+        let content = content.trim().to_string();
+        Ok(LlmResponse {
+            content,
+            model,
+            usage: None,
+        })
+    }
+}
+
+// --- CliClient (ollama, simple subprocess) ---
 
 #[derive(Debug, Clone)]
 pub struct CliClient {
     command: String,
-    args_builder: CliArgsBuilder,
-}
-
-#[derive(Debug, Clone)]
-enum CliArgsBuilder {
-    Claude,
-    Ollama,
 }
 
 impl CliClient {
-    pub fn claude() -> Self {
-        Self {
-            command: std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string()),
-            args_builder: CliArgsBuilder::Claude,
-        }
-    }
-
     pub fn ollama() -> Self {
         Self {
             command: std::env::var("OLLAMA_PATH").unwrap_or_else(|_| "ollama".to_string()),
-            args_builder: CliArgsBuilder::Ollama,
         }
     }
 
     fn build_command(&self, request: &LlmRequest) -> tokio::process::Command {
-        match &self.args_builder {
-            CliArgsBuilder::Claude => {
-                let mut cmd = tokio::process::Command::new(&self.command);
-                cmd.arg("--model").arg(&request.model);
-                cmd.arg("--output-format").arg("text");
-                if let Some(ref system) = request.system {
-                    cmd.arg("--system-prompt").arg(system);
-                }
-                // Pass the last user message as the prompt via --prompt
-                if let Some(last_user) =
-                    request.messages.iter().rev().find(|m| m.role == Role::User)
-                {
-                    cmd.arg("--prompt").arg(&last_user.content);
-                }
-                cmd
-            }
-            CliArgsBuilder::Ollama => {
-                let mut cmd = tokio::process::Command::new(&self.command);
-                cmd.arg("run").arg(&request.model);
-                // Ollama takes prompt as the final positional arg
-                let mut prompt = String::new();
-                if let Some(ref system) = request.system {
-                    prompt.push_str(&format!("System: {system}\n\n"));
-                }
-                for msg in &request.messages {
-                    match msg.role {
-                        Role::User => prompt.push_str(&format!("User: {}\n\n", msg.content)),
-                        Role::Assistant => {
-                            prompt.push_str(&format!("Assistant: {}\n\n", msg.content))
-                        }
-                        Role::System => {}
-                    }
-                }
-                cmd.arg(prompt.trim());
-                cmd
+        let mut cmd = tokio::process::Command::new(&self.command);
+        cmd.arg("run").arg(&request.model);
+        // Ollama takes prompt as the final positional arg
+        let mut prompt = String::new();
+        if let Some(ref system) = request.system {
+            prompt.push_str(&format!("System: {system}\n\n"));
+        }
+        for msg in &request.messages {
+            match msg.role {
+                Role::User => prompt.push_str(&format!("User: {}\n\n", msg.content)),
+                Role::Assistant => prompt.push_str(&format!("Assistant: {}\n\n", msg.content)),
+                Role::System => {}
             }
         }
+        cmd.arg(prompt.trim());
+        cmd
     }
 }
 
@@ -339,7 +415,6 @@ mod tests {
 
     #[test]
     fn api_client_from_env_defaults() {
-        // Unset to test default behavior
         unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
         let client = ApiClient::from_env();
         assert!(client.api_key.is_empty());
@@ -376,8 +451,14 @@ mod tests {
     }
 
     #[test]
-    fn cli_client_claude_builds_command() {
-        let client = CliClient::claude();
+    fn tmux_client_session_name() {
+        let client = TmuxCliClient::new("planning", "design");
+        assert_eq!(client.session_name, "koto-planning-design");
+    }
+
+    #[test]
+    fn tmux_client_builds_command() {
+        let client = TmuxCliClient::new("planning", "design");
         let request = LlmRequest {
             model: "claude-sonnet-4-5-20250514".to_string(),
             system: Some("You are a dev".to_string()),
@@ -387,13 +468,21 @@ mod tests {
             }],
             max_tokens: 1000,
         };
-        let cmd = client.build_command(&request);
-        let prog = cmd.as_std().get_program().to_string_lossy().to_string();
-        assert!(prog.contains("claude"), "expected claude, got: {prog}");
+        let cmd = client.build_claude_command(&request);
+        assert!(cmd.contains("claude"));
+        assert!(cmd.contains("--model"));
+        assert!(cmd.contains("--system-prompt"));
+        assert!(cmd.contains("--prompt"));
     }
 
     #[test]
-    fn cli_client_ollama_builds_command() {
+    fn shell_escape_handles_quotes() {
+        assert_eq!(shell_escape("hello"), "'hello'");
+        assert_eq!(shell_escape("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn ollama_client_builds_command() {
         let client = CliClient::ollama();
         let request = LlmRequest {
             model: "llama3".to_string(),
@@ -411,10 +500,9 @@ mod tests {
 
     #[test]
     fn create_client_returns_correct_backend() {
-        // Just verify it doesn't panic for each variant
-        let _ = create_client(Backend::Api);
-        let _ = create_client(Backend::ClaudeCli);
-        let _ = create_client(Backend::Ollama);
+        let _ = create_client(Backend::Api, "test", "stage");
+        let _ = create_client(Backend::ClaudeCli, "test", "stage");
+        let _ = create_client(Backend::Ollama, "test", "stage");
     }
 
     #[test]
@@ -434,73 +522,5 @@ mod tests {
         let msg: Message = serde_json::from_str(json).unwrap();
         assert_eq!(msg.role, Role::Assistant);
         assert_eq!(msg.content, "hi there");
-    }
-
-    #[test]
-    fn llm_request_builder_pattern() {
-        let request = LlmRequest {
-            model: "claude-sonnet-4-5-20250514".to_string(),
-            system: Some("system prompt".to_string()),
-            messages: vec![
-                Message {
-                    role: Role::User,
-                    content: "first".to_string(),
-                },
-                Message {
-                    role: Role::Assistant,
-                    content: "response".to_string(),
-                },
-                Message {
-                    role: Role::User,
-                    content: "second".to_string(),
-                },
-            ],
-            max_tokens: 4096,
-        };
-        assert_eq!(request.messages.len(), 3);
-        assert_eq!(request.max_tokens, 4096);
-    }
-
-    #[test]
-    fn claude_command_includes_system_prompt() {
-        let client = CliClient::claude();
-        let request = LlmRequest {
-            model: "sonnet".to_string(),
-            system: Some("be helpful".to_string()),
-            messages: vec![Message {
-                role: Role::User,
-                content: "hi".to_string(),
-            }],
-            max_tokens: 100,
-        };
-        let cmd = client.build_command(&request);
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert!(args.contains(&"--system-prompt".to_string()));
-        assert!(args.contains(&"be helpful".to_string()));
-    }
-
-    #[test]
-    fn claude_command_without_system_prompt() {
-        let client = CliClient::claude();
-        let request = LlmRequest {
-            model: "sonnet".to_string(),
-            system: None,
-            messages: vec![Message {
-                role: Role::User,
-                content: "hi".to_string(),
-            }],
-            max_tokens: 100,
-        };
-        let cmd = client.build_command(&request);
-        let args: Vec<String> = cmd
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().to_string())
-            .collect();
-        assert!(!args.contains(&"--system-prompt".to_string()));
     }
 }

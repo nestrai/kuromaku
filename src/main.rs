@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
@@ -14,6 +14,9 @@ mod state;
 #[allow(dead_code)]
 mod ui;
 
+const KOTO_DIR: &str = ".koto";
+const FLOWS_DIR: &str = ".koto/flows";
+
 #[derive(Parser)]
 #[command(name = "koto", about = "Reproducible AI agent teams")]
 struct Cli {
@@ -25,9 +28,12 @@ struct Cli {
 enum Command {
     /// Start the agent team
     Up {
-        /// Path to the flow config file
-        #[arg(short, long, default_value = "koto.yaml")]
-        file: String,
+        /// Flow name (looks in .koto/flows/<name>.yaml)
+        flow: Option<String>,
+
+        /// Path to the flow config file (overrides flow name lookup)
+        #[arg(short, long)]
+        file: Option<String>,
     },
     /// Stop the agent team
     Down,
@@ -41,7 +47,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Up { file } => run_up(&file).await?,
+        Command::Up { flow, file } => run_up(flow.as_deref(), file.as_deref()).await?,
         Command::Down => {
             println!("koto down: not yet implemented");
         }
@@ -53,45 +59,90 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_up(file: &str) -> Result<()> {
-    let flow_start = Instant::now();
-    let path = Path::new(file);
+/// Resolve the flow config file path from CLI arguments.
+fn resolve_flow_path(flow: Option<&str>, file: Option<&str>) -> Result<PathBuf> {
+    // --file takes precedence
+    if let Some(f) = file {
+        let path = PathBuf::from(f);
+        if !path.exists() {
+            return Err(eyre!("config file '{}' not found", f));
+        }
+        return Ok(path);
+    }
 
-    if !path.exists() {
+    // If a flow name is given, look in .koto/flows/
+    if let Some(name) = flow {
+        let path = PathBuf::from(FLOWS_DIR).join(format!("{name}.yaml"));
+        if !path.exists() {
+            return Err(eyre!(
+                "flow '{name}' not found at {}\n\nhint: create {0} or use --file <path>",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+
+    // No args: list available flows
+    let flows_dir = Path::new(FLOWS_DIR);
+    if !flows_dir.exists() {
         return Err(eyre!(
-            "config file '{}' not found\n\nhint: create a koto.yaml in the current directory, or use --file <path>",
-            file
+            "no .koto/flows/ directory found\n\nhint: create .koto/flows/<name>.yaml, or use --file <path>"
         ));
     }
 
-    ui::print_command(&format!("koto up {file}"));
+    let mut flows: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(flows_dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".yaml") || name_str.ends_with(".yml") {
+                flows.push(
+                    name_str
+                        .trim_end_matches(".yaml")
+                        .trim_end_matches(".yml")
+                        .to_string(),
+                );
+            }
+        }
+    }
 
-    let flow_config = config::load_config(path)?;
+    if flows.is_empty() {
+        return Err(eyre!(
+            "no flows found in .koto/flows/\n\nhint: create .koto/flows/<name>.yaml"
+        ));
+    }
+
+    flows.sort();
+    let list = flows
+        .iter()
+        .map(|f| format!("  - {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Err(eyre!(
+        "no flow specified\n\navailable flows:\n{list}\n\nusage: koto up <flow-name>"
+    ))
+}
+
+async fn run_up(flow: Option<&str>, file: Option<&str>) -> Result<()> {
+    let flow_start = Instant::now();
+    let path = resolve_flow_path(flow, file)?;
+    let display_path = path.display().to_string();
+
+    ui::print_command(&format!("koto up {}", flow.unwrap_or(&display_path)));
+
+    let flow_config = config::load_config(&path)?;
+
+    // Derive flow name for tmux sessions
+    let flow_name = flow
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| flow_config.name.clone());
+
     ui::print_flow_start(
         &flow_config.name,
-        file,
+        &display_path,
         flow_config.stages.len(),
         flow_config.agents.len(),
     );
-
-    // Check for API key early if any agent uses the api backend
-    let needs_api_key = flow_config
-        .agents
-        .iter()
-        .any(|a| a.backend == config::Backend::Api)
-        || flow_config
-            .stages
-            .iter()
-            .any(|s| s.backend == Some(config::Backend::Api));
-    if needs_api_key
-        && std::env::var("ANTHROPIC_API_KEY")
-            .unwrap_or_default()
-            .is_empty()
-    {
-        return Err(eyre!(
-            "ANTHROPIC_API_KEY is not set but one or more agents use the 'api' backend\n\nhint: export ANTHROPIC_API_KEY=sk-..."
-        ));
-    }
 
     // Validate DAG and get execution order
     let stages = dag::validate_dag(&flow_config)?;
@@ -111,9 +162,22 @@ async fn run_up(file: &str) -> Result<()> {
     }
     ui::print_backends_ok(&backend_list);
 
+    // Load guide and rules context
+    let koto_dir = Path::new(KOTO_DIR);
+    let guide = runner::load_guide(koto_dir);
+    let rules_cache = runner::load_rules_for_agents(&flow_config.agents, koto_dir)?;
+
     // Run stages
     let state_path = Path::new(&flow_config.state.path);
-    let results = runner::run_stages(&flow_config, &stages, state_path).await?;
+    let results = runner::run_stages(
+        &flow_config,
+        &stages,
+        state_path,
+        &flow_name,
+        &guide,
+        &rules_cache,
+    )
+    .await?;
 
     // Print summary
     let total_elapsed = flow_start.elapsed();

@@ -225,6 +225,7 @@ stages:
                 role: "dev".to_string(),
                 model: "m".to_string(),
                 backend: crate::config::Backend::Api,
+                rules: None,
             }],
             stages: vec![Stage {
                 id: "a".to_string(),

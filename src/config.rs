@@ -93,6 +93,7 @@ pub struct RawAgent {
     pub role: String,
     pub model: Option<String>,
     pub backend: Option<Backend>,
+    pub rules: Option<String>,
     #[serde(flatten)]
     pub unknown: std::collections::HashMap<String, serde_yaml::Value>,
 }
@@ -148,6 +149,7 @@ pub struct Agent {
     pub role: String,
     pub model: String,
     pub backend: Backend,
+    pub rules: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -180,7 +182,7 @@ pub struct StateConfig {
 // --- Constants ---
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5";
-const DEFAULT_BACKEND: Backend = Backend::Api;
+const DEFAULT_BACKEND: Backend = Backend::ClaudeCli;
 const DEFAULT_STATE_BACKEND: &str = "local";
 const DEFAULT_STATE_PATH: &str = ".koto/state";
 
@@ -310,6 +312,7 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
             backend: a.backend.unwrap_or(defaults.backend),
             id: a.id,
             role: a.role,
+            rules: a.rules,
         })
         .collect();
 
@@ -444,7 +447,7 @@ stages:
         assert_eq!(config.stages.len(), 1);
         // Global defaults applied
         assert_eq!(config.agents[0].model, DEFAULT_MODEL);
-        assert_eq!(config.agents[0].backend, Backend::Api);
+        assert_eq!(config.agents[0].backend, Backend::ClaudeCli);
         assert_eq!(config.defaults.model, DEFAULT_MODEL);
         assert_eq!(config.state.backend, DEFAULT_STATE_BACKEND);
         assert_eq!(config.state.path, DEFAULT_STATE_PATH);
