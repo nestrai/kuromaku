@@ -8,6 +8,8 @@ use color_eyre::eyre::eyre;
 mod config;
 mod dag;
 #[allow(dead_code)]
+mod executor;
+#[allow(dead_code)]
 mod llm;
 mod runner;
 mod state;

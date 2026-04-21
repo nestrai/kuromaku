@@ -3,6 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::config::{Agent, Backend, FlowConfig, Stage, TaskSource};
+use crate::executor::{self, ExecutionTask, ExecutorBoxed};
 use crate::llm::{self, LlmRequest, Message, Role};
 use crate::state::{self, StageOutput};
 use crate::ui::{self, StageInfo, StageState};
@@ -16,6 +17,12 @@ pub enum RunError {
     LlmFailed {
         stage: String,
         source: llm::LlmError,
+    },
+
+    #[error("stage '{stage}' execution failed: {source}")]
+    ExecutorFailed {
+        stage: String,
+        source: executor::ExecutorError,
     },
 
     #[error("state error in stage '{stage}': {source}")]
@@ -101,6 +108,103 @@ fn build_system_prompt(
     parts.join("\n\n")
 }
 
+/// Build the user-facing prompt with context from prior stages.
+fn build_user_prompt(
+    task_text: &str,
+    stage: &Stage,
+    state_path: &Path,
+) -> Result<String, RunError> {
+    let mut context_parts: Vec<String> = Vec::new();
+    for input_id in &stage.input {
+        let prior = state::read_stage(state_path, input_id).map_err(|e| RunError::State {
+            stage: stage.id.clone(),
+            source: e,
+        })?;
+        let output_label = prior.stage_id.clone();
+        ui::print_context_injection(&output_label, &format!("{input_id}.json"), "");
+        context_parts.push(format!(
+            "--- Output from stage '{output_label}' ---\n{}\n---",
+            prior.response
+        ));
+    }
+
+    let mut user_content = task_text.to_string();
+    if !context_parts.is_empty() {
+        user_content = format!(
+            "{user_content}\n\nContext from previous stages:\n\n{}",
+            context_parts.join("\n\n")
+        );
+    }
+    Ok(user_content)
+}
+
+/// Run a stage via the Executor (CLI backends: claude-cli, ollama).
+async fn run_stage_via_executor(
+    executor: &dyn ExecutorBoxed,
+    stage: &Stage,
+    flow_name: &str,
+    system_prompt: &str,
+    user_content: &str,
+    model: &str,
+    backend: Backend,
+) -> Result<(String, Option<llm::Usage>), RunError> {
+    let task_id = format!("koto-{flow_name}-{}", stage.id);
+
+    let command = match backend {
+        Backend::ClaudeCli => {
+            executor::build_claude_command(model, Some(system_prompt), user_content)
+        }
+        Backend::Ollama => {
+            // For ollama, fold system prompt into user content
+            let mut prompt = String::new();
+            prompt.push_str(&format!("System: {system_prompt}\n\n"));
+            prompt.push_str(&format!("User: {user_content}"));
+            executor::build_ollama_command(model, &prompt)
+        }
+        Backend::Api => unreachable!("API backend does not use executor"),
+    };
+
+    let task = ExecutionTask {
+        id: task_id,
+        command,
+        env: HashMap::new(),
+    };
+
+    let handle = executor
+        .spawn_boxed(task)
+        .await
+        .map_err(|e| RunError::ExecutorFailed {
+            stage: stage.id.clone(),
+            source: e,
+        })?;
+
+    let output = executor
+        .wait_boxed(&handle)
+        .await
+        .map_err(|e| RunError::ExecutorFailed {
+            stage: stage.id.clone(),
+            source: e,
+        })?;
+
+    Ok((output.stdout, None))
+}
+
+/// Run a stage via the API client directly (no executor needed).
+async fn run_stage_via_api(
+    request: LlmRequest,
+    stage_id: &str,
+) -> Result<(String, Option<llm::Usage>), RunError> {
+    let client = llm::ApiClient::from_env();
+    let response = client
+        .send(request)
+        .await
+        .map_err(|e| RunError::LlmFailed {
+            stage: stage_id.to_string(),
+            source: e,
+        })?;
+    Ok((response.content, response.usage))
+}
+
 /// Run stages sequentially in topological order.
 pub async fn run_stages(
     config: &FlowConfig,
@@ -113,6 +217,9 @@ pub async fn run_stages(
     let agents: HashMap<&str, &Agent> = config.agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let total = stages.len();
     let mut results = Vec::with_capacity(total);
+
+    // Create executor for CLI backends
+    let executor = executor::create_executor(config);
 
     for (i, stage) in stages.iter().enumerate() {
         let agent = agents
@@ -145,53 +252,38 @@ pub async fn run_stages(
             }
         };
 
-        // Build context from input stages
-        let mut context_parts: Vec<String> = Vec::new();
-        for input_id in &stage.input {
-            let prior = state::read_stage(state_path, input_id).map_err(|e| RunError::State {
-                stage: stage.id.clone(),
-                source: e,
-            })?;
-            let output_label = prior.stage_id.clone();
-            ui::print_context_injection(&output_label, &format!("{input_id}.json"), "");
-            context_parts.push(format!(
-                "--- Output from stage '{output_label}' ---\n{}\n---",
-                prior.response
-            ));
-        }
-
-        // Build prompt
-        let mut user_content = task_text.clone();
-        if !context_parts.is_empty() {
-            user_content = format!(
-                "{user_content}\n\nContext from previous stages:\n\n{}",
-                context_parts.join("\n\n")
-            );
-        }
+        let user_content = build_user_prompt(&task_text, stage, state_path)?;
 
         ui::print_thinking(&task_text);
 
         let system_prompt = build_system_prompt(agent, guide, rules_cache);
 
-        let request = LlmRequest {
-            model: effective_model.to_string(),
-            system: Some(system_prompt),
-            messages: vec![Message {
-                role: Role::User,
-                content: user_content.clone(),
-            }],
-            max_tokens: 4096,
+        let start = Instant::now();
+
+        let (content, usage) = if executor::backend_needs_executor(effective_backend) {
+            run_stage_via_executor(
+                executor.as_ref(),
+                stage,
+                flow_name,
+                &system_prompt,
+                &user_content,
+                effective_model,
+                effective_backend,
+            )
+            .await?
+        } else {
+            let request = LlmRequest {
+                model: effective_model.to_string(),
+                system: Some(system_prompt),
+                messages: vec![Message {
+                    role: Role::User,
+                    content: user_content.clone(),
+                }],
+                max_tokens: 4096,
+            };
+            run_stage_via_api(request, &stage.id).await?
         };
 
-        let client = llm::create_client(effective_backend, flow_name, &stage.id);
-        let start = Instant::now();
-        let response = client
-            .send_boxed(request)
-            .await
-            .map_err(|e| RunError::LlmFailed {
-                stage: stage.id.clone(),
-                source: e,
-            })?;
         let duration = start.elapsed();
 
         // Save state
@@ -199,9 +291,9 @@ pub async fn run_stages(
         let stage_output = StageOutput {
             stage_id: stage.id.clone(),
             agent_id: agent.id.clone(),
-            model: response.model.clone(),
+            model: effective_model.to_string(),
             prompt: user_content,
-            response: response.content.clone(),
+            response: content.clone(),
             timestamp,
         };
         state::write_stage(state_path, &stage_output).map_err(|e| RunError::State {
@@ -216,14 +308,14 @@ pub async fn run_stages(
             if let Some(parent) = output_path.parent() {
                 std::fs::create_dir_all(parent).ok();
             }
-            std::fs::write(&output_path, &response.content).map_err(|e| RunError::State {
+            std::fs::write(&output_path, &content).map_err(|e| RunError::State {
                 stage: stage.id.clone(),
                 source: state::StateError::Write(e),
             })?;
         }
 
-        let tokens_in = response.usage.as_ref().map(|u| u.input_tokens);
-        let tokens_out = response.usage.as_ref().map(|u| u.output_tokens);
+        let tokens_in = usage.as_ref().map(|u| u.input_tokens);
+        let tokens_out = usage.as_ref().map(|u| u.output_tokens);
 
         ui::print_stage_done(
             &format_duration(duration),
