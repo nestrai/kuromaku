@@ -184,7 +184,7 @@ flow:
             steps: vec![Step {
                 id: "a".to_string(),
                 agent: "dev".to_string(),
-                focus: None,
+                task: None,
                 input: vec![],
                 needs: vec!["nonexistent".to_string()],
                 model: None,

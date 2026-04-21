@@ -5,7 +5,6 @@ use tokio::sync::Mutex;
 
 use super::{
     ExecutionHandle, ExecutionOutput, ExecutionStatus, ExecutionTask, Executor, ExecutorError,
-    ExecutorTarget,
 };
 
 /// Executes steps locally as child processes.
@@ -49,7 +48,6 @@ impl Executor for LocalExecutor {
 
         Ok(ExecutionHandle {
             id: task.id,
-            target: ExecutorTarget::Local,
             metadata,
         })
     }

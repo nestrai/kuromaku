@@ -46,10 +46,6 @@ enum Command {
         #[arg(short, long)]
         file: Option<String>,
 
-        /// Executor name: "local" (default), or a name from .koto/executors/<name>.yaml
-        /// Can also be set via KOTO_EXECUTOR env var.
-        #[arg(short = 'e', long)]
-        executor: Option<String>,
     },
     /// Fetch skills from remote sources pinned in .koto/skills.lock
     Pull,
@@ -70,16 +66,8 @@ async fn main() -> Result<()> {
             task,
             args,
             file,
-            executor,
         } => {
-            run_up(
-                flow.as_deref(),
-                task.as_deref(),
-                &args,
-                file.as_deref(),
-                executor.as_deref(),
-            )
-            .await?
+            run_up(flow.as_deref(), task.as_deref(), &args, file.as_deref()).await?
         }
         Command::Pull => run_pull()?,
         Command::Down => {
@@ -264,7 +252,6 @@ async fn run_up(
     task: Option<&str>,
     args: &[String],
     file: Option<&str>,
-    executor: Option<&str>,
 ) -> Result<()> {
     let flow_start = Instant::now();
     let path = resolve_flow_path(flow, file)?;
@@ -311,9 +298,6 @@ async fn run_up(
     }
     ui::print_backends_ok(&backend_list);
 
-    // Resolve executor: --executor flag > KOTO_EXECUTOR env var > default (local)
-    let executor_target = executor::resolve_executor_target(executor, koto_dir)?;
-
     // Load guide and rules context
     let guide = runner::load_guide(koto_dir);
     let rules_cache = runner::load_rules_for_agents(&agents, koto_dir)?;
@@ -347,7 +331,6 @@ async fn run_up(
         &guide,
         &rules_cache,
         &skills_cache,
-        &executor_target,
     )
     .await?;
 

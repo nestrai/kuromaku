@@ -1,14 +1,9 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::Path;
-
-use serde::Deserialize;
 
 use crate::config::Backend;
 
-pub mod k8s;
 pub mod local;
-pub mod ssh;
 
 // --- Errors ---
 
@@ -22,9 +17,6 @@ pub enum ExecutorError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-
-    #[error("not implemented: {0}")]
-    NotImplemented(String),
 }
 
 // --- Types ---
@@ -39,7 +31,6 @@ pub struct ExecutionTask {
 /// Handle to a running execution, used to poll/wait/stop.
 pub struct ExecutionHandle {
     pub id: String,
-    pub target: ExecutorTarget,
     pub metadata: HashMap<String, String>,
 }
 
@@ -58,51 +49,25 @@ pub struct ExecutionOutput {
     pub exit_code: i32,
 }
 
-/// Which executor implementation to use for a stage.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutorTarget {
-    Local,
-    Ssh(SshConfig),
-    Kubernetes(K8sConfig),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SshConfig {
-    pub host: String,
-    pub user: Option<String>,
-    pub key_file: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct K8sConfig {
-    pub namespace: String,
-    pub image: String,
-    pub service_account: Option<String>,
-}
-
 // --- Trait ---
 
-/// Trait for stage execution backends.
+/// Trait for execution backends.
 pub trait Executor: Send + Sync {
-    /// Spawn a stage execution. Returns a handle to track it.
     fn spawn(
         &self,
         task: ExecutionTask,
     ) -> impl Future<Output = Result<ExecutionHandle, ExecutorError>> + Send;
 
-    /// Wait for a spawned execution to complete and return its output.
     fn wait(
         &self,
         handle: &ExecutionHandle,
     ) -> impl Future<Output = Result<ExecutionOutput, ExecutorError>> + Send;
 
-    /// Check the current status of an execution.
     fn status(
         &self,
         handle: &ExecutionHandle,
     ) -> impl Future<Output = Result<ExecutionStatus, ExecutorError>> + Send;
 
-    /// Stop/kill a running execution.
     fn stop(
         &self,
         handle: &ExecutionHandle,
@@ -166,114 +131,14 @@ impl<T: Executor> ExecutorBoxed for T {
     }
 }
 
-// --- Executor config files (.koto/executors/<name>.yaml) ---
-
-/// Parsed executor configuration from `.koto/executors/<name>.yaml`.
-/// The `kind` field determines which executor implementation to use.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase")]
-pub enum ExecutorConfig {
-    Local {
-        #[serde(default = "default_runtime")]
-        runtime: String,
-    },
-    Ssh {
-        host: String,
-        user: Option<String>,
-        key_file: Option<String>,
-    },
-    Kubernetes {
-        namespace: String,
-        image: String,
-        service_account: Option<String>,
-        resources: Option<K8sResources>,
-    },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-pub struct K8sResources {
-    pub cpu: Option<String>,
-    pub memory: Option<String>,
-}
-
-fn default_runtime() -> String {
-    "tmux".to_string()
-}
-
-/// Load an executor config from `.koto/executors/<name>.yaml`.
-fn load_executor_config(koto_dir: &Path, name: &str) -> Result<ExecutorConfig, color_eyre::Report> {
-    let path = koto_dir.join("executors").join(format!("{name}.yaml"));
-    if !path.exists() {
-        return Err(color_eyre::eyre::eyre!(
-            "executor '{}' not found at {}\n\nhint: create {} with a 'kind' field (local, ssh, kubernetes)",
-            name,
-            path.display(),
-            path.display()
-        ));
-    }
-    let contents = std::fs::read_to_string(&path)?;
-    let config: ExecutorConfig = serde_yaml::from_str(&contents)
-        .map_err(|e| color_eyre::eyre::eyre!("failed to parse {}: {e}", path.display()))?;
-    Ok(config)
-}
-
 // --- Factory ---
 
-/// Resolve the executor from CLI flag, env var, or default.
-/// Resolution order: --executor flag > KOTO_EXECUTOR env var > default "local".
-/// "local" is built-in (no file needed). Other names load from `.koto/executors/<name>.yaml`.
-pub fn resolve_executor_target(
-    cli_flag: Option<&str>,
-    koto_dir: &Path,
-) -> Result<ExecutorTarget, color_eyre::Report> {
-    let name = cli_flag
-        .map(|s| s.to_string())
-        .or_else(|| std::env::var("KOTO_EXECUTOR").ok())
-        .unwrap_or_else(|| "local".to_string());
-
-    // "local" is the built-in default -- no file needed
-    if name == "local" {
-        return Ok(ExecutorTarget::Local);
-    }
-
-    let config = load_executor_config(koto_dir, &name)?;
-    match config {
-        ExecutorConfig::Local { .. } => Ok(ExecutorTarget::Local),
-        ExecutorConfig::Ssh {
-            host,
-            user,
-            key_file,
-        } => Ok(ExecutorTarget::Ssh(SshConfig {
-            host,
-            user,
-            key_file,
-        })),
-        ExecutorConfig::Kubernetes {
-            namespace,
-            image,
-            service_account,
-            ..
-        } => Ok(ExecutorTarget::Kubernetes(K8sConfig {
-            namespace,
-            image,
-            service_account,
-        })),
-    }
+/// Create the local executor. Only local execution is supported for now.
+pub fn create_executor() -> Box<dyn ExecutorBoxed> {
+    Box::new(local::LocalExecutor::new())
 }
 
-/// Create executor for a resolved executor target.
-pub fn create_executor(target: &ExecutorTarget) -> Box<dyn ExecutorBoxed> {
-    match target {
-        ExecutorTarget::Local => Box::new(local::LocalExecutor::new()),
-        ExecutorTarget::Ssh(config) => Box::new(ssh::SshExecutor::new(config.clone())),
-        ExecutorTarget::Kubernetes(config) => {
-            Box::new(k8s::KubernetesExecutor::new(config.clone()))
-        }
-    }
-}
-
-/// Build the CLI command string for a claude-cli stage.
-/// Uses `claude --print` for non-interactive output with the prompt as positional arg.
+/// Build the CLI command string for a claude-cli backend.
 pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_prompt: &str) -> String {
     let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
 
@@ -290,13 +155,12 @@ pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_promp
         parts.push(shell_escape(system));
     }
 
-    // Prompt is positional in claude CLI
     parts.push(shell_escape(user_prompt));
 
     parts.join(" ")
 }
 
-/// Build the CLI command string for an ollama stage.
+/// Build the CLI command string for an ollama backend.
 pub fn build_ollama_command(model: &str, prompt: &str) -> String {
     let ollama_bin = std::env::var("OLLAMA_PATH").unwrap_or_else(|_| "ollama".to_string());
 
@@ -363,75 +227,7 @@ mod tests {
     }
 
     #[test]
-    fn create_executor_local() {
-        let _ = create_executor(&ExecutorTarget::Local);
-    }
-
-    #[test]
-    fn resolve_executor_defaults_to_local() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = resolve_executor_target(None, dir.path()).unwrap();
-        assert_eq!(target, ExecutorTarget::Local);
-    }
-
-    #[test]
-    fn resolve_executor_local_flag() {
-        let dir = tempfile::tempdir().unwrap();
-        let target = resolve_executor_target(Some("local"), dir.path()).unwrap();
-        assert_eq!(target, ExecutorTarget::Local);
-    }
-
-    #[test]
-    fn resolve_executor_missing_file_errors() {
-        let dir = tempfile::tempdir().unwrap();
-        let err = resolve_executor_target(Some("magic"), dir.path()).unwrap_err();
-        assert!(err.to_string().contains("executor 'magic' not found"));
-    }
-
-    #[test]
-    fn resolve_executor_ssh_from_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let executors_dir = dir.path().join("executors");
-        std::fs::create_dir_all(&executors_dir).unwrap();
-        let config = "kind: ssh\nhost: dev-server\nuser: deploy\n";
-        std::fs::write(executors_dir.join("remote.yaml"), config).unwrap();
-        let target = resolve_executor_target(Some("remote"), dir.path()).unwrap();
-        assert_eq!(
-            target,
-            ExecutorTarget::Ssh(SshConfig {
-                host: "dev-server".to_string(),
-                user: Some("deploy".to_string()),
-                key_file: None,
-            })
-        );
-    }
-
-    #[test]
-    fn resolve_executor_k8s_from_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let executors_dir = dir.path().join("executors");
-        std::fs::create_dir_all(&executors_dir).unwrap();
-        let config = "kind: kubernetes\nnamespace: koto-agents\nimage: ghcr.io/org/agent:latest\n";
-        std::fs::write(executors_dir.join("k8s.yaml"), config).unwrap();
-        let target = resolve_executor_target(Some("k8s"), dir.path()).unwrap();
-        assert_eq!(
-            target,
-            ExecutorTarget::Kubernetes(K8sConfig {
-                namespace: "koto-agents".to_string(),
-                image: "ghcr.io/org/agent:latest".to_string(),
-                service_account: None,
-            })
-        );
-    }
-
-    #[test]
-    fn resolve_executor_local_from_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let executors_dir = dir.path().join("executors");
-        std::fs::create_dir_all(&executors_dir).unwrap();
-        let config = "kind: local\nruntime: tmux\n";
-        std::fs::write(executors_dir.join("dev.yaml"), config).unwrap();
-        let target = resolve_executor_target(Some("dev"), dir.path()).unwrap();
-        assert_eq!(target, ExecutorTarget::Local);
+    fn create_executor_works() {
+        let _ = create_executor();
     }
 }

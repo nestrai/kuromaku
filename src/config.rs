@@ -92,7 +92,7 @@ pub struct RawDefaults {
 #[derive(Debug, Deserialize)]
 pub struct RawStep {
     pub agent: String,
-    pub focus: Option<String>,
+    pub task: Option<String>,
     #[serde(default)]
     pub input: Vec<String>,
     #[serde(default)]
@@ -164,7 +164,7 @@ pub struct Agent {
 pub struct Step {
     pub id: String,
     pub agent: String,
-    pub focus: Option<String>,
+    pub task: Option<String>,
     pub input: Vec<String>,
     pub needs: Vec<String>,
     pub model: Option<String>,
@@ -313,7 +313,7 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
             Step {
                 id,
                 agent: s.agent,
-                focus: s.focus,
+                task: s.task,
                 input: s.input,
                 needs,
                 model: s.model,
@@ -365,7 +365,7 @@ flow:
   review:
     agent: reviewer
     input: [design]
-    focus: "Check architecture decisions"
+    task: "Check architecture decisions"
 
 stack:
   backend: local
@@ -390,7 +390,7 @@ flow:
         assert_eq!(config.steps[0].id, "design");
         assert_eq!(config.steps[0].agent, "architect");
         assert_eq!(config.steps[1].id, "review");
-        assert_eq!(config.steps[1].focus.as_deref(), Some("Check architecture decisions"));
+        assert_eq!(config.steps[1].task.as_deref(), Some("Check architecture decisions"));
         assert_eq!(config.stack.backend, "local");
         assert_eq!(config.stack.path, "/tmp/test-stack");
     }
@@ -552,18 +552,18 @@ flow:
     }
 
     #[test]
-    fn focus_field_parses() {
+    fn task_field_parses() {
         let yaml = r#"
 version: "1"
 name: test
 flow:
   review:
     agent: reviewer
-    focus: "Check error handling"
+    task: "Check error handling"
 "#;
         let config = load_flow_from_str(yaml).unwrap();
         assert_eq!(
-            config.steps[0].focus.as_deref(),
+            config.steps[0].task.as_deref(),
             Some("Check error handling")
         );
     }

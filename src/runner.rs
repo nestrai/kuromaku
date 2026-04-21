@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::config::{Agent, Backend, Step};
-use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorTarget};
+use crate::executor::{self, ExecutionTask, ExecutorBoxed};
 use crate::llm::{self, LlmRequest, Message, Role};
 use crate::skills;
 use crate::stack::{self, StepOutput};
@@ -145,9 +145,9 @@ fn build_user_prompt(
 
     let mut user_content = task.to_string();
 
-    // If step has a focus, prepend it
-    if let Some(ref focus) = step.focus {
-        user_content = format!("{user_content}\n\nFocus: {focus}");
+    // If step has its own task, append it
+    if let Some(ref step_task) = step.task {
+        user_content = format!("{user_content}\n\nYour task: {step_task}");
     }
 
     if !context_parts.is_empty() {
@@ -242,13 +242,12 @@ pub async fn run_steps(
     guide: &Option<String>,
     rules_cache: &HashMap<String, String>,
     skills_cache: &HashMap<String, String>,
-    executor_target: &ExecutorTarget,
 ) -> Result<Vec<StepRunResult>, RunError> {
     let agent_map: HashMap<&str, &Agent> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let total = steps.len();
     let mut results = Vec::with_capacity(total);
 
-    let executor = executor::create_executor(executor_target);
+    let executor = executor::create_executor();
 
     for (i, step) in steps.iter().enumerate() {
         let agent = agent_map
@@ -273,14 +272,8 @@ pub async fn run_steps(
 
         ui::print_step_banner(i + 1, total, &step_info);
 
-        // First step gets the task as prompt, subsequent steps get focus or a default
-        let step_task = if i == 0 {
-            task.to_string()
-        } else if let Some(ref focus) = step.focus {
-            focus.clone()
-        } else {
-            task.to_string()
-        };
+        // All steps get the flow prompt; step.task is appended in build_user_prompt
+        let step_task = task.to_string();
 
         let user_content = build_user_prompt(&step_task, step, stack_path)?;
 
