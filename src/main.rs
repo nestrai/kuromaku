@@ -39,7 +39,7 @@ enum Command {
 
         /// Executor name: "local" (default), or a name from .koto/executors/<name>.yaml
         /// Can also be set via KOTO_EXECUTOR env var.
-        #[arg(short = 'x', long)]
+        #[arg(short = 'e', long)]
         executor: Option<String>,
     },
     /// Stop the agent team
@@ -175,7 +175,7 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
 
     // Resolve executor: --executor flag > KOTO_EXECUTOR env var > default (local)
     let koto_dir = Path::new(KOTO_DIR);
-    let deploy_target = executor::resolve_executor_target(executor, koto_dir)?;
+    let executor_target = executor::resolve_executor_target(executor, koto_dir)?;
 
     // Load guide and rules context
     let guide = runner::load_guide(koto_dir);
@@ -190,7 +190,7 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
         &flow_name,
         &guide,
         &rules_cache,
-        &deploy_target,
+        &executor_target,
     )
     .await?;
 

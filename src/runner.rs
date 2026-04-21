@@ -3,7 +3,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::config::{Agent, Backend, FlowConfig, Stage, TaskSource};
-use crate::executor::{self, DeployTarget, ExecutionTask, ExecutorBoxed};
+use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorTarget};
 use crate::llm::{self, LlmRequest, Message, Role};
 use crate::state::{self, StageOutput};
 use crate::ui::{self, StageInfo, StageState};
@@ -213,14 +213,14 @@ pub async fn run_stages(
     flow_name: &str,
     guide: &Option<String>,
     rules_cache: &HashMap<String, String>,
-    deploy_target: &DeployTarget,
+    executor_target: &ExecutorTarget,
 ) -> Result<Vec<StageRunResult>, RunError> {
     let agents: HashMap<&str, &Agent> = config.agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let total = stages.len();
     let mut results = Vec::with_capacity(total);
 
-    // Create executor for CLI backends based on deploy target
-    let executor = executor::create_executor(deploy_target);
+    // Create executor for CLI backends
+    let executor = executor::create_executor(executor_target);
 
     for (i, stage) in stages.iter().enumerate() {
         let agent = agents

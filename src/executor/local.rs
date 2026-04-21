@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use super::{
-    DeployTarget, ExecutionHandle, ExecutionOutput, ExecutionStatus, ExecutionTask, Executor,
-    ExecutorError,
+    ExecutionHandle, ExecutionOutput, ExecutionStatus, ExecutionTask, Executor, ExecutorError,
+    ExecutorTarget,
 };
 
 /// Executes stages locally via tmux sessions.
@@ -81,7 +81,7 @@ impl Executor for LocalExecutor {
 
         Ok(ExecutionHandle {
             id: task.id,
-            target: DeployTarget::Local,
+            target: ExecutorTarget::Local,
             metadata,
         })
     }

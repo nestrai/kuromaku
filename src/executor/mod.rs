@@ -42,7 +42,7 @@ pub struct ExecutionTask {
 /// Handle to a running execution, used to poll/wait/stop.
 pub struct ExecutionHandle {
     pub id: String,
-    pub target: DeployTarget,
+    pub target: ExecutorTarget,
     pub metadata: HashMap<String, String>,
 }
 
@@ -60,9 +60,9 @@ pub struct ExecutionOutput {
     pub exit_code: i32,
 }
 
-/// Where a stage gets deployed.
+/// Which executor implementation to use for a stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DeployTarget {
+pub enum ExecutorTarget {
     Local,
     Ssh(SshConfig),
     Kubernetes(K8sConfig),
@@ -84,7 +84,7 @@ pub struct K8sConfig {
 
 // --- Trait ---
 
-/// Where and how stages get deployed.
+/// Trait for stage execution backends.
 pub trait Executor: Send + Sync {
     /// Spawn a stage execution. Returns a handle to track it.
     fn spawn(
@@ -227,7 +227,7 @@ fn load_executor_config(koto_dir: &Path, name: &str) -> Result<ExecutorConfig, c
 pub fn resolve_executor_target(
     cli_flag: Option<&str>,
     koto_dir: &Path,
-) -> Result<DeployTarget, color_eyre::Report> {
+) -> Result<ExecutorTarget, color_eyre::Report> {
     let name = cli_flag
         .map(|s| s.to_string())
         .or_else(|| std::env::var("KOTO_EXECUTOR").ok())
@@ -235,17 +235,17 @@ pub fn resolve_executor_target(
 
     // "local" is the built-in default -- no file needed
     if name == "local" {
-        return Ok(DeployTarget::Local);
+        return Ok(ExecutorTarget::Local);
     }
 
     let config = load_executor_config(koto_dir, &name)?;
     match config {
-        ExecutorConfig::Local { .. } => Ok(DeployTarget::Local),
+        ExecutorConfig::Local { .. } => Ok(ExecutorTarget::Local),
         ExecutorConfig::Ssh {
             host,
             user,
             key_file,
-        } => Ok(DeployTarget::Ssh(SshConfig {
+        } => Ok(ExecutorTarget::Ssh(SshConfig {
             host,
             user,
             key_file,
@@ -255,7 +255,7 @@ pub fn resolve_executor_target(
             image,
             service_account,
             ..
-        } => Ok(DeployTarget::Kubernetes(K8sConfig {
+        } => Ok(ExecutorTarget::Kubernetes(K8sConfig {
             namespace,
             image,
             service_account,
@@ -263,12 +263,14 @@ pub fn resolve_executor_target(
     }
 }
 
-/// Create executor for a specific deploy target.
-pub fn create_executor(target: &DeployTarget) -> Box<dyn ExecutorBoxed> {
+/// Create executor for a resolved executor target.
+pub fn create_executor(target: &ExecutorTarget) -> Box<dyn ExecutorBoxed> {
     match target {
-        DeployTarget::Local => Box::new(local::LocalExecutor::new()),
-        DeployTarget::Ssh(config) => Box::new(ssh::SshExecutor::new(config.clone())),
-        DeployTarget::Kubernetes(config) => Box::new(k8s::KubernetesExecutor::new(config.clone())),
+        ExecutorTarget::Local => Box::new(local::LocalExecutor::new()),
+        ExecutorTarget::Ssh(config) => Box::new(ssh::SshExecutor::new(config.clone())),
+        ExecutorTarget::Kubernetes(config) => {
+            Box::new(k8s::KubernetesExecutor::new(config.clone()))
+        }
     }
 }
 
@@ -361,21 +363,21 @@ mod tests {
 
     #[test]
     fn create_executor_local() {
-        let _ = create_executor(&DeployTarget::Local);
+        let _ = create_executor(&ExecutorTarget::Local);
     }
 
     #[test]
     fn resolve_executor_defaults_to_local() {
         let dir = tempfile::tempdir().unwrap();
         let target = resolve_executor_target(None, dir.path()).unwrap();
-        assert_eq!(target, DeployTarget::Local);
+        assert_eq!(target, ExecutorTarget::Local);
     }
 
     #[test]
     fn resolve_executor_local_flag() {
         let dir = tempfile::tempdir().unwrap();
         let target = resolve_executor_target(Some("local"), dir.path()).unwrap();
-        assert_eq!(target, DeployTarget::Local);
+        assert_eq!(target, ExecutorTarget::Local);
     }
 
     #[test]
@@ -395,7 +397,7 @@ mod tests {
         let target = resolve_executor_target(Some("remote"), dir.path()).unwrap();
         assert_eq!(
             target,
-            DeployTarget::Ssh(SshConfig {
+            ExecutorTarget::Ssh(SshConfig {
                 host: "dev-server".to_string(),
                 user: Some("deploy".to_string()),
                 key_file: None,
@@ -413,7 +415,7 @@ mod tests {
         let target = resolve_executor_target(Some("k8s"), dir.path()).unwrap();
         assert_eq!(
             target,
-            DeployTarget::Kubernetes(K8sConfig {
+            ExecutorTarget::Kubernetes(K8sConfig {
                 namespace: "koto-agents".to_string(),
                 image: "ghcr.io/org/agent:latest".to_string(),
                 service_account: None,
@@ -429,6 +431,6 @@ mod tests {
         let config = "kind: local\nruntime: tmux\n";
         std::fs::write(executors_dir.join("dev.yaml"), config).unwrap();
         let target = resolve_executor_target(Some("dev"), dir.path()).unwrap();
-        assert_eq!(target, DeployTarget::Local);
+        assert_eq!(target, ExecutorTarget::Local);
     }
 }
