@@ -168,91 +168,98 @@ impl<T: Executor> ExecutorBoxed for T {
     }
 }
 
-// --- Deploy config file (.koto/deploy.yaml) ---
+// --- Executor config files (.koto/executors/<name>.yaml) ---
 
-/// Operator-level deploy configuration, separate from flow definitions.
-/// Lives at `.koto/deploy.yaml`, potentially gitignored.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub struct DeployConfig {
-    pub ssh: Option<DeploySshConfig>,
-    pub kubernetes: Option<DeployK8sConfig>,
-}
-
+/// Parsed executor configuration from `.koto/executors/<name>.yaml`.
+/// The `kind` field determines which executor implementation to use.
 #[derive(Debug, Clone, Deserialize)]
-pub struct DeploySshConfig {
-    pub host: String,
-    pub user: Option<String>,
-    pub key_file: Option<String>,
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ExecutorConfig {
+    Local {
+        #[serde(default = "default_runtime")]
+        runtime: String,
+    },
+    Ssh {
+        host: String,
+        user: Option<String>,
+        key_file: Option<String>,
+    },
+    Kubernetes {
+        namespace: String,
+        image: String,
+        service_account: Option<String>,
+        resources: Option<K8sResources>,
+    },
 }
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct DeployK8sConfig {
-    pub namespace: String,
-    pub image: String,
-    pub service_account: Option<String>,
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct K8sResources {
+    pub cpu: Option<String>,
+    pub memory: Option<String>,
 }
 
-/// Load `.koto/deploy.yaml` if it exists. Returns None if file is absent.
-fn load_deploy_config(koto_dir: &Path) -> Result<Option<DeployConfig>, ExecutorError> {
-    let path = koto_dir.join("deploy.yaml");
+fn default_runtime() -> String {
+    "tmux".to_string()
+}
+
+/// Load an executor config from `.koto/executors/<name>.yaml`.
+fn load_executor_config(koto_dir: &Path, name: &str) -> Result<ExecutorConfig, color_eyre::Report> {
+    let path = koto_dir.join("executors").join(format!("{name}.yaml"));
     if !path.exists() {
-        return Ok(None);
+        return Err(color_eyre::eyre::eyre!(
+            "executor '{}' not found at {}\n\nhint: create {} with a 'kind' field (local, ssh, kubernetes)",
+            name,
+            path.display(),
+            path.display()
+        ));
     }
     let contents = std::fs::read_to_string(&path)?;
-    let config: DeployConfig = serde_yaml::from_str(&contents)
-        .map_err(|e| ExecutorError::Spawn(format!("failed to parse {}: {e}", path.display())))?;
-    Ok(Some(config))
+    let config: ExecutorConfig = serde_yaml::from_str(&contents)
+        .map_err(|e| color_eyre::eyre::eyre!("failed to parse {}: {e}", path.display()))?;
+    Ok(config)
 }
 
 // --- Factory ---
 
-/// Resolve the deploy target from CLI flag, env var, or default.
-/// Resolution order: CLI flag > KOTO_DEPLOY env var > default (local).
-/// For ssh/kubernetes targets, connection details come from `.koto/deploy.yaml`.
-pub fn resolve_deploy_target(
+/// Resolve the executor from CLI flag, env var, or default.
+/// Resolution order: --executor flag > KOTO_EXECUTOR env var > default "local".
+/// "local" is built-in (no file needed). Other names load from `.koto/executors/<name>.yaml`.
+pub fn resolve_executor_target(
     cli_flag: Option<&str>,
     koto_dir: &Path,
 ) -> Result<DeployTarget, color_eyre::Report> {
-    let target_name = cli_flag
+    let name = cli_flag
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("KOTO_DEPLOY").ok())
+        .or_else(|| std::env::var("KOTO_EXECUTOR").ok())
         .unwrap_or_else(|| "local".to_string());
 
-    match target_name.as_str() {
-        "local" => Ok(DeployTarget::Local),
-        "ssh" => {
-            let deploy_config = load_deploy_config(koto_dir)?.ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "deploy target 'ssh' requires .koto/deploy.yaml with ssh config"
-                )
-            })?;
-            let ssh = deploy_config.ssh.ok_or_else(|| {
-                color_eyre::eyre::eyre!(".koto/deploy.yaml exists but has no 'ssh' section")
-            })?;
-            Ok(DeployTarget::Ssh(SshConfig {
-                host: ssh.host,
-                user: ssh.user,
-                key_file: ssh.key_file,
-            }))
-        }
-        "kubernetes" | "k8s" => {
-            let deploy_config = load_deploy_config(koto_dir)?.ok_or_else(|| {
-                color_eyre::eyre::eyre!(
-                    "deploy target 'kubernetes' requires .koto/deploy.yaml with kubernetes config"
-                )
-            })?;
-            let k8s = deploy_config.kubernetes.ok_or_else(|| {
-                color_eyre::eyre::eyre!(".koto/deploy.yaml exists but has no 'kubernetes' section")
-            })?;
-            Ok(DeployTarget::Kubernetes(K8sConfig {
-                namespace: k8s.namespace,
-                image: k8s.image,
-                service_account: k8s.service_account,
-            }))
-        }
-        other => Err(color_eyre::eyre::eyre!(
-            "unknown deploy target '{other}'\n\nvalid targets: local, ssh, kubernetes (k8s)"
-        )),
+    // "local" is the built-in default -- no file needed
+    if name == "local" {
+        return Ok(DeployTarget::Local);
+    }
+
+    let config = load_executor_config(koto_dir, &name)?;
+    match config {
+        ExecutorConfig::Local { .. } => Ok(DeployTarget::Local),
+        ExecutorConfig::Ssh {
+            host,
+            user,
+            key_file,
+        } => Ok(DeployTarget::Ssh(SshConfig {
+            host,
+            user,
+            key_file,
+        })),
+        ExecutorConfig::Kubernetes {
+            namespace,
+            image,
+            service_account,
+            ..
+        } => Ok(DeployTarget::Kubernetes(K8sConfig {
+            namespace,
+            image,
+            service_account,
+        })),
     }
 }
 
@@ -358,39 +365,34 @@ mod tests {
     }
 
     #[test]
-    fn resolve_deploy_target_defaults_to_local() {
+    fn resolve_executor_defaults_to_local() {
         let dir = tempfile::tempdir().unwrap();
-        let target = resolve_deploy_target(None, dir.path()).unwrap();
+        let target = resolve_executor_target(None, dir.path()).unwrap();
         assert_eq!(target, DeployTarget::Local);
     }
 
     #[test]
-    fn resolve_deploy_target_cli_flag() {
+    fn resolve_executor_local_flag() {
         let dir = tempfile::tempdir().unwrap();
-        let target = resolve_deploy_target(Some("local"), dir.path()).unwrap();
+        let target = resolve_executor_target(Some("local"), dir.path()).unwrap();
         assert_eq!(target, DeployTarget::Local);
     }
 
     #[test]
-    fn resolve_deploy_target_unknown_errors() {
+    fn resolve_executor_missing_file_errors() {
         let dir = tempfile::tempdir().unwrap();
-        let err = resolve_deploy_target(Some("magic"), dir.path()).unwrap_err();
-        assert!(err.to_string().contains("unknown deploy target 'magic'"));
+        let err = resolve_executor_target(Some("magic"), dir.path()).unwrap_err();
+        assert!(err.to_string().contains("executor 'magic' not found"));
     }
 
     #[test]
-    fn resolve_deploy_target_ssh_needs_config() {
+    fn resolve_executor_ssh_from_file() {
         let dir = tempfile::tempdir().unwrap();
-        let err = resolve_deploy_target(Some("ssh"), dir.path()).unwrap_err();
-        assert!(err.to_string().contains("deploy.yaml"));
-    }
-
-    #[test]
-    fn resolve_deploy_target_ssh_from_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let config_content = "ssh:\n  host: dev-server\n  user: deploy\n";
-        std::fs::write(dir.path().join("deploy.yaml"), config_content).unwrap();
-        let target = resolve_deploy_target(Some("ssh"), dir.path()).unwrap();
+        let executors_dir = dir.path().join("executors");
+        std::fs::create_dir_all(&executors_dir).unwrap();
+        let config = "kind: ssh\nhost: dev-server\nuser: deploy\n";
+        std::fs::write(executors_dir.join("remote.yaml"), config).unwrap();
+        let target = resolve_executor_target(Some("remote"), dir.path()).unwrap();
         assert_eq!(
             target,
             DeployTarget::Ssh(SshConfig {
@@ -402,12 +404,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_deploy_target_k8s_from_file() {
+    fn resolve_executor_k8s_from_file() {
         let dir = tempfile::tempdir().unwrap();
-        let config_content =
-            "kubernetes:\n  namespace: koto-agents\n  image: ghcr.io/org/agent:latest\n";
-        std::fs::write(dir.path().join("deploy.yaml"), config_content).unwrap();
-        let target = resolve_deploy_target(Some("k8s"), dir.path()).unwrap();
+        let executors_dir = dir.path().join("executors");
+        std::fs::create_dir_all(&executors_dir).unwrap();
+        let config = "kind: kubernetes\nnamespace: koto-agents\nimage: ghcr.io/org/agent:latest\n";
+        std::fs::write(executors_dir.join("k8s.yaml"), config).unwrap();
+        let target = resolve_executor_target(Some("k8s"), dir.path()).unwrap();
         assert_eq!(
             target,
             DeployTarget::Kubernetes(K8sConfig {
@@ -416,5 +419,16 @@ mod tests {
                 service_account: None,
             })
         );
+    }
+
+    #[test]
+    fn resolve_executor_local_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let executors_dir = dir.path().join("executors");
+        std::fs::create_dir_all(&executors_dir).unwrap();
+        let config = "kind: local\nruntime: tmux\n";
+        std::fs::write(executors_dir.join("dev.yaml"), config).unwrap();
+        let target = resolve_executor_target(Some("dev"), dir.path()).unwrap();
+        assert_eq!(target, DeployTarget::Local);
     }
 }

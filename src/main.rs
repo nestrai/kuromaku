@@ -37,10 +37,10 @@ enum Command {
         #[arg(short, long)]
         file: Option<String>,
 
-        /// Deployment target: local, ssh, kubernetes (default: local)
-        /// Can also be set via KOTO_DEPLOY env var.
-        #[arg(short, long)]
-        deploy: Option<String>,
+        /// Executor name: "local" (default), or a name from .koto/executors/<name>.yaml
+        /// Can also be set via KOTO_EXECUTOR env var.
+        #[arg(short = 'x', long)]
+        executor: Option<String>,
     },
     /// Stop the agent team
     Down,
@@ -54,9 +54,11 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Up { flow, file, deploy } => {
-            run_up(flow.as_deref(), file.as_deref(), deploy.as_deref()).await?
-        }
+        Command::Up {
+            flow,
+            file,
+            executor,
+        } => run_up(flow.as_deref(), file.as_deref(), executor.as_deref()).await?,
         Command::Down => {
             println!("koto down: not yet implemented");
         }
@@ -132,7 +134,7 @@ fn resolve_flow_path(flow: Option<&str>, file: Option<&str>) -> Result<PathBuf> 
     ))
 }
 
-async fn run_up(flow: Option<&str>, file: Option<&str>, deploy: Option<&str>) -> Result<()> {
+async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) -> Result<()> {
     let flow_start = Instant::now();
     let path = resolve_flow_path(flow, file)?;
     let display_path = path.display().to_string();
@@ -171,9 +173,9 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, deploy: Option<&str>) ->
     }
     ui::print_backends_ok(&backend_list);
 
-    // Resolve deploy target: CLI flag > env var > default (local)
+    // Resolve executor: --executor flag > KOTO_EXECUTOR env var > default (local)
     let koto_dir = Path::new(KOTO_DIR);
-    let deploy_target = executor::resolve_deploy_target(deploy, koto_dir)?;
+    let deploy_target = executor::resolve_executor_target(executor, koto_dir)?;
 
     // Load guide and rules context
     let guide = runner::load_guide(koto_dir);
