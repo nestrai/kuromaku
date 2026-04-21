@@ -20,9 +20,6 @@ pub enum ExecutorError {
     #[error("execution failed (exit {code}): {message}")]
     Failed { code: i32, message: String },
 
-    #[error("tmux error: {0}")]
-    Tmux(String),
-
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -55,6 +52,7 @@ pub enum ExecutionStatus {
 }
 
 /// Output captured from a completed execution.
+#[derive(Debug)]
 pub struct ExecutionOutput {
     pub stdout: String,
     pub exit_code: i32,
@@ -275,21 +273,24 @@ pub fn create_executor(target: &ExecutorTarget) -> Box<dyn ExecutorBoxed> {
 }
 
 /// Build the CLI command string for a claude-cli stage.
+/// Uses `claude --print` for non-interactive output with the prompt as positional arg.
 pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_prompt: &str) -> String {
     let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
 
     let mut parts = vec![claude_bin];
+    parts.push("--print".to_string());
     parts.push("--model".to_string());
     parts.push(shell_escape(model));
     parts.push("--output-format".to_string());
     parts.push("text".to_string());
+    parts.push("--dangerously-skip-permissions".to_string());
 
     if let Some(system) = system_prompt {
         parts.push("--system-prompt".to_string());
         parts.push(shell_escape(system));
     }
 
-    parts.push("--prompt".to_string());
+    // Prompt is positional in claude CLI
     parts.push(shell_escape(user_prompt));
 
     parts.join(" ")
@@ -335,7 +336,7 @@ mod tests {
         let cmd = build_claude_command("claude-sonnet-4-5", None, "write tests");
         assert!(cmd.contains("claude"));
         assert!(cmd.contains("--model"));
-        assert!(cmd.contains("--prompt"));
+        assert!(cmd.contains("--print"));
         assert!(!cmd.contains("--system-prompt"));
     }
 

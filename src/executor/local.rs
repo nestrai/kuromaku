@@ -1,83 +1,51 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use tokio::sync::Mutex;
 
 use super::{
     ExecutionHandle, ExecutionOutput, ExecutionStatus, ExecutionTask, Executor, ExecutorError,
     ExecutorTarget,
 };
 
-/// Executes stages locally via tmux sessions.
-#[derive(Debug, Clone)]
+/// Executes steps locally as child processes.
+///
+/// Spawns commands via `sh -c` inheriting the current environment,
+/// captures stdout+stderr, and returns the output when done.
 pub struct LocalExecutor {
-    poll_interval: std::time::Duration,
+    children: Arc<Mutex<HashMap<String, tokio::process::Child>>>,
 }
 
 impl LocalExecutor {
     pub fn new() -> Self {
         Self {
-            poll_interval: std::time::Duration::from_secs(2),
+            children: Arc::new(Mutex::new(HashMap::new())),
         }
-    }
-
-    #[cfg(test)]
-    pub fn with_poll_interval(poll_interval: std::time::Duration) -> Self {
-        Self { poll_interval }
-    }
-
-    fn session_name(task_id: &str) -> String {
-        // Sanitize for tmux session naming
-        task_id
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '-'
-                }
-            })
-            .collect()
     }
 }
 
 impl Executor for LocalExecutor {
     async fn spawn(&self, task: ExecutionTask) -> Result<ExecutionHandle, ExecutorError> {
-        let session = Self::session_name(&task.id);
-        let output_file = std::env::temp_dir().join(format!("{session}.out"));
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c").arg(&task.command);
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
 
-        // Build the tmux command that redirects output to a file
-        let tmux_cmd = format!("{} > '{}' 2>&1", task.command, output_file.display());
-
-        eprintln!("      tmux session: {session}");
-        eprintln!("      attach: tmux attach -t {session}");
-
-        // Kill any existing session with this name (ignore errors)
-        let _ = tokio::process::Command::new("tmux")
-            .args(["kill-session", "-t", &session])
-            .output()
-            .await;
-
-        // Build env args for tmux
-        let mut cmd = tokio::process::Command::new("tmux");
-        cmd.args(["new-session", "-d", "-s", &session]);
-
-        // Set environment variables in the tmux session
         for (key, value) in &task.env {
             cmd.env(key, value);
         }
 
-        cmd.arg(&tmux_cmd);
-
-        let create_output = cmd.output().await?;
-
-        if !create_output.status.success() {
-            let stderr = String::from_utf8_lossy(&create_output.stderr).to_string();
-            return Err(ExecutorError::Tmux(format!(
-                "failed to create tmux session '{session}': {stderr}"
-            )));
-        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| ExecutorError::Spawn(format!("failed to spawn process: {e}")))?;
 
         let mut metadata = HashMap::new();
-        metadata.insert("session".to_string(), session);
-        metadata.insert("output_file".to_string(), output_file.display().to_string());
+        if let Some(pid) = child.id() {
+            metadata.insert("pid".to_string(), pid.to_string());
+            eprintln!("      pid: {pid}");
+        }
+
+        self.children.lock().await.insert(task.id.clone(), child);
 
         Ok(ExecutionHandle {
             id: task.id,
@@ -87,85 +55,73 @@ impl Executor for LocalExecutor {
     }
 
     async fn wait(&self, handle: &ExecutionHandle) -> Result<ExecutionOutput, ExecutorError> {
-        let session = handle
-            .metadata
-            .get("session")
-            .ok_or_else(|| ExecutorError::Tmux("missing session in handle metadata".to_string()))?;
-        let output_file = handle.metadata.get("output_file").ok_or_else(|| {
-            ExecutorError::Tmux("missing output_file in handle metadata".to_string())
-        })?;
+        let child = self
+            .children
+            .lock()
+            .await
+            .remove(&handle.id)
+            .ok_or_else(|| ExecutorError::Failed {
+                code: -1,
+                message: format!("process '{}' not found", handle.id),
+            })?;
 
-        // Poll until the tmux session ends
-        loop {
-            tokio::time::sleep(self.poll_interval).await;
-
-            let check = tokio::process::Command::new("tmux")
-                .args(["has-session", "-t", session])
-                .output()
-                .await?;
-
-            if !check.status.success() {
-                break;
+        let output = child.wait_with_output().await.map_err(|e| {
+            ExecutorError::Failed {
+                code: -1,
+                message: format!("failed waiting for process: {e}"),
             }
-        }
-
-        // Read the output file
-        let stdout = tokio::fs::read_to_string(output_file).await.map_err(|e| {
-            ExecutorError::Tmux(format!(
-                "failed to read output from session '{session}': {e}"
-            ))
         })?;
 
-        // Clean up temp file
-        let _ = tokio::fs::remove_file(output_file).await;
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        if !output.status.success() {
+            let code = output.status.code().unwrap_or(-1);
+            return Err(ExecutorError::Failed {
+                code,
+                message: format!("process exited with code {code}: {stderr}"),
+            });
+        }
 
         Ok(ExecutionOutput {
             stdout: stdout.trim().to_string(),
-            exit_code: 0,
+            exit_code: output.status.code().unwrap_or(0),
         })
     }
 
     async fn status(&self, handle: &ExecutionHandle) -> Result<ExecutionStatus, ExecutorError> {
-        let session = handle
-            .metadata
-            .get("session")
-            .ok_or_else(|| ExecutorError::Tmux("missing session in handle metadata".to_string()))?;
-
-        let check = tokio::process::Command::new("tmux")
-            .args(["has-session", "-t", session])
-            .output()
-            .await?;
-
-        if check.status.success() {
-            Ok(ExecutionStatus::Running)
+        let mut children = self.children.lock().await;
+        if let Some(child) = children.get_mut(&handle.id) {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        Ok(ExecutionStatus::Completed)
+                    } else {
+                        Ok(ExecutionStatus::Failed(format!(
+                            "exit code: {}",
+                            status.code().unwrap_or(-1)
+                        )))
+                    }
+                }
+                Ok(None) => Ok(ExecutionStatus::Running),
+                Err(e) => Err(ExecutorError::Failed {
+                    code: -1,
+                    message: format!("failed to check process status: {e}"),
+                }),
+            }
         } else {
+            // Process not in map means it was already waited on
             Ok(ExecutionStatus::Completed)
         }
     }
 
     async fn stop(&self, handle: &ExecutionHandle) -> Result<(), ExecutorError> {
-        let session = handle
-            .metadata
-            .get("session")
-            .ok_or_else(|| ExecutorError::Tmux("missing session in handle metadata".to_string()))?;
-
-        let output = tokio::process::Command::new("tmux")
-            .args(["kill-session", "-t", session])
-            .output()
-            .await?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-            return Err(ExecutorError::Tmux(format!(
-                "failed to kill session '{session}': {stderr}"
-            )));
+        if let Some(mut child) = self.children.lock().await.remove(&handle.id) {
+            child.kill().await.map_err(|e| ExecutorError::Failed {
+                code: -1,
+                message: format!("failed to kill process: {e}"),
+            })?;
         }
-
-        // Clean up output file if it exists
-        if let Some(output_file) = handle.metadata.get("output_file") {
-            let _ = tokio::fs::remove_file(output_file).await;
-        }
-
         Ok(())
     }
 }
@@ -175,30 +131,75 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_name_sanitizes() {
-        assert_eq!(
-            LocalExecutor::session_name("koto-planning-design"),
-            "koto-planning-design"
-        );
-        assert_eq!(
-            LocalExecutor::session_name("my flow/stage"),
-            "my-flow-stage"
-        );
-        assert_eq!(LocalExecutor::session_name("a.b.c"), "a-b-c");
+    fn new_creates_executor() {
+        let _ = LocalExecutor::new();
     }
 
-    #[test]
-    fn new_creates_with_defaults() {
+    #[tokio::test]
+    async fn spawn_and_wait_echo() {
         let executor = LocalExecutor::new();
-        assert_eq!(executor.poll_interval, std::time::Duration::from_secs(2));
+        let task = ExecutionTask {
+            id: "test-echo".to_string(),
+            command: "echo hello".to_string(),
+            env: HashMap::new(),
+        };
+
+        let handle = executor.spawn(task).await.unwrap();
+        assert_eq!(handle.id, "test-echo");
+
+        let output = executor.wait(&handle).await.unwrap();
+        assert_eq!(output.stdout, "hello");
+        assert_eq!(output.exit_code, 0);
     }
 
-    #[test]
-    fn custom_poll_interval() {
-        let executor = LocalExecutor::with_poll_interval(std::time::Duration::from_millis(100));
-        assert_eq!(
-            executor.poll_interval,
-            std::time::Duration::from_millis(100)
-        );
+    #[tokio::test]
+    async fn spawn_inherits_env() {
+        let executor = LocalExecutor::new();
+        let mut env = HashMap::new();
+        env.insert("KOTO_TEST_VAR".to_string(), "works".to_string());
+
+        let task = ExecutionTask {
+            id: "test-env".to_string(),
+            command: "echo $KOTO_TEST_VAR".to_string(),
+            env,
+        };
+
+        let handle = executor.spawn(task).await.unwrap();
+        let output = executor.wait(&handle).await.unwrap();
+        assert_eq!(output.stdout, "works");
+    }
+
+    #[tokio::test]
+    async fn spawn_failed_command_returns_error() {
+        let executor = LocalExecutor::new();
+        let task = ExecutionTask {
+            id: "test-fail".to_string(),
+            command: "exit 42".to_string(),
+            env: HashMap::new(),
+        };
+
+        let handle = executor.spawn(task).await.unwrap();
+        let err = executor.wait(&handle).await.unwrap_err();
+        assert!(matches!(err, ExecutorError::Failed { code: 42, .. }));
+    }
+
+    #[tokio::test]
+    async fn stop_kills_process() {
+        let executor = LocalExecutor::new();
+        let task = ExecutionTask {
+            id: "test-stop".to_string(),
+            command: "sleep 60".to_string(),
+            env: HashMap::new(),
+        };
+
+        let handle = executor.spawn(task).await.unwrap();
+
+        // Brief pause so the process is running
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let status = executor.status(&handle).await.unwrap();
+        assert_eq!(status, ExecutionStatus::Running);
+
+        executor.stop(&handle).await.unwrap();
     }
 }
