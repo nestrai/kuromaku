@@ -189,6 +189,7 @@ flow:
                 needs: vec!["nonexistent".to_string()],
                 model: None,
                 backend: None,
+                print_output: false,
             }],
             stack: crate::config::StackConfig {
                 backend: "local".to_string(),

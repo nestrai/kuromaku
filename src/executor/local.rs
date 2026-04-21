@@ -41,7 +41,6 @@ impl Executor for LocalExecutor {
         let mut metadata = HashMap::new();
         if let Some(pid) = child.id() {
             metadata.insert("pid".to_string(), pid.to_string());
-            eprintln!("      pid: {pid}");
         }
 
         self.children.lock().await.insert(task.id.clone(), child);

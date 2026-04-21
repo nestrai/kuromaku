@@ -9,6 +9,11 @@
 //! All output goes to stdout using ANSI escape codes via crossterm.
 //! This is the foundation for a future ratatui-based TUI.
 
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
+
 use crossterm::style::{self, Attribute, Color, Stylize};
 
 use crate::config::Backend;
@@ -182,10 +187,72 @@ pub fn print_step_banner(n: usize, total: usize, step: &StepInfo) {
     println!("{meta}");
 }
 
-/// Print "thinking" status with spinner placeholder (static for now).
+/// Start an animated spinner that shows elapsed time.
+/// Returns a handle that stops the spinner when dropped or `.stop()` is called.
+pub fn start_spinner() -> SpinnerHandle {
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+    let start = Instant::now();
+
+    let handle = std::thread::spawn(move || {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let t = &DARK;
+        let mut i = 0;
+        while running_clone.load(Ordering::Relaxed) {
+            let elapsed = start.elapsed().as_secs();
+            let time_str = if elapsed >= 60 {
+                format!("{}m{:02}s", elapsed / 60, elapsed % 60)
+            } else {
+                format!("{elapsed}s")
+            };
+            eprint!(
+                "\x1b[2K\r      {} {} {}",
+                style::style(frames[i % frames.len()]).with(t.cyan),
+                style::style("flowing").with(t.cyan),
+                style::style(&time_str).with(t.dim),
+            );
+            let _ = std::io::stderr().flush();
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+        // Clear the spinner line
+        eprint!("\x1b[2K\r");
+        let _ = std::io::stderr().flush();
+    });
+
+    SpinnerHandle {
+        running,
+        thread: Some(handle),
+    }
+}
+
+pub struct SpinnerHandle {
+    running: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SpinnerHandle {
+    pub fn stop(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for SpinnerHandle {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Print "thinking" status (static, used when spinner is not needed).
 pub fn print_thinking(task_description: &str) {
     let t = &DARK;
-    println!(
+    eprintln!(
         "      {} {}   {} \"{}\"",
         style::style("⠋").with(t.cyan),
         style::style("thinking").with(t.cyan),

@@ -21,7 +21,7 @@ const KOTO_DIR: &str = ".koto";
 const FLOWS_DIR: &str = ".koto/flows";
 
 #[derive(Parser)]
-#[command(name = "koto", about = "Reproducible AI agent teams")]
+#[command(name = "koto", about = "Reproducible AI agent teams", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -348,6 +348,17 @@ async fn run_up(
         "—",
         &stack_path.display().to_string(),
     );
+
+    // Print output of steps marked with print_output: true
+    for result in &results {
+        if result.print_output {
+            let output_path = stack_path.join(&result.output_file);
+            if let Ok(content) = std::fs::read_to_string(&output_path) {
+                println!();
+                termimad::print_text(&content);
+            }
+        }
+    }
 
     Ok(())
 }

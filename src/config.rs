@@ -99,6 +99,8 @@ pub struct RawStep {
     pub needs: Vec<String>,
     pub model: Option<String>,
     pub backend: Option<Backend>,
+    #[serde(default)]
+    pub print_output: bool,
     #[serde(flatten)]
     pub unknown: HashMap<String, serde_yaml::Value>,
 }
@@ -169,6 +171,7 @@ pub struct Step {
     pub needs: Vec<String>,
     pub model: Option<String>,
     pub backend: Option<Backend>,
+    pub print_output: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -318,6 +321,7 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
                 needs,
                 model: s.model,
                 backend: s.backend,
+                print_output: s.print_output,
             }
         })
         .collect();

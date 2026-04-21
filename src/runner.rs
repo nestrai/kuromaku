@@ -48,6 +48,7 @@ pub struct StepRunResult {
     pub tokens_in: Option<u32>,
     pub tokens_out: Option<u32>,
     pub output_file: String,
+    pub print_output: bool,
 }
 
 /// Generate an auto-named output filename: `<flow>-<timestamp>-<step>-<agent>.md`
@@ -284,7 +285,6 @@ pub async fn run_steps(
             std::fs::create_dir_all(parent).ok();
         }
 
-        ui::print_thinking(&step_task);
         eprintln!(
             "      output: {}",
             output_path.canonicalize().unwrap_or(output_path.clone()).display()
@@ -293,6 +293,7 @@ pub async fn run_steps(
         let system_prompt = build_system_prompt(agent, guide, rules_cache, skills_cache);
 
         let start = Instant::now();
+        let spinner = ui::start_spinner();
 
         let (content, usage) = if executor::backend_needs_executor(effective_backend) {
             run_step_via_executor(
@@ -318,6 +319,7 @@ pub async fn run_steps(
             run_step_via_api(request, &step.id).await?
         };
 
+        spinner.stop();
         let duration = start.elapsed();
 
         // Save to stack
@@ -364,6 +366,7 @@ pub async fn run_steps(
             tokens_in,
             tokens_out,
             output_file,
+            print_output: step.print_output,
         });
     }
 
@@ -451,6 +454,7 @@ mod tests {
             tokens_in: Some(1200),
             tokens_out: Some(800),
             output_file: "dev-20260421-1052-design-Levi.md".to_string(),
+            print_output: false,
         }];
         let summary = build_summary(&results);
         assert_eq!(summary.len(), 1);
