@@ -106,6 +106,7 @@ pub struct RawStep {
 #[derive(Debug, Deserialize)]
 pub struct RawAgentFile {
     pub name: String,
+    pub title: Option<String>,
     pub role: String,
     #[serde(default)]
     pub rules: Vec<String>,
@@ -148,6 +149,7 @@ pub struct Defaults {
 pub struct Agent {
     pub id: String,
     pub name: String,
+    pub title: Option<String>,
     pub role: String,
     pub model: String,
     pub backend: Backend,
@@ -222,6 +224,7 @@ pub fn load_agent_file(
     Ok(Agent {
         id: agent_id.to_string(),
         name: raw.name,
+        title: raw.title,
         role: raw.role,
         model: raw.model.unwrap_or_else(|| defaults.model.clone()),
         backend: raw.backend.unwrap_or(defaults.backend),

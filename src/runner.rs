@@ -152,7 +152,7 @@ fn build_user_prompt(
 
     if !context_parts.is_empty() {
         user_content = format!(
-            "{user_content}\n\nContext from previous steps:\n\n{}",
+            "{user_content}\n\nContext from previous steps:\n\n{}\n\nIMPORTANT: The above is work already completed by other team members. Build on their output -- do not repeat or rephrase what they already covered. Add your own perspective, analysis, or implementation.",
             context_parts.join("\n\n")
         );
     }
@@ -264,6 +264,7 @@ pub async fn run_steps(
         let step_info = StepInfo {
             id: step.id.clone(),
             agent: agent.name.clone(),
+            title: agent.title.clone(),
             model: effective_model.to_string(),
             backend: effective_backend,
             input: step.input.clone(),
@@ -470,6 +471,7 @@ mod tests {
         let agent = Agent {
             id: "dev".to_string(),
             name: "Dev".to_string(),
+            title: None,
             role: "You are a developer".to_string(),
             model: "sonnet".to_string(),
             backend: Backend::ClaudeCli,
@@ -501,6 +503,7 @@ mod tests {
         let agent = Agent {
             id: "dev".to_string(),
             name: "Dev".to_string(),
+            title: None,
             role: "You are a developer".to_string(),
             model: "sonnet".to_string(),
             backend: Backend::ClaudeCli,
@@ -530,6 +533,7 @@ mod tests {
         let agent = Agent {
             id: "dev".to_string(),
             name: "Dev".to_string(),
+            title: None,
             role: "You are a developer".to_string(),
             model: "sonnet".to_string(),
             backend: Backend::ClaudeCli,
@@ -570,6 +574,7 @@ mod tests {
         let agents = vec![Agent {
             id: "dev".to_string(),
             name: "Dev".to_string(),
+            title: None,
             role: "dev".to_string(),
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
@@ -593,6 +598,7 @@ mod tests {
         let agents = vec![Agent {
             id: "dev".to_string(),
             name: "Dev".to_string(),
+            title: None,
             role: "dev".to_string(),
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
@@ -613,6 +619,7 @@ mod tests {
         let agents = vec![Agent {
             id: "dev".to_string(),
             name: "Dev".to_string(),
+            title: None,
             role: "dev".to_string(),
             model: "m".to_string(),
             backend: Backend::ClaudeCli,

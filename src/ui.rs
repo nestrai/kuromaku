@@ -151,7 +151,7 @@ pub fn print_step_banner(n: usize, total: usize, step: &StepInfo) {
     };
     println!();
     println!(
-        "  {}  {} Step {}/{}  {}  {}  {}",
+        "  {}  {} Step {}/{}  {}  {}  {}{}",
         style::style("──").with(t.muted),
         style::style(marker).with(color).attribute(Attribute::Bold),
         n,
@@ -161,6 +161,9 @@ pub fn print_step_banner(n: usize, total: usize, step: &StepInfo) {
             .attribute(Attribute::Bold),
         style::style("──").with(t.muted),
         style::style(&step.agent).with(t.magenta),
+        step.title.as_deref().map_or(String::new(), |t_str| {
+            format!("  {}", style::style(t_str).with(t.dim))
+        }),
     );
     let mut meta = format!(
         "      {} {}   {} {}",
@@ -594,6 +597,7 @@ pub fn print_footer(elapsed: &str, tokens_in: &str, tokens_out: &str, backends: 
 pub struct StepInfo {
     pub id: String,
     pub agent: String,
+    pub title: Option<String>,
     pub model: String,
     pub backend: Backend,
     pub input: Vec<String>,
@@ -644,6 +648,7 @@ mod tests {
         let info = StepInfo {
             id: "test".into(),
             agent: "dev".into(),
+            title: None,
             model: "sonnet".into(),
             backend: Backend::ClaudeCli,
             input: vec![],
