@@ -94,6 +94,8 @@ pub struct RawAgent {
     pub model: Option<String>,
     pub backend: Option<Backend>,
     pub rules: Option<String>,
+    #[serde(default)]
+    pub skills: Vec<String>,
     #[serde(flatten)]
     pub unknown: std::collections::HashMap<String, serde_yaml::Value>,
 }
@@ -150,6 +152,7 @@ pub struct Agent {
     pub model: String,
     pub backend: Backend,
     pub rules: Option<String>,
+    pub skills: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +316,7 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
             id: a.id,
             role: a.role,
             rules: a.rules,
+            skills: a.skills,
         })
         .collect();
 
@@ -823,5 +827,32 @@ stages:
             "got: {}",
             err
         );
+    }
+
+    #[test]
+    fn skills_field_parses() {
+        let yaml = r#"
+version: "1"
+name: test
+agents:
+  - id: dev
+    role: "dev"
+    skills: [domain-cli, error-handling]
+stages:
+  - id: code
+    agent: dev
+    task: "do it"
+"#;
+        let config = load_config_from_str(yaml).unwrap();
+        assert_eq!(
+            config.agents[0].skills,
+            vec!["domain-cli", "error-handling"]
+        );
+    }
+
+    #[test]
+    fn skills_field_defaults_to_empty() {
+        let config = load_config_from_str(MINIMAL_CONFIG).unwrap();
+        assert!(config.agents[0].skills.is_empty());
     }
 }

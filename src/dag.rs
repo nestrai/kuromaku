@@ -226,6 +226,7 @@ stages:
                 model: "m".to_string(),
                 backend: crate::config::Backend::Api,
                 rules: None,
+                skills: vec![],
             }],
             stages: vec![Stage {
                 id: "a".to_string(),

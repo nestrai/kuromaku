@@ -5,6 +5,7 @@ use std::time::Instant;
 use crate::config::{Agent, Backend, FlowConfig, Stage, TaskSource};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorTarget};
 use crate::llm::{self, LlmRequest, Message, Role};
+use crate::skills;
 use crate::state::{self, StageOutput};
 use crate::ui::{self, StageInfo, StageState};
 
@@ -36,6 +37,9 @@ pub enum RunError {
 
     #[error("rules file not found: {0}")]
     RulesNotFound(String),
+
+    #[error("skill error: {0}")]
+    Skill(#[from] skills::SkillsError),
 }
 
 /// Result of running a single stage, used for the summary table.
@@ -84,11 +88,12 @@ pub fn load_rules_for_agents(
     Ok(cache)
 }
 
-/// Build the full system prompt: Guide + Rules + Role.
+/// Build the full system prompt: Guide > Rules > Skills > Role.
 fn build_system_prompt(
     agent: &Agent,
     guide: &Option<String>,
     rules_cache: &HashMap<String, String>,
+    skills_cache: &HashMap<String, String>,
 ) -> String {
     let mut parts: Vec<&str> = Vec::new();
 
@@ -102,6 +107,16 @@ fn build_system_prompt(
     {
         rules_content = content.clone();
         parts.push(&rules_content);
+    }
+
+    // Append skills content in order
+    let skill_contents: Vec<&str> = agent
+        .skills
+        .iter()
+        .filter_map(|name| skills_cache.get(name).map(|s| s.as_str()))
+        .collect();
+    for content in &skill_contents {
+        parts.push(content);
     }
 
     parts.push(&agent.role);
@@ -206,6 +221,7 @@ async fn run_stage_via_api(
 }
 
 /// Run stages sequentially in topological order.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_stages(
     config: &FlowConfig,
     stages: &[&Stage],
@@ -213,6 +229,7 @@ pub async fn run_stages(
     flow_name: &str,
     guide: &Option<String>,
     rules_cache: &HashMap<String, String>,
+    skills_cache: &HashMap<String, String>,
     executor_target: &ExecutorTarget,
 ) -> Result<Vec<StageRunResult>, RunError> {
     let agents: HashMap<&str, &Agent> = config.agents.iter().map(|a| (a.id.as_str(), a)).collect();
@@ -257,7 +274,7 @@ pub async fn run_stages(
 
         ui::print_thinking(&task_text);
 
-        let system_prompt = build_system_prompt(agent, guide, rules_cache);
+        let system_prompt = build_system_prompt(agent, guide, rules_cache, skills_cache);
 
         let start = Instant::now();
 
@@ -436,6 +453,7 @@ mod tests {
             model: "sonnet".to_string(),
             backend: Backend::ClaudeCli,
             rules: Some("rust-developer".to_string()),
+            skills: vec!["error-handling".to_string()],
         };
         let guide = Some("Project guide content".to_string());
         let mut rules_cache = HashMap::new();
@@ -443,10 +461,16 @@ mod tests {
             "rust-developer".to_string(),
             "Rust rules content".to_string(),
         );
+        let mut skills_cache = HashMap::new();
+        skills_cache.insert(
+            "error-handling".to_string(),
+            "Error handling skill content".to_string(),
+        );
 
-        let prompt = build_system_prompt(&agent, &guide, &rules_cache);
+        let prompt = build_system_prompt(&agent, &guide, &rules_cache, &skills_cache);
         assert!(prompt.starts_with("Project guide content"));
         assert!(prompt.contains("Rust rules content"));
+        assert!(prompt.contains("Error handling skill content"));
         assert!(prompt.ends_with("You are a developer"));
     }
 
@@ -458,11 +482,13 @@ mod tests {
             model: "sonnet".to_string(),
             backend: Backend::ClaudeCli,
             rules: None,
+            skills: vec![],
         };
         let guide = None;
         let rules_cache = HashMap::new();
+        let skills_cache = HashMap::new();
 
-        let prompt = build_system_prompt(&agent, &guide, &rules_cache);
+        let prompt = build_system_prompt(&agent, &guide, &rules_cache, &skills_cache);
         assert_eq!(prompt, "You are a developer");
     }
 
@@ -494,6 +520,7 @@ mod tests {
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
             rules: Some("rust-developer".to_string()),
+            skills: vec![],
         }];
 
         let cache = load_rules_for_agents(&agents, dir.path()).unwrap();
@@ -509,6 +536,7 @@ mod tests {
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
             rules: Some("nonexistent".to_string()),
+            skills: vec![],
         }];
 
         let err = load_rules_for_agents(&agents, dir.path()).unwrap_err();

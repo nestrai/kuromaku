@@ -12,6 +12,7 @@ mod executor;
 #[allow(dead_code)]
 mod llm;
 mod runner;
+mod skills;
 mod state;
 #[allow(dead_code)]
 mod ui;
@@ -42,6 +43,8 @@ enum Command {
         #[arg(short = 'e', long)]
         executor: Option<String>,
     },
+    /// Fetch skills from remote sources pinned in .koto/skills.lock
+    Pull,
     /// Stop the agent team
     Down,
     /// Show running agents and state
@@ -59,6 +62,7 @@ async fn main() -> Result<()> {
             file,
             executor,
         } => run_up(flow.as_deref(), file.as_deref(), executor.as_deref()).await?,
+        Command::Pull => run_pull()?,
         Command::Down => {
             println!("koto down: not yet implemented");
         }
@@ -181,6 +185,22 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
     let guide = runner::load_guide(koto_dir);
     let rules_cache = runner::load_rules_for_agents(&flow_config.agents, koto_dir)?;
 
+    // Check and load skills
+    let skills_dir = koto_dir.join("skills");
+    let skill_names = skills::collect_skill_names(&flow_config.agents);
+    let skills_cache = if skill_names.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let missing = skills::check_skills_available(&skill_names, &skills_dir);
+        if !missing.is_empty() {
+            return Err(eyre!(
+                "missing skills: {}\n\nhint: run `koto pull` to fetch skills",
+                missing.join(", ")
+            ));
+        }
+        skills::load_skills_for_agents(&skill_names, &skills_dir)?
+    };
+
     // Run stages
     let state_path = Path::new(&flow_config.state.path);
     let results = runner::run_stages(
@@ -190,6 +210,7 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
         &flow_name,
         &guide,
         &rules_cache,
+        &skills_cache,
         &executor_target,
     )
     .await?;
@@ -208,6 +229,32 @@ async fn run_up(flow: Option<&str>, file: Option<&str>, executor: Option<&str>) 
         "—",
         &flow_config.state.path,
     );
+
+    Ok(())
+}
+
+fn run_pull() -> Result<()> {
+    let koto_dir = Path::new(KOTO_DIR);
+    let lock_path = koto_dir.join("skills.lock");
+
+    if !lock_path.exists() {
+        return Err(eyre!(
+            "no .koto/skills.lock found\n\nhint: create .koto/skills.lock with your skill sources"
+        ));
+    }
+
+    let lock = skills::load_skills_lock(&lock_path)?;
+    if lock.skills.is_empty() {
+        println!("no skills defined in .koto/skills.lock");
+        return Ok(());
+    }
+
+    let skills_dir = koto_dir.join("skills");
+    std::fs::create_dir_all(&skills_dir)?;
+
+    println!("pulling {} skill(s)...", lock.skills.len());
+    skills::pull_skills(&lock, &skills_dir)?;
+    println!("done");
 
     Ok(())
 }

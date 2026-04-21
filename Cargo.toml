@@ -17,6 +17,7 @@ crossterm = "0.28"
 color-eyre = "0.6"
 thiserror = "2"
 chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"
 
 [dev-dependencies]
 tempfile = "3"
