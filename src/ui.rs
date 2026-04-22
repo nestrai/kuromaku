@@ -161,9 +161,7 @@ pub fn print_step_banner(n: usize, total: usize, step: &StepInfo) {
         style::style(marker).with(color).attribute(Attribute::Bold),
         n,
         total,
-        style::style(&step.id)
-            .with(t.fg)
-            .attribute(Attribute::Bold),
+        style::style(&step.id).with(t.fg).attribute(Attribute::Bold),
         style::style("──").with(t.muted),
         style::style(&step.agent).with(t.magenta),
         step.title.as_deref().map_or(String::new(), |t_str| {
@@ -601,7 +599,10 @@ pub fn print_status_table(steps: &[StepResult]) {
     );
     println!(
         "    {}",
-        style::style("─────────────────────────────────────────────────────────────────────────────────────").with(t.muted),
+        style::style(
+            "─────────────────────────────────────────────────────────────────────────────────────"
+        )
+        .with(t.muted),
     );
 
     for s in steps {

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::{Agent, Backend, Step};
@@ -9,16 +9,53 @@ use crate::skills;
 use crate::stack::{self, StepOutput};
 use crate::ui::{self, StepInfo, StepState};
 
+/// Immutable context for a single flow run.
+/// Constructed once in main::run_up(), passed to run_steps() and internal helpers.
+pub struct RunContext {
+    #[allow(dead_code)] // Placeholder for Phase 1.2 (run-ID stack)
+    pub run_id: String,
+    pub flow_name: String,
+    pub task: String,
+    pub stack_path: PathBuf,
+    pub guide: Option<String>,
+    pub rules_cache: HashMap<String, String>,
+    pub skills_cache: HashMap<String, String>,
+}
+
+impl RunContext {
+    pub fn new(
+        flow_name: String,
+        task: String,
+        stack_path: PathBuf,
+        guide: Option<String>,
+        rules_cache: HashMap<String, String>,
+        skills_cache: HashMap<String, String>,
+    ) -> Self {
+        let now = chrono::Local::now();
+        let ts = now.format("%Y%m%d-%H%M%S").to_string();
+        // Short hash from timestamp nanos for uniqueness
+        let hash = format!("{:03x}", now.timestamp_subsec_nanos() & 0xFFF);
+        let run_id = format!("{ts}-{hash}");
+
+        Self {
+            run_id,
+            flow_name,
+            task,
+            stack_path,
+            guide,
+            rules_cache,
+            skills_cache,
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum RunError {
     #[error("step '{step}' references unknown agent '{agent}'")]
     UnknownAgent { step: String, agent: String },
 
     #[error("step '{step}' failed: {source}")]
-    LlmFailed {
-        step: String,
-        source: llm::LlmError,
-    },
+    LlmFailed { step: String, source: llm::LlmError },
 
     #[error("step '{step}' execution failed: {source}")]
     ExecutorFailed {
@@ -125,11 +162,7 @@ fn build_system_prompt(
 }
 
 /// Build the user-facing prompt with context from prior steps.
-fn build_user_prompt(
-    task: &str,
-    step: &Step,
-    stack_path: &Path,
-) -> Result<String, RunError> {
+fn build_user_prompt(task: &str, step: &Step, stack_path: &Path) -> Result<String, RunError> {
     let mut context_parts: Vec<String> = Vec::new();
     for input_id in &step.input {
         let prior = stack::read_step(stack_path, input_id).map_err(|e| RunError::Stack {
@@ -233,16 +266,10 @@ async fn run_step_via_api(
 }
 
 /// Run steps sequentially in topological order.
-#[allow(clippy::too_many_arguments)]
 pub async fn run_steps(
     steps: &[&Step],
     agents: &[Agent],
-    task: &str,
-    stack_path: &Path,
-    flow_name: &str,
-    guide: &Option<String>,
-    rules_cache: &HashMap<String, String>,
-    skills_cache: &HashMap<String, String>,
+    ctx: &RunContext,
 ) -> Result<Vec<StepRunResult>, RunError> {
     let agent_map: HashMap<&str, &Agent> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let total = steps.len();
@@ -274,23 +301,27 @@ pub async fn run_steps(
         ui::print_step_banner(i + 1, total, &step_info);
 
         // All steps get the flow prompt; step.task is appended in build_user_prompt
-        let step_task = task.to_string();
+        let step_task = ctx.task.to_string();
 
-        let user_content = build_user_prompt(&step_task, step, stack_path)?;
+        let user_content = build_user_prompt(&step_task, step, &ctx.stack_path)?;
 
         // Pre-compute output path and show it immediately so user can tail -f
-        let output_file = auto_output_filename(flow_name, &step.id, &agent.name);
-        let output_path = stack_path.join(&output_file);
+        let output_file = auto_output_filename(&ctx.flow_name, &step.id, &agent.name);
+        let output_path = ctx.stack_path.join(&output_file);
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
 
         eprintln!(
             "      output: {}",
-            output_path.canonicalize().unwrap_or(output_path.clone()).display()
+            output_path
+                .canonicalize()
+                .unwrap_or(output_path.clone())
+                .display()
         );
 
-        let system_prompt = build_system_prompt(agent, guide, rules_cache, skills_cache);
+        let system_prompt =
+            build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
 
         let start = Instant::now();
         let spinner = ui::start_spinner();
@@ -299,7 +330,7 @@ pub async fn run_steps(
             run_step_via_executor(
                 executor.as_ref(),
                 step,
-                flow_name,
+                &ctx.flow_name,
                 &system_prompt,
                 &user_content,
                 effective_model,
@@ -332,7 +363,7 @@ pub async fn run_steps(
             response: content.clone(),
             timestamp,
         };
-        stack::write_step(stack_path, &step_output).map_err(|e| RunError::Stack {
+        stack::write_step(&ctx.stack_path, &step_output).map_err(|e| RunError::Stack {
             step: step.id.clone(),
             source: e,
         })?;

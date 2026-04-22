@@ -62,12 +62,13 @@ impl Executor for LocalExecutor {
                 message: format!("process '{}' not found", handle.id),
             })?;
 
-        let output = child.wait_with_output().await.map_err(|e| {
-            ExecutorError::Failed {
+        let output = child
+            .wait_with_output()
+            .await
+            .map_err(|e| ExecutorError::Failed {
                 code: -1,
                 message: format!("failed waiting for process: {e}"),
-            }
-        })?;
+            })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr);

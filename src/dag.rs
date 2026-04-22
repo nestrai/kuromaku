@@ -28,8 +28,7 @@ pub fn validate_dag(config: &FlowConfig) -> Result<Vec<&Step>, DagError> {
     }
 
     // Topological sort using Kahn's algorithm
-    let step_map: HashMap<&str, &Step> =
-        config.steps.iter().map(|s| (s.id.as_str(), s)).collect();
+    let step_map: HashMap<&str, &Step> = config.steps.iter().map(|s| (s.id.as_str(), s)).collect();
 
     let mut in_degree: HashMap<&str, usize> = config
         .steps
