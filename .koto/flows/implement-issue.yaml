@@ -1,0 +1,50 @@
+# Implement a GitHub issue: fetch -> design -> implement -> review -> ship.
+# Usage: koto up implement-issue issue=41
+version: "1"
+name: implement-issue
+prompt: |
+  Implement issue #{{issue}} in this repository.
+
+flow:
+  fetch:
+    agent: Minion
+    task: |
+      Fetch issue #{{issue}} using gh issue view --comments.
+      Output the full issue description, comments, and acceptance
+      criteria as-is. Do not analyze -- just output the raw data.
+
+  design:
+    agent: Levi
+    input: [fetch]
+    task: |
+      Design the implementation. Read the issue carefully, especially
+      the acceptance criteria. Identify which files and modules need
+      changes, propose the approach, and flag risks or open questions.
+      Output a concrete plan, not abstract advice.
+
+  implement:
+    agent: Noah
+    input: [fetch, design]
+    task: |
+      Implement the changes based on the design. Create a feature branch
+      from main, write the code, add tests that cover the acceptance
+      criteria. Follow project conventions. Commit with conventional
+      commit messages.
+
+  review:
+    agent: Bella
+    input: [fetch, design, implement]
+    task: |
+      Review the implementation against the issue and acceptance criteria.
+      For each acceptance criterion: is it met? Check correctness, test
+      coverage, edge cases, and backwards compatibility.
+
+  ship:
+    agent: Noah
+    input: [review]
+    print_output: true
+    task: |
+      If the review has no blocking issues, push the branch and create
+      a PR that references the issue. Include what was changed and why.
+      If the review found blocking issues, fix them first.
+      Output the PR URL and a summary.
