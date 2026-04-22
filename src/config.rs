@@ -287,8 +287,7 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
     };
 
     // Collect step IDs for reference validation
-    let step_ids: std::collections::HashSet<&str> =
-        raw.flow.keys().map(|k| k.as_str()).collect();
+    let step_ids: std::collections::HashSet<&str> = raw.flow.keys().map(|k| k.as_str()).collect();
 
     // Validate step references
     for (id, step) in &raw.flow {
@@ -394,7 +393,10 @@ flow:
         assert_eq!(config.steps[0].id, "design");
         assert_eq!(config.steps[0].agent, "architect");
         assert_eq!(config.steps[1].id, "review");
-        assert_eq!(config.steps[1].task.as_deref(), Some("Check architecture decisions"));
+        assert_eq!(
+            config.steps[1].task.as_deref(),
+            Some("Check architecture decisions")
+        );
         assert_eq!(config.stack.backend, "local");
         assert_eq!(config.stack.path, "/tmp/test-stack");
     }

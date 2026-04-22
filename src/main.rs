@@ -17,6 +17,8 @@ mod stack;
 #[allow(dead_code)]
 mod ui;
 
+use crate::runner::RunContext;
+
 const KOTO_DIR: &str = ".koto";
 const FLOWS_DIR: &str = ".koto/flows";
 
@@ -45,7 +47,6 @@ enum Command {
         /// Path to the flow config file (overrides flow name lookup)
         #[arg(short, long)]
         file: Option<String>,
-
     },
     /// Fetch skills from remote sources pinned in .koto/skills.lock
     Pull,
@@ -66,9 +67,7 @@ async fn main() -> Result<()> {
             task,
             args,
             file,
-        } => {
-            run_up(flow.as_deref(), task.as_deref(), &args, file.as_deref()).await?
-        }
+        } => run_up(flow.as_deref(), task.as_deref(), &args, file.as_deref()).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
             println!("koto down: not yet implemented");
@@ -321,18 +320,18 @@ async fn run_up(
     // Resolve stack path
     let stack_path = resolve_stack_path(&flow_config.stack.path);
 
+    // Construct RunContext
+    let ctx = RunContext::new(
+        flow_name.clone(),
+        resolved_task,
+        stack_path.clone(),
+        guide,
+        rules_cache,
+        skills_cache,
+    );
+
     // Run steps
-    let results = runner::run_steps(
-        &steps,
-        &agents,
-        &resolved_task,
-        &stack_path,
-        &flow_name,
-        &guide,
-        &rules_cache,
-        &skills_cache,
-    )
-    .await?;
+    let results = runner::run_steps(&steps, &agents, &ctx).await?;
 
     // Print summary
     let total_elapsed = flow_start.elapsed();
@@ -346,13 +345,13 @@ async fn run_up(
         &total_in.to_string(),
         &total_out.to_string(),
         "—",
-        &stack_path.display().to_string(),
+        &ctx.stack_path.display().to_string(),
     );
 
     // Print output of steps marked with print_output: true
     for result in &results {
         if result.print_output {
-            let output_path = stack_path.join(&result.output_file);
+            let output_path = ctx.stack_path.join(&result.output_file);
             if let Ok(content) = std::fs::read_to_string(&output_path) {
                 println!();
                 termimad::print_text(&content);
@@ -455,16 +454,19 @@ mod tests {
 
     #[test]
     fn resolve_task_flag_wins() {
-        let result =
-            resolve_task(Some("manual task"), &Some("default {{pr}}".to_string()), &[]).unwrap();
+        let result = resolve_task(
+            Some("manual task"),
+            &Some("default {{pr}}".to_string()),
+            &[],
+        )
+        .unwrap();
         assert_eq!(result, "manual task");
     }
 
     #[test]
     fn resolve_task_flow_prompt_with_args() {
         let args = vec!["pr=42".to_string()];
-        let result =
-            resolve_task(None, &Some("Review PR #{{pr}}".to_string()), &args).unwrap();
+        let result = resolve_task(None, &Some("Review PR #{{pr}}".to_string()), &args).unwrap();
         assert_eq!(result, "Review PR #42");
     }
 
