@@ -5,16 +5,26 @@ name: implement-issue
 prompt: |
   Implement issue #{{issue}} in this repository.
 
+roles:
+  fetcher:
+    default: Minion
+  architect:
+    default: Levi
+  developer:
+    default: Noah
+  reviewer:
+    default: Bella
+
 flow:
   fetch:
-    agent: Minion
+    role: fetcher
     task: |
       Fetch issue #{{issue}} using gh issue view --comments.
       Output the full issue description, comments, and acceptance
       criteria as-is. Do not analyze -- just output the raw data.
 
   design:
-    agent: Levi
+    role: architect
     input: [fetch]
     task: |
       Design the implementation. Read the issue carefully, especially
@@ -23,7 +33,7 @@ flow:
       Output a concrete plan, not abstract advice.
 
   implement:
-    agent: Noah
+    role: developer
     input: [fetch, design]
     task: |
       Implement the changes based on the design. Create a feature branch
@@ -32,7 +42,7 @@ flow:
       commit messages.
 
   review:
-    agent: Bella
+    role: reviewer
     input: [fetch, design, implement]
     task: |
       Review the implementation against the issue and acceptance criteria.
@@ -40,7 +50,7 @@ flow:
       coverage, edge cases, and backwards compatibility.
 
   ship:
-    agent: Noah
+    role: developer
     input: [review]
     print_output: true
     task: |
