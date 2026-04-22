@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use indexmap::IndexMap;
@@ -65,6 +65,12 @@ impl<'de> Deserialize<'de> for Version {
 
 // --- Raw serde structs (what we deserialize from YAML) ---
 
+/// Role default (maps role name to default agent ID).
+#[derive(Debug, Deserialize)]
+pub struct RawRoleDefault {
+    pub default: String,
+}
+
 /// Flow config file format (lives in .koto/flows/<name>.yaml).
 #[derive(Debug, Deserialize)]
 pub struct RawFlowConfig {
@@ -73,6 +79,8 @@ pub struct RawFlowConfig {
     pub prompt: Option<String>,
     #[serde(default)]
     pub defaults: Option<RawDefaults>,
+    #[serde(default)]
+    pub roles: HashMap<String, RawRoleDefault>,
     pub flow: IndexMap<String, RawStep>,
     #[serde(default)]
     pub stack: Option<RawStackConfig>,
@@ -91,7 +99,8 @@ pub struct RawDefaults {
 /// A step in the flow map. The key in the map is the step ID.
 #[derive(Debug, Deserialize)]
 pub struct RawStep {
-    pub agent: String,
+    pub agent: Option<String>,
+    pub role: Option<String>,
     pub task: Option<String>,
     #[serde(default)]
     pub input: Vec<String>,
@@ -139,6 +148,7 @@ pub struct FlowConfig {
     pub name: String,
     pub prompt: Option<String>,
     pub defaults: Defaults,
+    pub roles: HashMap<String, String>,
     pub steps: Vec<Step>,
     pub stack: StackConfig,
 }
@@ -188,12 +198,22 @@ const DEFAULT_STACK_BACKEND: &str = "local";
 
 // --- Loading ---
 
+#[allow(dead_code)]
 pub fn load_flow(path: &Path) -> Result<FlowConfig, ConfigError> {
     let contents = std::fs::read_to_string(path)?;
     load_flow_from_str(&contents)
 }
 
+#[allow(dead_code)]
 pub fn load_flow_from_str(contents: &str) -> Result<FlowConfig, ConfigError> {
+    load_flow_from_str_with_overrides(contents, &HashMap::new())
+}
+
+/// Load flow from YAML string with role overrides.
+pub fn load_flow_from_str_with_overrides(
+    contents: &str,
+    role_overrides: &HashMap<String, String>,
+) -> Result<FlowConfig, ConfigError> {
     let raw: RawFlowConfig = serde_yaml::from_str(contents)?;
     warn_unknown_fields("top-level", &raw.unknown);
     if let Some(ref defaults) = raw.defaults {
@@ -205,7 +225,13 @@ pub fn load_flow_from_str(contents: &str) -> Result<FlowConfig, ConfigError> {
     if let Some(ref stack) = raw.stack {
         warn_unknown_fields("stack", &stack.unknown);
     }
-    validate_and_resolve(raw)
+    validate_and_resolve(raw, role_overrides)
+}
+
+/// Parse just the role names from a flow YAML (for CLI arg partitioning).
+pub fn parse_role_names(contents: &str) -> Result<HashSet<String>, ConfigError> {
+    let raw: RawFlowConfig = serde_yaml::from_str(contents)?;
+    Ok(raw.roles.keys().cloned().collect())
 }
 
 /// Load a single agent file from .koto/agents/<agent_id>.yaml.
@@ -265,7 +291,10 @@ fn warn_unknown_fields(context: &str, fields: &HashMap<String, serde_yaml::Value
 
 // --- Validation and resolution ---
 
-fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
+fn validate_and_resolve(
+    raw: RawFlowConfig,
+    role_overrides: &HashMap<String, String>,
+) -> Result<FlowConfig, ConfigError> {
     if raw.version.0 != "1" {
         return Err(ConfigError::Validation(format!(
             "unsupported version '{}', expected '1'",
@@ -286,8 +315,44 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
             .unwrap_or(DEFAULT_BACKEND),
     };
 
+    // Build resolved roles map (default + overrides)
+    let mut resolved_roles: HashMap<String, String> = HashMap::new();
+    for (role_name, role_default) in &raw.roles {
+        let agent_id = role_overrides
+            .get(role_name)
+            .unwrap_or(&role_default.default)
+            .clone();
+        resolved_roles.insert(role_name.clone(), agent_id);
+    }
+
+    // Validate resolved roles have non-empty agent IDs
+    for (role_name, agent_id) in &resolved_roles {
+        if agent_id.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "role '{role_name}' resolves to empty agent ID"
+            )));
+        }
+    }
+
+    // Extract placeholders from flow prompt to detect role-placeholder collisions
+    let prompt_placeholders = if let Some(ref prompt) = raw.prompt {
+        extract_placeholders(prompt)
+    } else {
+        HashSet::new()
+    };
+
+    // Validate role names don't collide with template placeholders
+    for role_name in raw.roles.keys() {
+        if prompt_placeholders.contains(role_name) {
+            return Err(ConfigError::Validation(format!(
+                "role name '{role_name}' collides with template placeholder {{{{{}}}}}",
+                role_name
+            )));
+        }
+    }
+
     // Collect step IDs for reference validation
-    let step_ids: std::collections::HashSet<&str> = raw.flow.keys().map(|k| k.as_str()).collect();
+    let step_ids: HashSet<&str> = raw.flow.keys().map(|k| k.as_str()).collect();
 
     // Validate step references
     for (id, step) in &raw.flow {
@@ -300,30 +365,70 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
         }
     }
 
-    // Resolve steps -- input implies needs
+    // Validate and resolve steps
     let steps: Vec<Step> = raw
         .flow
         .into_iter()
         .map(|(id, s)| {
-            let mut needs: Vec<String> = s.needs;
-            for input_dep in &s.input {
-                if !needs.contains(input_dep) {
-                    needs.push(input_dep.clone());
+            // Validate: exactly one of agent or role must be set
+            match (&s.agent, &s.role) {
+                (Some(_), Some(_)) => Err(ConfigError::Validation(format!(
+                    "step '{id}' has both 'agent' and 'role' -- use one or the other"
+                ))),
+                (None, None) => Err(ConfigError::Validation(format!(
+                    "step '{id}' must specify either 'agent' or 'role'"
+                ))),
+                (Some(agent_id), None) => {
+                    // Direct agent assignment -- bypass roles
+                    let mut needs: Vec<String> = s.needs;
+                    for input_dep in &s.input {
+                        if !needs.contains(input_dep) {
+                            needs.push(input_dep.clone());
+                        }
+                    }
+                    Ok(Step {
+                        id,
+                        agent: agent_id.clone(),
+                        task: s.task,
+                        input: s.input,
+                        needs,
+                        model: s.model,
+                        backend: s.backend,
+                        print_output: s.print_output,
+                    })
+                }
+                (None, Some(role_name)) => {
+                    // Resolve role to agent ID
+                    let agent_id = resolved_roles.get(role_name).ok_or_else(|| {
+                        let available = resolved_roles.keys()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        ConfigError::Validation(format!(
+                            "step '{id}' references undefined role '{role_name}' (available: {available})"
+                        ))
+                    })?;
+
+                    let mut needs: Vec<String> = s.needs;
+                    for input_dep in &s.input {
+                        if !needs.contains(input_dep) {
+                            needs.push(input_dep.clone());
+                        }
+                    }
+                    Ok(Step {
+                        id,
+                        agent: agent_id.clone(),
+                        task: s.task,
+                        input: s.input,
+                        needs,
+                        model: s.model,
+                        backend: s.backend,
+                        print_output: s.print_output,
+                    })
                 }
             }
-
-            Step {
-                id,
-                agent: s.agent,
-                task: s.task,
-                input: s.input,
-                needs,
-                model: s.model,
-                backend: s.backend,
-                print_output: s.print_output,
-            }
         })
-        .collect();
+        .collect::<Result<Vec<_>, _>>()?;
 
     let stack = StackConfig {
         backend: raw
@@ -343,9 +448,18 @@ fn validate_and_resolve(raw: RawFlowConfig) -> Result<FlowConfig, ConfigError> {
         name: raw.name,
         prompt: raw.prompt,
         defaults,
+        roles: resolved_roles,
         steps,
         stack,
     })
+}
+
+/// Extract `{{placeholder}}` names from a prompt template.
+pub fn extract_placeholders(prompt: &str) -> HashSet<String> {
+    let re = regex_lite::Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap();
+    re.captures_iter(prompt)
+        .map(|cap| cap[1].to_string())
+        .collect()
 }
 
 // --- Tests ---
@@ -680,5 +794,202 @@ flow:
         let config = load_flow_from_str(yaml).unwrap();
         assert_eq!(config.defaults.model, "custom-model");
         assert_eq!(config.defaults.backend, Backend::Api);
+    }
+
+    #[test]
+    fn role_based_flow_parses() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Noah }
+  reviewer: { default: Bella }
+flow:
+  code:
+    role: coder
+  review:
+    role: reviewer
+    input: [code]
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(config.steps[0].agent, "Noah");
+        assert_eq!(config.steps[1].agent, "Bella");
+        assert_eq!(config.roles.get("coder").unwrap(), "Noah");
+        assert_eq!(config.roles.get("reviewer").unwrap(), "Bella");
+    }
+
+    #[test]
+    fn role_with_cli_override() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Noah }
+flow:
+  code:
+    role: coder
+"#;
+        let mut overrides = HashMap::new();
+        overrides.insert("coder".to_string(), "Kai".to_string());
+        let config = load_flow_from_str_with_overrides(yaml, &overrides).unwrap();
+        assert_eq!(config.steps[0].agent, "Kai");
+        assert_eq!(config.roles.get("coder").unwrap(), "Kai");
+    }
+
+    #[test]
+    fn step_with_both_agent_and_role_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Noah }
+flow:
+  code:
+    agent: Kai
+    role: coder
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("both 'agent' and 'role'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn step_with_neither_agent_nor_role_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  code:
+    task: "Do something"
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must specify either 'agent' or 'role'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn undefined_role_in_step_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Noah }
+flow:
+  code:
+    role: phantom
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("undefined role 'phantom'"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn role_name_collides_with_placeholder_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+prompt: "Fix issue #{{issue}}"
+roles:
+  issue: { default: Noah }
+flow:
+  code:
+    role: issue
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("collides with template placeholder"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn backwards_compat_agent_only() {
+        // No roles defined, steps use agent directly
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  code:
+    agent: Noah
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps[0].agent, "Noah");
+        assert!(config.roles.is_empty());
+    }
+
+    #[test]
+    fn mixed_agent_and_role_steps() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Noah }
+flow:
+  code:
+    role: coder
+  review:
+    agent: Bella
+    input: [code]
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert_eq!(config.steps[0].agent, "Noah");
+        assert_eq!(config.steps[1].agent, "Bella");
+    }
+
+    #[test]
+    fn empty_role_default_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: "" }
+flow:
+  code:
+    role: coder
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role 'coder' resolves to empty agent ID"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn undefined_role_lists_available() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Noah }
+  reviewer: { default: Bella }
+flow:
+  code:
+    role: phantom
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("undefined role 'phantom'"),
+            "got: {}",
+            err
+        );
+        assert!(msg.contains("available:"), "got: {}", err);
+        assert!(msg.contains("coder") && msg.contains("reviewer"), "got: {}", err);
     }
 }

@@ -180,6 +180,7 @@ flow:
                 model: "m".to_string(),
                 backend: crate::config::Backend::Api,
             },
+            roles: std::collections::HashMap::new(),
             steps: vec![Step {
                 id: "a".to_string(),
                 agent: "dev".to_string(),

@@ -5,16 +5,26 @@ name: review-pr
 prompt: |
   Review PR #{{pr}} in this repository. Evaluate the changes thoroughly.
 
+roles:
+  fetcher:
+    default: Minion
+  architect:
+    default: Levi
+  reviewer:
+    default: Bella
+  facilitator:
+    default: Mika
+
 flow:
   fetch:
-    agent: Minion
+    role: fetcher
     task: |
       Fetch PR #{{pr}} using the gh CLI. Run gh pr view and gh pr diff.
       Output the full PR description and diff as-is, nothing else.
       Do not analyze or comment -- just output the raw data.
 
   architecture:
-    agent: Levi
+    role: architect
     input: [fetch]
     task: |
       Evaluate the design decisions and architectural impact of this PR.
@@ -22,7 +32,7 @@ flow:
       the approach fits the existing codebase. Skip cosmetic issues.
 
   code-review:
-    agent: Bella
+    role: reviewer
     input: [fetch]
     task: |
       Review the implementation for correctness, edge cases, and test
@@ -30,7 +40,7 @@ flow:
       Verify before reporting -- false positives waste everyone's time.
 
   consensus:
-    agent: Mika
+    role: facilitator
     input: [architecture, code-review]
     print_output: true
     task: |

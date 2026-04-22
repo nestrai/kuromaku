@@ -179,14 +179,14 @@ fn resolve_stack_path(config_path: &str) -> PathBuf {
         .join(project)
 }
 
-/// Resolve the task prompt from CLI flag, flow default, and key=value args.
+/// Resolve the task prompt from CLI flag, flow default, and template vars.
 ///
 /// Priority: `-t "prompt"` overrides flow default. If the flow has a `prompt:`
-/// field with `{{key}}` placeholders, key=value trailing args fill them.
+/// field with `{{key}}` placeholders, template vars fill them.
 fn resolve_task(
     task_flag: Option<&str>,
     flow_prompt: &Option<String>,
-    args: &[String],
+    template_vars: &std::collections::HashMap<String, String>,
 ) -> Result<String> {
     // -t flag takes precedence
     if let Some(task) = task_flag {
@@ -195,8 +195,7 @@ fn resolve_task(
 
     // Flow has a default prompt with placeholders
     if let Some(prompt) = flow_prompt {
-        let vars = parse_key_value_args(args)?;
-        let resolved = substitute_placeholders(prompt, &vars)?;
+        let resolved = substitute_placeholders(prompt, template_vars)?;
         return Ok(resolved);
     }
 
@@ -398,10 +397,43 @@ async fn run_up(
 
     ui::print_command(&format!("koto up {}", flow.unwrap_or(&display_path)));
 
-    let flow_config = config::load_flow(&path)?;
+    // Parse role names from YAML to partition args
+    let contents = std::fs::read_to_string(&path)?;
+    let role_names = config::parse_role_names(&contents)?;
+
+    // Partition args: role overrides vs template vars
+    let all_args = parse_key_value_args(args)?;
+    let (role_overrides, template_vars): (
+        std::collections::HashMap<_, _>,
+        std::collections::HashMap<_, _>,
+    ) = all_args
+        .into_iter()
+        .partition(|(k, _)| role_names.contains(k));
+
+    // Warn about template vars that aren't placeholders
+    if !template_vars.is_empty() {
+        let flow_config_temp = config::load_flow_from_str(&contents)?;
+        let placeholders = flow_config_temp
+            .prompt
+            .as_ref()
+            .map(|p| config::extract_placeholders(p))
+            .unwrap_or_default();
+
+        for key in template_vars.keys() {
+            if !placeholders.contains(key) {
+                eprintln!(
+                    "warning: '{}' is not a declared role or template placeholder",
+                    key
+                );
+            }
+        }
+    }
+
+    // Load flow with role overrides
+    let flow_config = config::load_flow_from_str_with_overrides(&contents, &role_overrides)?;
 
     // Resolve task prompt: -t flag > flow default prompt with {{key}} substitution
-    let resolved_task = resolve_task(task, &flow_config.prompt, args)?;
+    let resolved_task = resolve_task(task, &flow_config.prompt, &template_vars)?;
 
     // Derive flow name for tmux sessions
     let flow_name = flow
@@ -594,10 +626,11 @@ mod tests {
 
     #[test]
     fn resolve_task_flag_wins() {
+        let vars = std::collections::HashMap::new();
         let result = resolve_task(
             Some("manual task"),
             &Some("default {{pr}}".to_string()),
-            &[],
+            &vars,
         )
         .unwrap();
         assert_eq!(result, "manual task");
@@ -605,14 +638,55 @@ mod tests {
 
     #[test]
     fn resolve_task_flow_prompt_with_args() {
-        let args = vec!["pr=42".to_string()];
-        let result = resolve_task(None, &Some("Review PR #{{pr}}".to_string()), &args).unwrap();
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("pr".to_string(), "42".to_string());
+        let result = resolve_task(None, &Some("Review PR #{{pr}}".to_string()), &vars).unwrap();
         assert_eq!(result, "Review PR #42");
     }
 
     #[test]
     fn resolve_task_no_task_no_prompt_errors() {
-        let err = resolve_task(None, &None, &[]).unwrap_err();
+        let vars = std::collections::HashMap::new();
+        let err = resolve_task(None, &None, &vars).unwrap_err();
         assert!(err.to_string().contains("no task specified"));
+    }
+
+    #[test]
+    fn partition_role_overrides_from_template_vars() {
+        use std::collections::{HashMap, HashSet};
+
+        let mut role_names = HashSet::new();
+        role_names.insert("reviewer".to_string());
+
+        let mut all_args = HashMap::new();
+        all_args.insert("issue".to_string(), "42".to_string());
+        all_args.insert("reviewer".to_string(), "Kai".to_string());
+
+        let (role_overrides, template_vars): (HashMap<_, _>, HashMap<_, _>) = all_args
+            .into_iter()
+            .partition(|(k, _)| role_names.contains(k));
+
+        assert_eq!(role_overrides.len(), 1);
+        assert_eq!(role_overrides.get("reviewer").unwrap(), "Kai");
+        assert_eq!(template_vars.len(), 1);
+        assert_eq!(template_vars.get("issue").unwrap(), "42");
+    }
+
+    #[test]
+    fn all_args_are_template_vars_when_no_roles() {
+        use std::collections::{HashMap, HashSet};
+
+        let role_names: HashSet<String> = HashSet::new(); // No roles
+
+        let mut all_args = HashMap::new();
+        all_args.insert("issue".to_string(), "42".to_string());
+        all_args.insert("branch".to_string(), "main".to_string());
+
+        let (role_overrides, template_vars): (HashMap<_, _>, HashMap<_, _>) = all_args
+            .into_iter()
+            .partition(|(k, _)| role_names.contains(k));
+
+        assert!(role_overrides.is_empty());
+        assert_eq!(template_vars.len(), 2);
     }
 }

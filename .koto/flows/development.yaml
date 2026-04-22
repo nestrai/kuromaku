@@ -5,16 +5,24 @@ name: development
 prompt: |
   {{task}}
 
+roles:
+  architect:
+    default: Levi
+  developer:
+    default: Noah
+  reviewer:
+    default: Bella
+
 flow:
   design:
-    agent: Levi
+    role: architect
     task: |
       Design the implementation for this feature. Identify which modules
       need changes, propose the approach, and flag any architectural
       concerns. Output a concrete design doc, not a wishlist.
 
   implement:
-    agent: Noah
+    role: developer
     input: [design]
     task: |
       Implement the feature based on the design doc. Create a feature
@@ -22,7 +30,7 @@ flow:
       Commit with conventional commit messages.
 
   review:
-    agent: Bella
+    role: reviewer
     input: [design, implement]
     print_output: true
     task: |
