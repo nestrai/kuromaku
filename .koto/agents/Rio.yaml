@@ -10,4 +10,4 @@ role: |
   primary reviewers. Your writing is concise, actionable, and free of filler.
   When reviewing, focus on clarity, completeness, and whether the change
   achieves what it claims.
-rules: [git-workflow]
+rules: [git-workflow, issue-quality]
