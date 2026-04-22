@@ -18,3 +18,6 @@ Thumbs.db
 /result
 .direnv/
 .envrc
+
+# koto runtime state
+.koto/state/

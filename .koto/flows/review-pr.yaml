@@ -1,0 +1,48 @@
+# Review a GitHub PR: fetch -> architecture + code-review -> consensus.
+# Usage: koto up review-pr pr=67
+version: "1"
+name: review-pr
+prompt: |
+  Review PR #{{pr}} in this repository. Evaluate the changes thoroughly.
+
+flow:
+  fetch:
+    agent: Minion
+    task: |
+      Fetch PR #{{pr}} using the gh CLI. Run gh pr view and gh pr diff.
+      Output the full PR description and diff as-is, nothing else.
+      Do not analyze or comment -- just output the raw data.
+
+  architecture:
+    agent: Levi
+    input: [fetch]
+    task: |
+      Evaluate the design decisions and architectural impact of this PR.
+      Focus on module boundaries, error handling patterns, and whether
+      the approach fits the existing codebase. Skip cosmetic issues.
+
+  code-review:
+    agent: Bella
+    input: [fetch]
+    task: |
+      Review the implementation for correctness, edge cases, and test
+      coverage. List only actual issues with file, line, problem, fix.
+      Verify before reporting -- false positives waste everyone's time.
+
+  consensus:
+    agent: Mika
+    input: [architecture, code-review]
+    print_output: true
+    task: |
+      Output ONLY a GitHub PR comment, ready to copy-paste as-is.
+      No preamble, no meta-commentary, no wrapper text -- start directly
+      with the verdict line.
+      Your job is to distill the BEST suggestions from the previous reviews,
+      not to invent new ones. Only include suggestions that are within the
+      scope of what the PR is trying to do -- no feature creep, no "while
+      you're at it" additions, no documentation unless the PR introduces
+      something genuinely new.
+      For each suggestion, one sentence why + a minimal code snippet (2-5 lines).
+      Never estimate effort or time.
+      No emojis anywhere in the output. No bonus or extra sections.
+      Keep the entire comment under 40 lines.

@@ -1,0 +1,31 @@
+# New feature development: design -> implement -> review -> ship.
+# Usage: koto up development -t "Add content-addressable caching for step outputs"
+version: "1"
+name: development
+prompt: |
+  {{task}}
+
+flow:
+  design:
+    agent: Levi
+    task: |
+      Design the implementation for this feature. Identify which modules
+      need changes, propose the approach, and flag any architectural
+      concerns. Output a concrete design doc, not a wishlist.
+
+  implement:
+    agent: Noah
+    input: [design]
+    task: |
+      Implement the feature based on the design doc. Create a feature
+      branch, write the code and tests. Follow the project conventions.
+      Commit with conventional commit messages.
+
+  review:
+    agent: Bella
+    input: [design, implement]
+    print_output: true
+    task: |
+      Review the implementation against the design. Check correctness,
+      test coverage, and adherence to project conventions. List only
+      actual issues.
