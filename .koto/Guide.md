@@ -62,6 +62,17 @@ ADRs live in `docs/decisions/`. They are for internal use by the maintainer.
 - No emojis or icons in any output
 - Plain, clean markdown
 
+## Git Workflow
+
+Before any work:
+1. `git checkout main && git pull` -- always start from up-to-date main
+2. Create a feature branch (`feat/...`, `fix/...`)
+3. Work, commit, push
+
+If you cannot check out main or create a branch (dirty worktree, conflicts, etc.), STOP and report the problem. Do not work on a stale or wrong branch.
+
+Never commit directly to main. Never close, reopen, or reassign issues -- that is the maintainer's decision.
+
 ## Review Guidelines
 
 When reviewing PRs:
