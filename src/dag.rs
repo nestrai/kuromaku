@@ -1,41 +1,26 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use crate::config::{FlowConfig, Stage};
+use crate::config::{FlowConfig, Step};
 
 #[derive(Debug, thiserror::Error)]
 pub enum DagError {
     #[error("cycle detected: {0}")]
     Cycle(String),
 
-    #[error("stage '{stage}' references unknown stage '{referenced}'")]
-    UnknownStage { stage: String, referenced: String },
-
-    #[error("stage '{stage}' references unknown agent '{agent}'")]
-    UnknownAgent { stage: String, agent: String },
+    #[error("step '{step}' references unknown step '{referenced}'")]
+    UnknownStep { step: String, referenced: String },
 }
 
-/// Validates the DAG formed by stage dependencies and returns stages in topological order.
-///
-/// Checks:
-/// - All referenced stage IDs exist
-/// - All referenced agent IDs exist
-/// - No cycles in the dependency graph
-pub fn validate_dag(config: &FlowConfig) -> Result<Vec<&Stage>, DagError> {
-    let stage_ids: HashSet<&str> = config.stages.iter().map(|s| s.id.as_str()).collect();
-    let agent_ids: HashSet<&str> = config.agents.iter().map(|a| a.id.as_str()).collect();
+/// Validates the DAG formed by step dependencies and returns steps in topological order.
+pub fn validate_dag(config: &FlowConfig) -> Result<Vec<&Step>, DagError> {
+    let step_ids: HashSet<&str> = config.steps.iter().map(|s| s.id.as_str()).collect();
 
     // Validate references
-    for stage in &config.stages {
-        if !agent_ids.contains(stage.agent.as_str()) {
-            return Err(DagError::UnknownAgent {
-                stage: stage.id.clone(),
-                agent: stage.agent.clone(),
-            });
-        }
-        for dep in &stage.needs {
-            if !stage_ids.contains(dep.as_str()) {
-                return Err(DagError::UnknownStage {
-                    stage: stage.id.clone(),
+    for step in &config.steps {
+        for dep in &step.needs {
+            if !step_ids.contains(dep.as_str()) {
+                return Err(DagError::UnknownStep {
+                    step: step.id.clone(),
                     referenced: dep.clone(),
                 });
             }
@@ -43,22 +28,22 @@ pub fn validate_dag(config: &FlowConfig) -> Result<Vec<&Stage>, DagError> {
     }
 
     // Topological sort using Kahn's algorithm
-    let stage_map: HashMap<&str, &Stage> =
-        config.stages.iter().map(|s| (s.id.as_str(), s)).collect();
+    let step_map: HashMap<&str, &Step> =
+        config.steps.iter().map(|s| (s.id.as_str(), s)).collect();
 
     let mut in_degree: HashMap<&str, usize> = config
-        .stages
+        .steps
         .iter()
         .map(|s| (s.id.as_str(), s.needs.len()))
         .collect();
 
     let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
-    for stage in &config.stages {
-        for dep in &stage.needs {
+    for step in &config.steps {
+        for dep in &step.needs {
             dependents
                 .entry(dep.as_str())
                 .or_default()
-                .push(stage.id.as_str());
+                .push(step.id.as_str());
         }
     }
 
@@ -73,10 +58,10 @@ pub fn validate_dag(config: &FlowConfig) -> Result<Vec<&Stage>, DagError> {
     initial.sort();
     queue.extend(initial);
 
-    let mut result: Vec<&Stage> = Vec::with_capacity(config.stages.len());
+    let mut result: Vec<&Step> = Vec::with_capacity(config.steps.len());
 
     while let Some(id) = queue.pop_front() {
-        result.push(stage_map[id]);
+        result.push(step_map[id]);
 
         if let Some(deps) = dependents.get(id) {
             let mut next: Vec<&str> = Vec::new();
@@ -92,8 +77,7 @@ pub fn validate_dag(config: &FlowConfig) -> Result<Vec<&Stage>, DagError> {
         }
     }
 
-    if result.len() != config.stages.len() {
-        // Cycle detected -- find and report it
+    if result.len() != config.steps.len() {
         let cycle_path = find_cycle(config);
         return Err(DagError::Cycle(cycle_path));
     }
@@ -101,10 +85,9 @@ pub fn validate_dag(config: &FlowConfig) -> Result<Vec<&Stage>, DagError> {
     Ok(result)
 }
 
-/// Finds a cycle in the dependency graph and returns a formatted path string.
 fn find_cycle(config: &FlowConfig) -> String {
-    let stage_needs: HashMap<&str, &[String]> = config
-        .stages
+    let step_needs: HashMap<&str, &[String]> = config
+        .steps
         .iter()
         .map(|s| (s.id.as_str(), s.needs.as_slice()))
         .collect();
@@ -113,11 +96,11 @@ fn find_cycle(config: &FlowConfig) -> String {
     let mut in_stack: HashSet<&str> = HashSet::new();
     let mut path: Vec<&str> = Vec::new();
 
-    for stage in &config.stages {
-        if !visited.contains(stage.id.as_str())
+    for step in &config.steps {
+        if !visited.contains(step.id.as_str())
             && let Some(cycle) = dfs_find_cycle(
-                stage.id.as_str(),
-                &stage_needs,
+                step.id.as_str(),
+                &step_needs,
                 &mut visited,
                 &mut in_stack,
                 &mut path,
@@ -149,7 +132,6 @@ fn dfs_find_cycle<'a>(
                     return Some(cycle);
                 }
             } else if in_stack.contains(dep_str) {
-                // Found a cycle -- extract the cycle path
                 let cycle_start = path.iter().position(|&n| n == dep_str).unwrap();
                 let mut cycle_nodes: Vec<&str> = path[cycle_start..].to_vec();
                 cycle_nodes.push(dep_str);
@@ -166,27 +148,22 @@ fn dfs_find_cycle<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::load_config_from_str;
+    use crate::config::load_flow_from_str;
 
     #[test]
-    fn cycle_two_stages() {
+    fn cycle_two_steps() {
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
+flow:
+  a:
     agent: dev
-    task: "do a"
     needs: [b]
-  - id: b
+  b:
     agent: dev
-    task: "do b"
     needs: [a]
 "#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         let err = validate_dag(&config).unwrap_err();
         let msg = err.to_string();
         assert!(msg.starts_with("cycle detected:"), "got: {msg}");
@@ -195,91 +172,34 @@ stages:
     }
 
     #[test]
-    fn missing_stage_reference() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
-    agent: dev
-    task: "do a"
-    needs: [nonexistent]
-"#;
-        // Config parser already catches this, but let's test with a crafted FlowConfig
-        let config = load_config_from_str(yaml);
-        assert!(config.is_err()); // caught at config level
-
-        // Test via DAG directly with a manually constructed config
+    fn missing_step_reference() {
         let config = FlowConfig {
             version: "1".to_string(),
             name: "test".to_string(),
+            prompt: None,
             defaults: crate::config::Defaults {
                 model: "m".to_string(),
                 backend: crate::config::Backend::Api,
             },
-            agents: vec![crate::config::Agent {
-                id: "dev".to_string(),
-                role: "dev".to_string(),
-                model: "m".to_string(),
-                backend: crate::config::Backend::Api,
-                rules: None,
-            }],
-            stages: vec![Stage {
+            steps: vec![Step {
                 id: "a".to_string(),
                 agent: "dev".to_string(),
-                task: crate::config::TaskSource::Inline("do a".to_string()),
+                task: None,
                 input: vec![],
                 needs: vec!["nonexistent".to_string()],
-                output: None,
                 model: None,
                 backend: None,
+                print_output: false,
             }],
-            state: crate::config::StateConfig {
+            stack: crate::config::StackConfig {
                 backend: "local".to_string(),
-                path: ".koto/state".to_string(),
+                path: String::new(),
             },
         };
         let err = validate_dag(&config).unwrap_err();
         assert!(
             err.to_string()
-                .contains("stage 'a' references unknown stage 'nonexistent'"),
-            "got: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn missing_agent_reference() {
-        let config = FlowConfig {
-            version: "1".to_string(),
-            name: "test".to_string(),
-            defaults: crate::config::Defaults {
-                model: "m".to_string(),
-                backend: crate::config::Backend::Api,
-            },
-            agents: vec![],
-            stages: vec![Stage {
-                id: "a".to_string(),
-                agent: "ghost".to_string(),
-                task: crate::config::TaskSource::Inline("do a".to_string()),
-                input: vec![],
-                needs: vec![],
-                output: None,
-                model: None,
-                backend: None,
-            }],
-            state: crate::config::StateConfig {
-                backend: "local".to_string(),
-                path: ".koto/state".to_string(),
-            },
-        };
-        let err = validate_dag(&config).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("stage 'a' references unknown agent 'ghost'"),
+                .contains("step 'a' references unknown step 'nonexistent'"),
             "got: {}",
             err
         );
@@ -290,32 +210,24 @@ stages:
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
+flow:
+  a:
     agent: dev
-    task: "do a"
-  - id: b
+  b:
     agent: dev
-    task: "do b"
     needs: [a]
-  - id: c
+  c:
     agent: dev
-    task: "do c"
     needs: [a]
-  - id: d
+  d:
     agent: dev
-    task: "do d"
     needs: [b, c]
 "#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         let order = validate_dag(&config).unwrap();
         let ids: Vec<&str> = order.iter().map(|s| s.id.as_str()).collect();
 
         assert_eq!(ids.len(), 4);
-        // a must come before b and c, b and c before d
         let pos = |id: &str| ids.iter().position(|&s| s == id).unwrap();
         assert!(pos("a") < pos("b"));
         assert!(pos("a") < pos("c"));
@@ -328,66 +240,23 @@ stages:
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
+flow:
+  a:
     agent: dev
-    task: "do a"
-  - id: b
+  b:
     agent: dev
-    task: "do b"
     needs: [a]
-  - id: c
+  c:
     agent: dev
-    task: "do c"
     needs: [b]
-  - id: d
+  d:
     agent: dev
-    task: "do d"
     needs: [c]
 "#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         let order = validate_dag(&config).unwrap();
         let ids: Vec<&str> = order.iter().map(|s| s.id.as_str()).collect();
         assert_eq!(ids, vec!["a", "b", "c", "d"]);
-    }
-
-    #[test]
-    fn diamond_dag() {
-        let yaml = r#"
-version: "1"
-name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
-    agent: dev
-    task: "do a"
-  - id: b
-    agent: dev
-    task: "do b"
-    needs: [a]
-  - id: c
-    agent: dev
-    task: "do c"
-    needs: [a]
-  - id: d
-    agent: dev
-    task: "do d"
-    needs: [b, c]
-"#;
-        let config = load_config_from_str(yaml).unwrap();
-        let order = validate_dag(&config).unwrap();
-        let ids: Vec<&str> = order.iter().map(|s| s.id.as_str()).collect();
-
-        let pos = |id: &str| ids.iter().position(|&s| s == id).unwrap();
-        assert!(pos("a") < pos("b"));
-        assert!(pos("a") < pos("c"));
-        assert!(pos("b") < pos("d"));
-        assert!(pos("c") < pos("d"));
     }
 
     #[test]
@@ -395,21 +264,15 @@ stages:
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
+flow:
+  a:
     agent: dev
-    task: "do a"
-  - id: b
+  b:
     agent: dev
-    task: "do b"
-  - id: c
+  c:
     agent: dev
-    task: "do c"
 "#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         let order = validate_dag(&config).unwrap();
         assert_eq!(order.len(), 3);
     }
@@ -419,22 +282,15 @@ stages:
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
+flow:
+  a:
     agent: dev
-    task: "do a"
-    output: result.md
-  - id: b
+  b:
     agent: dev
-    task: "do b"
     input: [a]
 "#;
-        let config = load_config_from_str(yaml).unwrap();
-        // input merges into needs during config resolution
-        assert!(config.stages[1].needs.contains(&"a".to_string()));
+        let config = load_flow_from_str(yaml).unwrap();
+        assert!(config.steps[1].needs.contains(&"a".to_string()));
 
         let order = validate_dag(&config).unwrap();
         let ids: Vec<&str> = order.iter().map(|s| s.id.as_str()).collect();
@@ -446,24 +302,18 @@ stages:
         let yaml = r#"
 version: "1"
 name: test
-agents:
-  - id: dev
-    role: "dev"
-stages:
-  - id: a
+flow:
+  a:
     agent: dev
-    task: "do a"
     needs: [c]
-  - id: b
+  b:
     agent: dev
-    task: "do b"
     needs: [a]
-  - id: c
+  c:
     agent: dev
-    task: "do c"
     needs: [b]
 "#;
-        let config = load_config_from_str(yaml).unwrap();
+        let config = load_flow_from_str(yaml).unwrap();
         let err = validate_dag(&config).unwrap_err();
         let msg = err.to_string();
         assert!(msg.starts_with("cycle detected:"), "got: {msg}");

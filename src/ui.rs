@@ -2,12 +2,17 @@
 //!
 //! Implements the visual language from the koto terminal design mockups:
 //! - Semantic color system (tokyonight-inspired dark theme)
-//! - Stage pills, banners, and summary tables
+//! - Step pills, banners, and summary tables
 //! - Streaming output with spinners
 //! - Error diagnostics with source pointers
 //!
 //! All output goes to stdout using ANSI escape codes via crossterm.
 //! This is the foundation for a future ratatui-based TUI.
+
+use std::io::Write;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use crossterm::style::{self, Attribute, Color, Stylize};
 
@@ -41,10 +46,10 @@ pub const DARK: Theme = Theme {
     blue: Color::Blue,
 };
 
-// --- Stage state ---
+// --- Step state ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageState {
+pub enum StepState {
     Pending,
     Running,
     Done,
@@ -52,7 +57,7 @@ pub enum StageState {
     Skipped,
 }
 
-impl StageState {
+impl StepState {
     fn marker(self) -> &'static str {
         match self {
             Self::Done => "✓",
@@ -74,24 +79,24 @@ impl StageState {
     }
 }
 
-// --- Stage pill info ---
+// --- Step pill info ---
 
-pub struct StagePill {
+pub struct StepPill {
     pub label: String,
-    pub state: StageState,
+    pub state: StepState,
 }
 
 // --- Output functions ---
 
 /// Print the flow header: "koto flow <name> (<file>)"
-pub fn print_flow_start(name: &str, file: &str, stage_count: usize, agent_count: usize) {
+pub fn print_flow_start(name: &str, file: &str, step_count: usize, agent_count: usize) {
     let t = &DARK;
     println!(
-        "  {} loaded flow {} ({})  ({} stages, {} agents)",
+        "  {} loaded flow {} ({})  ({} steps, {} agents)",
         style::style("✓").with(t.green),
         style::style(name).with(t.fg),
         style::style(file).with(t.dim),
-        stage_count,
+        step_count,
         agent_count,
     );
 }
@@ -117,75 +122,137 @@ pub fn print_backends_ok(backends: &[(&str, &str)]) {
     );
 }
 
-/// Print the stage pills row: "✓ design  ─  ● implement  ─  ○ review"
-pub fn print_stage_pills(stages: &[StagePill]) {
+/// Print the step pills row: "✓ design  -  ● implement  -  ○ review"
+pub fn print_step_pills(steps: &[StepPill]) {
     let t = &DARK;
     let mut out = String::new();
-    for (i, s) in stages.iter().enumerate() {
+    for (i, s) in steps.iter().enumerate() {
         let color = s.state.color(t);
         out.push_str(&format!(
             "{} {}",
             style::style(s.state.marker()).with(color),
             style::style(&s.label).with(color),
         ));
-        if i < stages.len() - 1 {
+        if i < steps.len() - 1 {
             out.push_str(&format!("  {}  ", style::style("─").with(t.muted)));
         }
     }
     println!("{out}");
 }
 
-/// Print a stage banner: "── ▶ Stage 1/2  design  ──  architect · Software architect"
-pub fn print_stage_banner(n: usize, total: usize, stage: &StageInfo) {
+/// Print a step banner:
+/// ```text
+///   -- > Step 1/3  design -- Levi
+///      model claude-sonnet-4-5  backend claude-cli
+///      task "Implement the feature"
+/// ```
+pub fn print_step_banner(n: usize, total: usize, step: &StepInfo) {
     let t = &DARK;
-    let (marker, color) = match stage.state {
-        StageState::Done => ("✓", t.green),
-        StageState::Running => ("▶", t.cyan),
-        StageState::Failed => ("✗", t.red),
+    let (marker, color) = match step.state {
+        StepState::Done => ("✓", t.green),
+        StepState::Running => ("▶", t.cyan),
+        StepState::Failed => ("✗", t.red),
         _ => ("·", t.fg),
     };
     println!();
     println!(
-        "  {}  {} Stage {}/{}  {}  {}  {}{}",
+        "  {}  {} Step {}/{}  {}  {}  {}{}",
         style::style("──").with(t.muted),
         style::style(marker).with(color).attribute(Attribute::Bold),
         n,
         total,
-        style::style(&stage.id)
+        style::style(&step.id)
             .with(t.fg)
             .attribute(Attribute::Bold),
         style::style("──").with(t.muted),
-        style::style(&stage.agent).with(t.magenta),
-        format_args!(
-            " {} {}",
-            style::style("·").with(t.dim),
-            style::style(&stage.role).with(t.dim),
-        ),
+        style::style(&step.agent).with(t.magenta),
+        step.title.as_deref().map_or(String::new(), |t_str| {
+            format!("  {}", style::style(t_str).with(t.dim))
+        }),
     );
-    println!(
-        "      {} {}   {} {}{}   {} {}",
+    let mut meta = format!(
+        "      {} {}   {} {}",
         style::style("model").with(t.dim),
-        style::style(&stage.model).with(t.yellow),
+        style::style(&step.model).with(t.yellow),
         style::style("backend").with(t.dim),
-        style::style(stage.backend_name()).with(t.blue),
-        if !stage.input.is_empty() {
-            format!(
-                "   {} [{}]",
-                style::style("input").with(t.dim),
-                stage.input.join(", "),
-            )
-        } else {
-            String::new()
-        },
-        style::style("output").with(t.dim),
-        style::style(&stage.output).with(t.fg),
+        style::style(step.backend_name()).with(t.blue),
     );
+    if !step.input.is_empty() {
+        meta.push_str(&format!(
+            "   {} [{}]",
+            style::style("input").with(t.dim),
+            step.input.join(", "),
+        ));
+    }
+    println!("{meta}");
 }
 
-/// Print "thinking" status with spinner placeholder (static for now).
+/// Start an animated spinner that shows elapsed time.
+/// Returns a handle that stops the spinner when dropped or `.stop()` is called.
+pub fn start_spinner() -> SpinnerHandle {
+    let running = Arc::new(AtomicBool::new(true));
+    let running_clone = running.clone();
+    let start = Instant::now();
+
+    let handle = std::thread::spawn(move || {
+        let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let t = &DARK;
+        let mut i = 0;
+        while running_clone.load(Ordering::Relaxed) {
+            let elapsed = start.elapsed().as_secs();
+            let time_str = if elapsed >= 60 {
+                format!("{}m{:02}s", elapsed / 60, elapsed % 60)
+            } else {
+                format!("{elapsed}s")
+            };
+            eprint!(
+                "\x1b[2K\r      {} {} {}",
+                style::style(frames[i % frames.len()]).with(t.cyan),
+                style::style("flowing").with(t.cyan),
+                style::style(&time_str).with(t.dim),
+            );
+            let _ = std::io::stderr().flush();
+            i += 1;
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+        // Clear the spinner line
+        eprint!("\x1b[2K\r");
+        let _ = std::io::stderr().flush();
+    });
+
+    SpinnerHandle {
+        running,
+        thread: Some(handle),
+    }
+}
+
+pub struct SpinnerHandle {
+    running: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl SpinnerHandle {
+    pub fn stop(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+impl Drop for SpinnerHandle {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Print "thinking" status (static, used when spinner is not needed).
 pub fn print_thinking(task_description: &str) {
     let t = &DARK;
-    println!(
+    eprintln!(
         "      {} {}   {} \"{}\"",
         style::style("⠋").with(t.cyan),
         style::style("thinking").with(t.cyan),
@@ -202,7 +269,7 @@ pub fn print_reasoning_block(lines: &[&str]) {
         "      {} {} {}",
         style::style("┌─").with(t.muted),
         style::style("reasoning").with(t.dim),
-        style::style("──────────────────���──────────────────────────────────────").with(t.muted),
+        style::style("──────────────────────────────────────────────────").with(t.muted),
     );
     for line in lines {
         println!(
@@ -213,7 +280,7 @@ pub fn print_reasoning_block(lines: &[&str]) {
     }
     println!(
         "      {}",
-        style::style("└─��───────────────────────────────────────────���────────────────────")
+        style::style("└────────────────────────────────────────────────────────────────")
             .with(t.muted),
     );
 }
@@ -229,8 +296,8 @@ pub fn print_writing(filename: &str) {
     );
 }
 
-/// Print stage completion line.
-pub fn print_stage_done(duration: &str, tokens_in: &str, tokens_out: &str, output: &str) {
+/// Print step completion line.
+pub fn print_step_done(duration: &str, tokens_in: &str, tokens_out: &str, output: &str) {
     let t = &DARK;
     println!(
         "      {} {} {}   {} {} in / {} out   {} {}",
@@ -245,8 +312,8 @@ pub fn print_stage_done(duration: &str, tokens_in: &str, tokens_out: &str, outpu
     );
 }
 
-/// Print context injection line (handoff between stages).
-pub fn print_context_injection(from_stage: &str, from_file: &str, tokens: &str) {
+/// Print context injection line (handoff between steps).
+pub fn print_context_injection(from_step: &str, from_file: &str, tokens: &str) {
     let t = &DARK;
     println!(
         "      {} {}",
@@ -256,7 +323,7 @@ pub fn print_context_injection(from_stage: &str, from_file: &str, tokens: &str) 
     println!(
         "        {} {} ({})  {} {} → prompt",
         style::style("from").with(t.dim),
-        style::style(from_stage).with(t.green),
+        style::style(from_step).with(t.green),
         style::style(from_file).with(t.dim),
         style::style(tokens).with(t.fg),
         style::style("tokens").with(t.dim),
@@ -281,7 +348,7 @@ pub fn print_streaming(backend: &str, pid: Option<u32>) {
 
 // --- Flow complete ---
 
-pub struct StageResult {
+pub struct StepResult {
     pub id: String,
     pub agent: String,
     pub backend: String,
@@ -289,17 +356,20 @@ pub struct StageResult {
     pub tokens_in: String,
     pub tokens_out: String,
     pub output: String,
-    pub state: StageState,
+    pub state: StepState,
 }
 
 /// Print the flow complete summary table.
+///
+/// Column alignment uses pre-padded plain strings before applying ANSI colors,
+/// so invisible escape bytes don't affect visual alignment.
 pub fn print_flow_complete(
-    stages: &[StageResult],
+    steps: &[StepResult],
     total_elapsed: &str,
     total_in: &str,
     total_out: &str,
     cost: &str,
-    run_dir: &str,
+    stack_path: &str,
 ) {
     let t = &DARK;
     println!();
@@ -312,7 +382,7 @@ pub fn print_flow_complete(
     );
     println!(
         "      {}",
-        style::style(format!("{} stages, 0 failures", stages.len())).with(t.dim),
+        style::style(format!("{} steps, 0 failures", steps.len())).with(t.dim),
     );
     println!();
 
@@ -320,30 +390,33 @@ pub fn print_flow_complete(
     println!(
         "      {}",
         style::style(
-            "Stage            Agent         Backend       Duration      Tokens (in/out)     Output"
+            "Step             Agent         Backend       Duration      Tokens (in/out)     Output"
         )
         .with(t.dim),
     );
     println!(
         "      {}",
-        style::style("────────────────────���─────────────────────────────────────────────────────────────────").with(t.muted),
+        style::style("─────────────────────────────────────────────────────────────────────────────────────────").with(t.muted),
     );
 
-    for s in stages {
+    // Format plain strings first with padding, then colorize.
+    // This avoids ANSI escape codes messing up column widths.
+    #[allow(clippy::format_in_format_args)]
+    for s in steps {
         let state_marker = match s.state {
-            StageState::Done => style::style("✓").with(t.green).to_string(),
-            StageState::Failed => style::style("✗").with(t.red).to_string(),
+            StepState::Done => style::style("✓").with(t.green).to_string(),
+            StepState::Failed => style::style("✗").with(t.red).to_string(),
             _ => style::style("○").with(t.muted).to_string(),
         };
+        let tokens = format!("{} / {}", s.tokens_in, s.tokens_out);
         println!(
-            "      {} {:<14}{:<14}{:<14}{:<14}{} / {:<12}{}",
+            "      {} {} {} {} {} {} {}",
             state_marker,
-            style::style(&s.id).with(t.fg),
-            style::style(&s.agent).with(t.magenta),
-            style::style(&s.backend).with(t.blue),
-            &s.duration,
-            &s.tokens_in,
-            &s.tokens_out,
+            style::style(format!("{:<16}", s.id)).with(t.fg),
+            style::style(format!("{:<14}", s.agent)).with(t.magenta),
+            style::style(format!("{:<14}", s.backend)).with(t.blue),
+            format!("{:<14}", s.duration),
+            format!("{:<20}", tokens),
             style::style(&s.output).with(t.cyan),
         );
     }
@@ -360,12 +433,12 @@ pub fn print_flow_complete(
         style::style(cost).with(t.yellow),
     );
 
-    // Artifacts tree
+    // Stack path
     println!();
     println!(
         "      {} {}",
         style::style("Artifacts written to").with(t.dim),
-        style::style(run_dir).with(t.fg),
+        style::style(stack_path).with(t.fg),
     );
 }
 
@@ -397,13 +470,13 @@ pub fn print_next_hint(commands: &[(&str, &str)]) {
 
 // --- Error state ---
 
-/// Print a stage failure with rust-style diagnostic.
-pub fn print_stage_failed(duration: &str, retries: u32) {
+/// Print a step failure with rust-style diagnostic.
+pub fn print_step_failed(duration: &str, retries: u32) {
     let t = &DARK;
     println!(
         "      {}{}",
         style::style("✗").with(t.red).attribute(Attribute::Bold),
-        style::style(" stage failed")
+        style::style(" step failed")
             .with(t.red)
             .attribute(Attribute::Bold),
     );
@@ -489,13 +562,13 @@ pub fn print_error_hints(hints: &[(&str, &str)]) {
 // --- Status command ---
 
 /// Print the koto status table header.
-pub fn print_status_header(run_id: &str, flow_name: &str, status: StageState) {
+pub fn print_status_header(run_id: &str, flow_name: &str, status: StepState) {
     let t = &DARK;
     let status_str = match status {
-        StageState::Done => style::style("complete")
+        StepState::Done => style::style("complete")
             .with(t.green)
             .attribute(Attribute::Bold),
-        StageState::Failed => style::style("failed")
+        StepState::Failed => style::style("failed")
             .with(t.red)
             .attribute(Attribute::Bold),
         _ => style::style("running")
@@ -515,50 +588,51 @@ pub fn print_status_header(run_id: &str, flow_name: &str, status: StageState) {
     );
 }
 
-/// Print the status table with all stages.
-pub fn print_status_table(stages: &[StageResult]) {
+/// Print the status table with all steps.
+pub fn print_status_table(steps: &[StepResult]) {
     let t = &DARK;
     println!();
     println!(
         "    {}",
         style::style(
-            "STAGE        STATE     AGENT       BACKEND      DURATION   TOKENS          OUTPUT"
+            "STEP         STATE     AGENT       BACKEND      DURATION   TOKENS          OUTPUT"
         )
         .with(t.muted),
     );
     println!(
         "    {}",
-        style::style("─────────────────────────────────────────────────────────────���──────────────────────────").with(t.muted),
+        style::style("─────────────────────────────────────────────────────────────────────────────────────").with(t.muted),
     );
 
-    for s in stages {
+    for s in steps {
         let state_str = match s.state {
-            StageState::Done => style::style("done").with(t.green).to_string(),
-            StageState::Failed => style::style("failed").with(t.red).to_string(),
-            StageState::Skipped => style::style("skipped").with(t.muted).to_string(),
-            StageState::Running => style::style("running").with(t.cyan).to_string(),
-            StageState::Pending => style::style("pending").with(t.muted).to_string(),
+            StepState::Done => style::style("done").with(t.green).to_string(),
+            StepState::Failed => style::style("failed").with(t.red).to_string(),
+            StepState::Skipped => style::style("skipped").with(t.muted).to_string(),
+            StepState::Running => style::style("running").with(t.cyan).to_string(),
+            StepState::Pending => style::style("pending").with(t.muted).to_string(),
         };
-        let dim = matches!(s.state, StageState::Skipped | StageState::Pending);
+        let dim = matches!(s.state, StepState::Skipped | StepState::Pending);
         let id_style = if dim { t.dim } else { t.fg };
         let agent_color = if dim { t.dim } else { t.magenta };
         let backend_color = if dim { t.dim } else { t.blue };
 
+        // Pad plain strings first, then colorize
         println!(
-            "    {:<13}{:<10}{:<12}{:<13}{:<11}{:<16}{}",
-            style::style(&s.id).with(id_style),
+            "    {} {} {} {} {} {} {}",
+            style::style(format!("{:<13}", s.id)).with(id_style),
             state_str,
-            style::style(&s.agent).with(agent_color),
-            style::style(&s.backend).with(backend_color),
+            style::style(format!("{:<12}", s.agent)).with(agent_color),
+            style::style(format!("{:<13}", s.backend)).with(backend_color),
             if dim {
-                style::style("—").with(t.dim).to_string()
+                format!("{:<11}", style::style("—").with(t.dim))
             } else {
-                s.duration.clone()
+                format!("{:<11}", s.duration)
             },
             if dim {
-                style::style("—").with(t.dim).to_string()
+                format!("{:<16}", style::style("—").with(t.dim))
             } else {
-                format!("{} / {}", s.tokens_in, s.tokens_out)
+                format!("{:<16}", format!("{} / {}", s.tokens_in, s.tokens_out))
             },
             if dim {
                 style::style("—").with(t.dim).to_string()
@@ -587,18 +661,17 @@ pub fn print_footer(elapsed: &str, tokens_in: &str, tokens_out: &str, backends: 
 
 // --- Helpers ---
 
-pub struct StageInfo {
+pub struct StepInfo {
     pub id: String,
     pub agent: String,
-    pub role: String,
+    pub title: Option<String>,
     pub model: String,
     pub backend: Backend,
     pub input: Vec<String>,
-    pub output: String,
-    pub state: StageState,
+    pub state: StepState,
 }
 
-impl StageInfo {
+impl StepInfo {
     fn backend_name(&self) -> &str {
         match self.backend {
             Backend::Api => "api",
@@ -630,45 +703,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn stage_state_markers() {
-        assert_eq!(StageState::Done.marker(), "✓");
-        assert_eq!(StageState::Running.marker(), "●");
-        assert_eq!(StageState::Failed.marker(), "✗");
-        assert_eq!(StageState::Pending.marker(), "○");
+    fn step_state_markers() {
+        assert_eq!(StepState::Done.marker(), "✓");
+        assert_eq!(StepState::Running.marker(), "●");
+        assert_eq!(StepState::Failed.marker(), "✗");
+        assert_eq!(StepState::Pending.marker(), "○");
     }
 
     #[test]
-    fn stage_info_backend_name() {
-        let info = StageInfo {
+    fn step_info_backend_name() {
+        let info = StepInfo {
             id: "test".into(),
             agent: "dev".into(),
-            role: "developer".into(),
+            title: None,
             model: "sonnet".into(),
             backend: Backend::ClaudeCli,
             input: vec![],
-            output: "out.md".into(),
-            state: StageState::Running,
+            state: StepState::Running,
         };
         assert_eq!(info.backend_name(), "claude-cli");
     }
 
     #[test]
-    fn stage_pills_smoke() {
+    fn step_pills_smoke() {
         // Just verify it doesn't panic
         let pills = vec![
-            StagePill {
+            StepPill {
                 label: "design".into(),
-                state: StageState::Done,
+                state: StepState::Done,
             },
-            StagePill {
+            StepPill {
                 label: "impl".into(),
-                state: StageState::Running,
+                state: StepState::Running,
             },
-            StagePill {
+            StepPill {
                 label: "review".into(),
-                state: StageState::Pending,
+                state: StepState::Pending,
             },
         ];
-        print_stage_pills(&pills);
+        print_step_pills(&pills);
     }
 }
