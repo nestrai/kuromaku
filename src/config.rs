@@ -442,7 +442,7 @@ fn validate_and_resolve(
 }
 
 /// Extract `{{placeholder}}` names from a prompt template.
-fn extract_placeholders(prompt: &str) -> HashSet<String> {
+pub fn extract_placeholders(prompt: &str) -> HashSet<String> {
     let re = regex_lite::Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap();
     re.captures_iter(prompt)
         .map(|cap| cap[1].to_string())

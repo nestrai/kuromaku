@@ -410,6 +410,25 @@ async fn run_up(
         .into_iter()
         .partition(|(k, _)| role_names.contains(k));
 
+    // Warn about template vars that aren't placeholders
+    if !template_vars.is_empty() {
+        let flow_config_temp = config::load_flow_from_str(&contents)?;
+        let placeholders = flow_config_temp
+            .prompt
+            .as_ref()
+            .map(|p| config::extract_placeholders(p))
+            .unwrap_or_default();
+
+        for key in template_vars.keys() {
+            if !placeholders.contains(key) {
+                eprintln!(
+                    "warning: '{}' is not a declared role or template placeholder",
+                    key
+                );
+            }
+        }
+    }
+
     // Load flow with role overrides
     let flow_config = config::load_flow_from_str_with_overrides(&contents, &role_overrides)?;
 
