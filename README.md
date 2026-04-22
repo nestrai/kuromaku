@@ -10,7 +10,7 @@ koto up review-pr pr=67
 
 ## What it does
 
-koto orchestrates AI agent teams through declarative YAML flows. Agents are files in your repo. Rules are Markdown documents. Flows define who does what in which order. The CLI runs the team and writes results to a persistent stack.
+koto orchestrates AI agent teams through declarative YAML configurations. A **flow** is a process -- a reusable sequence of steps like "fetch, implement, review, ship". **Agents** are the people who execute those steps. **Rules** are shared knowledge injected into agent prompts. The same flow can run with different agent teams depending on the task.
 
 ```
 .koto/

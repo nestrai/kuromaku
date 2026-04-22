@@ -48,6 +48,16 @@ enum Command {
         #[arg(short, long)]
         file: Option<String>,
     },
+    /// Run an ad-hoc task with one or more agents (no flow needed)
+    Task {
+        /// Agent name(s) from .koto/agents/ (repeatable, executed in order)
+        #[arg(short, long, required = true)]
+        agent: Vec<String>,
+
+        /// Task prompt
+        #[arg(short = 't', long, required = true)]
+        task: String,
+    },
     /// Fetch skills from remote sources pinned in .koto/skills.lock
     Pull,
     /// Stop the agent team
@@ -68,6 +78,7 @@ async fn main() -> Result<()> {
             args,
             file,
         } => run_up(flow.as_deref(), task.as_deref(), &args, file.as_deref()).await?,
+        Command::Task { agent, task } => run_task(&agent, &task).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
             println!("koto down: not yet implemented");
@@ -244,6 +255,135 @@ fn substitute_placeholders(
     }
 
     Ok(result)
+}
+
+async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
+    let task_start = Instant::now();
+    let koto_dir = Path::new(KOTO_DIR);
+
+    // Use defaults matching flow config defaults
+    let defaults = config::Defaults {
+        model: "claude-sonnet-4-5".to_string(),
+        backend: config::Backend::ClaudeCli,
+    };
+
+    // Load requested agents
+    let mut agents = Vec::new();
+    for name in agent_names {
+        let agent = config::load_agent_file(koto_dir, name, &defaults)?;
+        agents.push(agent);
+    }
+
+    // Build synthetic steps: sequential chain, each sees previous output
+    let mut steps: Vec<config::Step> = Vec::new();
+    for (i, agent) in agents.iter().enumerate() {
+        let input = if i == 0 {
+            vec![]
+        } else {
+            vec![format!("step-{}", i)]
+        };
+        steps.push(config::Step {
+            id: format!("step-{}", i + 1),
+            agent: agent.id.clone(),
+            task: None,
+            input,
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: i == agents.len() - 1, // last step prints
+        });
+    }
+
+    let step_refs: Vec<&config::Step> = steps.iter().collect();
+
+    let task_name = if agent_names.len() == 1 {
+        format!("task-{}", agent_names[0].to_lowercase())
+    } else {
+        "task".to_string()
+    };
+
+    ui::print_command(&format!(
+        "koto task --agent {} -t \"...\"",
+        agent_names.join(" --agent ")
+    ));
+
+    ui::print_flow_start(&task_name, "ad-hoc", steps.len(), agents.len());
+
+    // Resolve backends
+    let mut seen_backends = std::collections::HashSet::new();
+    let mut backend_list: Vec<(&str, &str)> = Vec::new();
+    for agent in &agents {
+        let name = match agent.backend {
+            config::Backend::Api => "api",
+            config::Backend::ClaudeCli => "claude-cli",
+            config::Backend::Ollama => "ollama",
+        };
+        if seen_backends.insert(name) {
+            backend_list.push((name, ""));
+        }
+    }
+    ui::print_backends_ok(&backend_list);
+
+    // Load context
+    let guide = runner::load_guide(koto_dir);
+    let rules_cache = runner::load_rules_for_agents(&agents, koto_dir)?;
+
+    // Skills
+    let skills_dir = koto_dir.join("skills");
+    let skill_names = skills::collect_skill_names(&agents);
+    let skills_cache = if skill_names.is_empty() {
+        std::collections::HashMap::new()
+    } else {
+        let missing = skills::check_skills_available(&skill_names, &skills_dir);
+        if !missing.is_empty() {
+            return Err(eyre!(
+                "missing skills: {}\n\nhint: run `koto pull` to fetch skills",
+                missing.join(", ")
+            ));
+        }
+        skills::load_skills_for_agents(&skill_names, &skills_dir)?
+    };
+
+    let stack_path = resolve_stack_path("");
+
+    let ctx = runner::RunContext::new(
+        task_name.clone(),
+        task.to_string(),
+        stack_path.clone(),
+        guide,
+        rules_cache,
+        skills_cache,
+    );
+
+    let results = runner::run_steps(&step_refs, &agents, &ctx).await?;
+
+    // Summary
+    let total_elapsed = task_start.elapsed();
+    let summary = runner::build_summary(&results);
+    let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
+    let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
+
+    ui::print_flow_complete(
+        &summary,
+        &format_elapsed(total_elapsed),
+        &total_in.to_string(),
+        &total_out.to_string(),
+        "—",
+        &ctx.stack_path.display().to_string(),
+    );
+
+    // Print output of last step
+    for result in &results {
+        if result.print_output {
+            let output_path = ctx.stack_path.join(&result.output_file);
+            if let Ok(content) = std::fs::read_to_string(&output_path) {
+                println!();
+                termimad::print_text(&content);
+            }
+        }
+    }
+
+    Ok(())
 }
 
 async fn run_up(
