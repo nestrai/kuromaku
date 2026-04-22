@@ -174,8 +174,10 @@ pub fn build_codex_command(model: &str, system_prompt: Option<&str>, user_prompt
 
     let mut parts = vec![codex_bin, "exec".to_string()];
     parts.push("--full-auto".to_string());
-    parts.push("-m".to_string());
-    parts.push(shell_escape(model));
+    if model != "default" {
+        parts.push("-m".to_string());
+        parts.push(shell_escape(model));
+    }
     parts.push(shell_escape(&prompt));
 
     parts.join(" ")
