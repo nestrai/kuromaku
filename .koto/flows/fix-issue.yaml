@@ -1,21 +1,27 @@
 # Fix a GitHub issue: fetch -> implement -> review -> ship.
 # Usage: koto up fix-issue issue=35
+# Override roles: koto up fix-issue issue=35 implementer=Kai reviewer=Levi
 version: "1"
 name: fix-issue
 prompt: |
   Fix issue #{{issue}} in this repository. Read the issue carefully,
   implement the fix, and create a PR.
 
+roles:
+  fetcher: { default: Minion }
+  implementer: { default: Noah }
+  reviewer: { default: Bella }
+
 flow:
   fetch:
-    agent: Minion
+    role: fetcher
     task: |
       Fetch issue #{{issue}} using gh issue view --comments.
       Output the full issue description and comments as-is.
       Do not analyze or comment -- just output the raw data.
 
   implement:
-    agent: Noah
+    role: implementer
     input: [fetch]
     task: |
       Implement the fix described in the issue. Create a feature branch,
@@ -23,7 +29,7 @@ flow:
       Commit with conventional commit messages.
 
   review:
-    agent: Bella
+    role: reviewer
     input: [fetch, implement]
     task: |
       Review the implementation against the issue requirements.
@@ -31,7 +37,7 @@ flow:
       Are the tests sufficient? Any regressions?
 
   ship:
-    agent: Noah
+    role: implementer
     input: [review]
     print_output: true
     task: |
