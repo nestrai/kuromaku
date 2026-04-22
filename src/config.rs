@@ -325,6 +325,15 @@ fn validate_and_resolve(
         resolved_roles.insert(role_name.clone(), agent_id);
     }
 
+    // Validate resolved roles have non-empty agent IDs
+    for (role_name, agent_id) in &resolved_roles {
+        if agent_id.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "role '{role_name}' resolves to empty agent ID"
+            )));
+        }
+    }
+
     // Extract placeholders from flow prompt to detect role-placeholder collisions
     let prompt_placeholders = if let Some(ref prompt) = raw.prompt {
         extract_placeholders(prompt)
@@ -336,7 +345,7 @@ fn validate_and_resolve(
     for role_name in raw.roles.keys() {
         if prompt_placeholders.contains(role_name) {
             return Err(ConfigError::Validation(format!(
-                "role name '{role_name}' collides with template placeholder {{{{{{{}}}}}}}",
+                "role name '{role_name}' collides with template placeholder {{{{{}}}}}",
                 role_name
             )));
         }
@@ -391,8 +400,12 @@ fn validate_and_resolve(
                 (None, Some(role_name)) => {
                     // Resolve role to agent ID
                     let agent_id = resolved_roles.get(role_name).ok_or_else(|| {
+                        let available = resolved_roles.keys()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         ConfigError::Validation(format!(
-                            "step '{id}' references undefined role '{role_name}'"
+                            "step '{id}' references undefined role '{role_name}' (available: {available})"
                         ))
                     })?;
 
@@ -935,5 +948,48 @@ flow:
         assert_eq!(config.steps.len(), 2);
         assert_eq!(config.steps[0].agent, "Noah");
         assert_eq!(config.steps[1].agent, "Bella");
+    }
+
+    #[test]
+    fn empty_role_default_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: "" }
+flow:
+  code:
+    role: coder
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("role 'coder' resolves to empty agent ID"),
+            "got: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn undefined_role_lists_available() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Noah }
+  reviewer: { default: Bella }
+flow:
+  code:
+    role: phantom
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("undefined role 'phantom'"),
+            "got: {}",
+            err
+        );
+        assert!(msg.contains("available:"), "got: {}", err);
+        assert!(msg.contains("coder") && msg.contains("reviewer"), "got: {}", err);
     }
 }
