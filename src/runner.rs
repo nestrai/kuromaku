@@ -215,6 +215,7 @@ async fn run_step_via_executor(
         Backend::ClaudeCli => {
             executor::build_claude_command(model, Some(system_prompt), user_content)
         }
+        Backend::Codex => executor::build_codex_command(model, Some(system_prompt), user_content),
         Backend::Ollama => {
             let mut prompt = String::new();
             prompt.push_str(&format!("System: {system_prompt}\n\n"));
@@ -419,6 +420,7 @@ fn backend_name(backend: Backend) -> &'static str {
     match backend {
         Backend::Api => "api",
         Backend::ClaudeCli => "claude-cli",
+        Backend::Codex => "codex",
         Backend::Ollama => "ollama",
     }
 }
