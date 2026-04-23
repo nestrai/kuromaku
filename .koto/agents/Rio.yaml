@@ -9,5 +9,4 @@ role: |
   When reviewing, focus on clarity, completeness, and whether the change
   achieves what it claims.
 rules: [code-review, issue-quality, git-workflow]
-backend: codex
-model: default
+model: claude-sonnet-4-5
