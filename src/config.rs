@@ -985,12 +985,315 @@ flow:
 "#;
         let err = load_flow_from_str(yaml).unwrap_err();
         let msg = err.to_string();
+        assert!(msg.contains("undefined role 'phantom'"), "got: {}", err);
+        assert!(msg.contains("available:"), "got: {}", err);
         assert!(
-            msg.contains("undefined role 'phantom'"),
+            msg.contains("coder") && msg.contains("reviewer"),
             "got: {}",
             err
         );
-        assert!(msg.contains("available:"), "got: {}", err);
-        assert!(msg.contains("coder") && msg.contains("reviewer"), "got: {}", err);
+    }
+
+    // --- Requirement Verification Tests (Issue #87) ---
+
+    /// Verify Noah's agent definition includes requirement restatement instructions
+    #[test]
+    fn noah_agent_has_requirement_restatement() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let noah_path = koto_dir.join("agents/Noah.yaml");
+
+        if !noah_path.exists() {
+            panic!("Noah.yaml not found at {}", noah_path.display());
+        }
+
+        let contents = std::fs::read_to_string(&noah_path).expect("failed to read Noah.yaml");
+        let agent: RawAgentFile =
+            serde_yaml::from_str(&contents).expect("failed to parse Noah.yaml");
+
+        let role_lower = agent.role.to_lowercase();
+
+        // Check for required instruction patterns
+        assert!(
+            role_lower.contains("restate the requirement")
+                || role_lower.contains("restate requirement"),
+            "Noah's role should include 'restate the requirement' instruction. Got: {}",
+            agent.role
+        );
+
+        assert!(
+            role_lower.contains("assumptions") || role_lower.contains("assumption"),
+            "Noah's role should include instruction to list assumptions. Got: {}",
+            agent.role
+        );
+
+        assert!(
+            role_lower.contains("ambiguous") && role_lower.contains("flag"),
+            "Noah's role should include instruction to flag ambiguity. Got: {}",
+            agent.role
+        );
+    }
+
+    /// Verify Bella's agent definition prioritizes original requirement verification
+    #[test]
+    fn bella_agent_prioritizes_original_requirement() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let bella_path = koto_dir.join("agents/Bella.yaml");
+
+        if !bella_path.exists() {
+            panic!("Bella.yaml not found at {}", bella_path.display());
+        }
+
+        let contents = std::fs::read_to_string(&bella_path).expect("failed to read Bella.yaml");
+        let agent: RawAgentFile =
+            serde_yaml::from_str(&contents).expect("failed to parse Bella.yaml");
+
+        let role = &agent.role;
+        let role_lower = role.to_lowercase();
+
+        // Check for prioritization of original requirement
+        assert!(
+            role_lower.contains("original requirement") || role_lower.contains("original task"),
+            "Bella's role should reference 'ORIGINAL requirement' or 'original task'. Got: {}",
+            role
+        );
+
+        // Check for negation of design-doc-only validation
+        assert!(
+            role_lower.contains("not just the design")
+                || role_lower.contains("not just")
+                || role_lower.contains("intermediate artifact"),
+            "Bella's role should warn against validating only against design doc/intermediate artifacts. Got: {}",
+            role
+        );
+
+        // Check for primary/first check language
+        assert!(
+            role_lower.contains("primary check")
+                || role_lower.contains("first check")
+                || role.starts_with("You are a code reviewer. Your primary check:"),
+            "Bella's role should indicate original-requirement check is primary. Got: {}",
+            role
+        );
+
+        // Check for divergence detection instruction
+        assert!(
+            role_lower.contains("diverged") || role_lower.contains("divergence"),
+            "Bella's role should include instruction to flag design divergence. Got: {}",
+            role
+        );
+    }
+
+    /// Verify fix-issue flow implement step includes restatement instruction
+    #[test]
+    fn fix_issue_implement_step_has_restatement() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/fix-issue.yaml");
+
+        if !flow_path.exists() {
+            panic!("fix-issue.yaml not found at {}", flow_path.display());
+        }
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read fix-issue.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse fix-issue.yaml");
+
+        let implement_step = raw
+            .flow
+            .get("implement")
+            .expect("fix-issue flow should have 'implement' step");
+
+        let task = implement_step
+            .task
+            .as_ref()
+            .expect("implement step should have a task");
+        let task_lower = task.to_lowercase();
+
+        assert!(
+            task_lower.contains("restate"),
+            "fix-issue implement step should include restatement instruction. Got: {}",
+            task
+        );
+
+        assert!(
+            task_lower.contains("assumption"),
+            "fix-issue implement step should mention assumptions. Got: {}",
+            task
+        );
+    }
+
+    /// Verify fix-issue flow review step has access to original issue
+    #[test]
+    fn fix_issue_review_step_has_fetch_input() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/fix-issue.yaml");
+
+        if !flow_path.exists() {
+            panic!("fix-issue.yaml not found at {}", flow_path.display());
+        }
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read fix-issue.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse fix-issue.yaml");
+
+        let review_step = raw
+            .flow
+            .get("review")
+            .expect("fix-issue flow should have 'review' step");
+
+        assert!(
+            review_step.input.contains(&"fetch".to_string()),
+            "fix-issue review step should have fetch in input array. Got: {:?}",
+            review_step.input
+        );
+
+        assert!(
+            review_step.input.contains(&"implement".to_string()),
+            "fix-issue review step should have implement in input array. Got: {:?}",
+            review_step.input
+        );
+    }
+
+    /// Verify development flow implement step references original task
+    #[test]
+    fn development_implement_step_references_original_task() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/development.yaml");
+
+        if !flow_path.exists() {
+            panic!("development.yaml not found at {}", flow_path.display());
+        }
+
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read development.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse development.yaml");
+
+        let implement_step = raw
+            .flow
+            .get("implement")
+            .expect("development flow should have 'implement' step");
+
+        let task = implement_step
+            .task
+            .as_ref()
+            .expect("implement step should have a task");
+        let task_lower = task.to_lowercase();
+
+        assert!(
+            task_lower.contains("restate"),
+            "development implement step should include restatement instruction. Got: {}",
+            task
+        );
+
+        assert!(
+            task_lower.contains("original task") || task_lower.contains("original requirement"),
+            "development implement step should reference original task. Got: {}",
+            task
+        );
+
+        assert!(
+            task_lower.contains("diverge") && task_lower.contains("flag"),
+            "development implement step should include divergence-flagging instruction. Got: {}",
+            task
+        );
+    }
+
+    /// Verify development flow review step prioritizes original task over design
+    #[test]
+    fn development_review_step_prioritizes_original_task() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/development.yaml");
+
+        if !flow_path.exists() {
+            panic!("development.yaml not found at {}", flow_path.display());
+        }
+
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read development.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse development.yaml");
+
+        let review_step = raw
+            .flow
+            .get("review")
+            .expect("development flow should have 'review' step");
+
+        let task = review_step
+            .task
+            .as_ref()
+            .expect("review step should have a task");
+        let task_lower = task.to_lowercase();
+
+        assert!(
+            task_lower.contains("original task") || task_lower.contains("original requirement"),
+            "development review step should reference original task. Got: {}",
+            task
+        );
+
+        assert!(
+            task_lower.contains("not just the design")
+                || (task_lower.contains("not") && task_lower.contains("design doc")),
+            "development review step should warn against design-only validation. Got: {}",
+            task
+        );
+
+        // The design should be mentioned, but as secondary concern
+        assert!(
+            task.to_lowercase().contains("design"),
+            "development review step should mention design (as secondary check). Got: {}",
+            task
+        );
+    }
+
+    /// Verify requirement-verification.md documentation exists and contains key sections
+    #[test]
+    fn requirement_verification_docs_exist() {
+        let docs_path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/requirement-verification.md");
+
+        assert!(
+            docs_path.exists(),
+            "docs/requirement-verification.md should exist at {}",
+            docs_path.display()
+        );
+
+        let contents = std::fs::read_to_string(&docs_path)
+            .expect("failed to read requirement-verification.md");
+        let contents_lower = contents.to_lowercase();
+
+        // Check for required sections
+        assert!(
+            contents_lower.contains("problem") || contents_lower.contains("## problem"),
+            "Documentation should have a Problem section"
+        );
+
+        assert!(
+            contents_lower.contains("pattern") || contents_lower.contains("## pattern"),
+            "Documentation should have a Pattern section"
+        );
+
+        assert!(
+            contents_lower.contains("for flow authors") || contents_lower.contains("flow authors"),
+            "Documentation should include guidance for flow authors"
+        );
+
+        assert!(
+            contents_lower.contains("agent role") || contents_lower.contains("for agent role"),
+            "Documentation should include guidance for agent role design"
+        );
+
+        // Check for key concepts
+        assert!(
+            contents_lower.contains("telephone")
+                || contents_lower.contains("drift")
+                || contents_lower.contains("diverge"),
+            "Documentation should explain the drift/divergence problem"
+        );
+
+        assert!(
+            contents_lower.contains("original requirement")
+                || contents_lower.contains("original task"),
+            "Documentation should emphasize original requirement verification"
+        );
     }
 }
