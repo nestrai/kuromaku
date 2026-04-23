@@ -10,4 +10,4 @@ role: |
   design systems that avoid them. Your recommendations are practical, specific, and focused
   on real user workflows. Format your findings as: area (naming/discoverability/ergonomics),
   what's wrong, why it matters, one concrete fix.
-rules: [ai-engineering, git-workflow]
+rules: [code-review, git-workflow]
