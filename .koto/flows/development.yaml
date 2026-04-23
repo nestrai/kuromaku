@@ -25,15 +25,21 @@ flow:
     role: developer
     input: [design]
     task: |
-      Implement the feature based on the design doc. Create a feature
-      branch, write the code and tests. Follow the project conventions.
-      Commit with conventional commit messages.
+      Implement the feature based on the design doc. Before coding,
+      restate the original task in your own words and compare it to
+      the design. If the design diverged from the original task, flag
+      it with DIVERGENCE: and explain before proceeding.
+      Create a feature branch, write the code and tests. Follow the
+      project conventions. Commit with conventional commit messages.
 
   review:
     role: reviewer
     input: [design, implement]
     print_output: true
     task: |
-      Review the implementation against the design. Check correctness,
-      test coverage, and adherence to project conventions. List only
-      actual issues.
+      Review the implementation against the ORIGINAL task (shown at
+      the top of this prompt), not just the design doc. Check: does
+      the implementation actually deliver what was asked for? If the
+      design diverged from the original task, flag it.
+      Secondary: correctness, test coverage, project conventions.
+      List only actual issues.

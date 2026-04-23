@@ -24,9 +24,12 @@ flow:
     role: implementer
     input: [fetch]
     task: |
-      Implement the fix described in the issue. Create a feature branch,
-      make the changes, and write tests. Follow the project conventions.
-      Commit with conventional commit messages.
+      Implement the fix described in the issue. Before coding, restate
+      the requirement from the issue in your own words. If anything is
+      ambiguous, list your assumptions explicitly.
+      Create a feature branch, make the changes, and write tests.
+      Follow the project conventions. Commit with conventional commit
+      messages.
 
   review:
     role: reviewer
