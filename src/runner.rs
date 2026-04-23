@@ -20,6 +20,7 @@ pub struct RunContext {
     pub guide: Option<String>,
     pub rules_cache: HashMap<String, String>,
     pub skills_cache: HashMap<String, String>,
+    pub no_cache: bool,
 }
 
 impl RunContext {
@@ -30,6 +31,7 @@ impl RunContext {
         guide: Option<String>,
         rules_cache: HashMap<String, String>,
         skills_cache: HashMap<String, String>,
+        no_cache: bool,
     ) -> Self {
         let now = chrono::Local::now();
         let ts = now.format("%Y%m%d-%H%M%S").to_string();
@@ -45,6 +47,7 @@ impl RunContext {
             guide,
             rules_cache,
             skills_cache,
+            no_cache,
         }
     }
 }
@@ -324,6 +327,55 @@ pub async fn run_steps(
         let system_prompt =
             build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
 
+        // Compute cache key from assembled prompts
+        let backend_str = match effective_backend {
+            Backend::Api => "api",
+            Backend::ClaudeCli => "claude-cli",
+            Backend::Codex => "codex",
+            Backend::Ollama => "ollama",
+        };
+        let cache_key =
+            stack::cache_key(effective_model, backend_str, &system_prompt, &user_content);
+
+        // Check cache if enabled
+        if !ctx.no_cache
+            && let Some(cached_output) = stack::read_cache(&ctx.stack_path, &cache_key)
+        {
+            // Cache hit: write to step-id slot so downstream steps can read it
+            stack::write_step(&ctx.stack_path, &cached_output).map_err(|e| RunError::Stack {
+                step: step.id.clone(),
+                source: e,
+            })?;
+
+            // Write artifact file
+            std::fs::write(&output_path, &cached_output.response).map_err(|e| RunError::Stack {
+                step: step.id.clone(),
+                source: stack::StackError::Write(e),
+            })?;
+
+            // Print cache hit
+            let display_path = output_path
+                .canonicalize()
+                .unwrap_or(output_path.clone())
+                .display()
+                .to_string();
+            ui::print_step_cached(&display_path);
+
+            // Push zero-duration result
+            results.push(StepRunResult {
+                step_id: step.id.clone(),
+                agent_name: agent.name.clone(),
+                backend: effective_backend,
+                duration: std::time::Duration::ZERO,
+                tokens_in: None,
+                tokens_out: None,
+                output_file,
+                print_output: step.print_output,
+            });
+
+            continue;
+        }
+
         let start = Instant::now();
         let spinner = ui::start_spinner();
 
@@ -373,6 +425,14 @@ pub async fn run_steps(
         std::fs::write(&output_path, &content).map_err(|e| RunError::Stack {
             step: step.id.clone(),
             source: stack::StackError::Write(e),
+        })?;
+
+        // Write to cache for future runs
+        stack::write_cache(&ctx.stack_path, &cache_key, &step_output).map_err(|e| {
+            RunError::Stack {
+                step: step.id.clone(),
+                source: e,
+            }
         })?;
 
         let tokens_in = usage.as_ref().map(|u| u.input_tokens);

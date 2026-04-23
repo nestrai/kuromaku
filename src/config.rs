@@ -985,12 +985,12 @@ flow:
 "#;
         let err = load_flow_from_str(yaml).unwrap_err();
         let msg = err.to_string();
+        assert!(msg.contains("undefined role 'phantom'"), "got: {}", err);
+        assert!(msg.contains("available:"), "got: {}", err);
         assert!(
-            msg.contains("undefined role 'phantom'"),
+            msg.contains("coder") && msg.contains("reviewer"),
             "got: {}",
             err
         );
-        assert!(msg.contains("available:"), "got: {}", err);
-        assert!(msg.contains("coder") && msg.contains("reviewer"), "got: {}", err);
     }
 }

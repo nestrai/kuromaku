@@ -310,6 +310,18 @@ pub fn print_step_done(duration: &str, tokens_in: &str, tokens_out: &str, output
     );
 }
 
+/// Print cache hit line.
+pub fn print_step_cached(output: &str) {
+    let t = &DARK;
+    println!(
+        "      {} {}   {} {}",
+        style::style("✓").with(t.green),
+        style::style("cached").with(t.cyan),
+        style::style("wrote").with(t.dim),
+        style::style(output).with(t.fg),
+    );
+}
+
 /// Print context injection line (handoff between steps).
 pub fn print_context_injection(from_step: &str, from_file: &str, tokens: &str) {
     let t = &DARK;

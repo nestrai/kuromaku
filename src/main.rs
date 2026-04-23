@@ -47,6 +47,10 @@ enum Command {
         /// Path to the flow config file (overrides flow name lookup)
         #[arg(short, long)]
         file: Option<String>,
+
+        /// Skip cache, re-run all steps
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Run an ad-hoc task with one or more agents (no flow needed)
     Task {
@@ -77,7 +81,17 @@ async fn main() -> Result<()> {
             task,
             args,
             file,
-        } => run_up(flow.as_deref(), task.as_deref(), &args, file.as_deref()).await?,
+            no_cache,
+        } => {
+            run_up(
+                flow.as_deref(),
+                task.as_deref(),
+                &args,
+                file.as_deref(),
+                no_cache,
+            )
+            .await?
+        }
         Command::Task { agent, task } => run_task(&agent, &task).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
@@ -353,6 +367,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
         guide,
         rules_cache,
         skills_cache,
+        false, // no cache for ad-hoc tasks
     );
 
     let results = runner::run_steps(&step_refs, &agents, &ctx).await?;
@@ -391,6 +406,7 @@ async fn run_up(
     task: Option<&str>,
     args: &[String],
     file: Option<&str>,
+    no_cache: bool,
 ) -> Result<()> {
     let flow_start = Instant::now();
     let path = resolve_flow_path(flow, file)?;
@@ -502,6 +518,7 @@ async fn run_up(
         guide,
         rules_cache,
         skills_cache,
+        no_cache,
     );
 
     // Run steps
