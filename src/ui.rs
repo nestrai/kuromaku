@@ -677,6 +677,7 @@ impl StepInfo {
         match self.backend {
             Backend::Api => "api",
             Backend::ClaudeCli => "claude-cli",
+            Backend::Codex => "codex",
             Backend::Ollama => "ollama",
         }
     }

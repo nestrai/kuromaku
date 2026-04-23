@@ -315,6 +315,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
         let name = match agent.backend {
             config::Backend::Api => "api",
             config::Backend::ClaudeCli => "claude-cli",
+            config::Backend::Codex => "codex",
             config::Backend::Ollama => "ollama",
         };
         if seen_backends.insert(name) {
@@ -461,6 +462,7 @@ async fn run_up(
         let name = match agent.backend {
             config::Backend::Api => "api",
             config::Backend::ClaudeCli => "claude-cli",
+            config::Backend::Codex => "codex",
             config::Backend::Ollama => "ollama",
         };
         if seen_backends.insert(name) {

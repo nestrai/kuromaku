@@ -25,6 +25,7 @@ pub enum ConfigError {
 pub enum Backend {
     Api,
     ClaudeCli,
+    Codex,
     Ollama,
 }
 

@@ -160,6 +160,34 @@ pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_promp
     parts.join(" ")
 }
 
+/// Build the CLI command string for a codex backend.
+///
+/// Uses `codex exec` in full-auto mode (no approval prompts, sandboxed).
+/// Codex has no --system-prompt flag, so system and user prompts are combined.
+pub fn build_codex_command(model: &str, system_prompt: Option<&str>, user_prompt: &str) -> String {
+    let codex_bin = std::env::var("CODEX_CLI_PATH").unwrap_or_else(|_| "codex".to_string());
+
+    // Codex CLI has no --system-prompt flag, so system and user prompts are
+    // concatenated. The LLM cannot distinguish instructions from task content
+    // if the user prompt starts instruction-like.
+    let prompt = match system_prompt {
+        Some(system) => format!("{system}\n\n{user_prompt}"),
+        None => user_prompt.to_string(),
+    };
+
+    let mut parts = vec![codex_bin, "exec".to_string()];
+    parts.push("--full-auto".to_string());
+    // "default" means use Codex's built-in model, don't pass -m flag.
+    // Any other value gets passed literally.
+    if model != "default" {
+        parts.push("-m".to_string());
+        parts.push(shell_escape(model));
+    }
+    parts.push(shell_escape(&prompt));
+
+    parts.join(" ")
+}
+
 /// Build the CLI command string for an ollama backend.
 pub fn build_ollama_command(model: &str, prompt: &str) -> String {
     let ollama_bin = std::env::var("OLLAMA_PATH").unwrap_or_else(|_| "ollama".to_string());
@@ -178,7 +206,10 @@ fn shell_escape(s: &str) -> String {
 
 /// Determine whether a backend needs an executor (CLI-based) or is direct HTTP.
 pub fn backend_needs_executor(backend: Backend) -> bool {
-    matches!(backend, Backend::ClaudeCli | Backend::Ollama)
+    matches!(
+        backend,
+        Backend::ClaudeCli | Backend::Codex | Backend::Ollama
+    )
 }
 
 #[cfg(test)]
@@ -220,8 +251,37 @@ mod tests {
     }
 
     #[test]
+    fn build_codex_command_basic() {
+        let cmd = build_codex_command("o3", None, "write docs");
+        assert!(cmd.contains("codex"));
+        assert!(cmd.contains("exec"));
+        assert!(cmd.contains("--full-auto"));
+        assert!(cmd.contains("-m"));
+        assert!(cmd.contains("write docs"));
+        assert!(!cmd.contains("System:"));
+    }
+
+    #[test]
+    fn build_codex_command_with_system() {
+        let cmd = build_codex_command("o3", Some("You are a writer"), "write docs");
+        assert!(cmd.contains("You are a writer"));
+        assert!(cmd.contains("write docs"));
+    }
+
+    #[test]
+    fn build_codex_command_default_model() {
+        let cmd = build_codex_command("default", None, "write docs");
+        assert!(cmd.contains("codex"));
+        assert!(cmd.contains("exec"));
+        assert!(cmd.contains("--full-auto"));
+        assert!(!cmd.contains("-m"));
+        assert!(cmd.contains("write docs"));
+    }
+
+    #[test]
     fn backend_needs_executor_classification() {
         assert!(backend_needs_executor(Backend::ClaudeCli));
+        assert!(backend_needs_executor(Backend::Codex));
         assert!(backend_needs_executor(Backend::Ollama));
         assert!(!backend_needs_executor(Backend::Api));
     }
