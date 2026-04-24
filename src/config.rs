@@ -996,7 +996,7 @@ flow:
 
     // --- Requirement Verification Tests (Issue #87) ---
 
-    /// Verify Noah's agent definition includes requirement restatement instructions
+    /// Verify Noah's agent definition includes requirement validation instructions
     #[test]
     fn noah_agent_has_requirement_restatement() {
         let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
@@ -1012,23 +1012,24 @@ flow:
 
         let role_lower = agent.role.to_lowercase();
 
-        // Check for required instruction patterns
+        // Check for requirement reading instruction
         assert!(
-            role_lower.contains("restate the requirement")
-                || role_lower.contains("restate requirement"),
-            "Noah's role should include 'restate the requirement' instruction. Got: {}",
+            role_lower.contains("read the requirement"),
+            "Noah's role should include 'read the requirement' instruction. Got: {}",
             agent.role
         );
 
+        // Check for edge case handling
         assert!(
-            role_lower.contains("assumptions") || role_lower.contains("assumption"),
-            "Noah's role should include instruction to list assumptions. Got: {}",
+            role_lower.contains("edge case"),
+            "Noah's role should mention edge case handling. Got: {}",
             agent.role
         );
 
+        // Check for blocking on incomplete/wrong designs
         assert!(
-            role_lower.contains("ambiguous") && role_lower.contains("flag"),
-            "Noah's role should include instruction to flag ambiguity. Got: {}",
+            role_lower.contains("blocked"),
+            "Noah's role should include BLOCKED instruction for incomplete designs. Got: {}",
             agent.role
         );
     }
@@ -1083,24 +1084,98 @@ flow:
         );
     }
 
-    /// Verify fix-issue flow implement step includes restatement instruction
+    /// Verify implement-issue flow has exactly 4 steps
     #[test]
-    fn fix_issue_implement_step_has_restatement() {
+    fn implement_issue_has_four_steps() {
         let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
-        let flow_path = koto_dir.join("flows/fix-issue.yaml");
+        let flow_path = koto_dir.join("flows/implement-issue.yaml");
 
         if !flow_path.exists() {
-            panic!("fix-issue.yaml not found at {}", flow_path.display());
+            panic!("implement-issue.yaml not found at {}", flow_path.display());
         }
 
-        let contents = std::fs::read_to_string(&flow_path).expect("failed to read fix-issue.yaml");
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read implement-issue.yaml");
         let raw: RawFlowConfig =
-            serde_yaml::from_str(&contents).expect("failed to parse fix-issue.yaml");
+            serde_yaml::from_str(&contents).expect("failed to parse implement-issue.yaml");
+
+        assert_eq!(
+            raw.flow.len(),
+            4,
+            "implement-issue flow should have exactly 4 steps. Got: {}",
+            raw.flow.len()
+        );
+
+        // Verify step names
+        assert!(
+            raw.flow.contains_key("fetch"),
+            "implement-issue flow should have 'fetch' step"
+        );
+        assert!(
+            raw.flow.contains_key("implement"),
+            "implement-issue flow should have 'implement' step"
+        );
+        assert!(
+            raw.flow.contains_key("review"),
+            "implement-issue flow should have 'review' step"
+        );
+        assert!(
+            raw.flow.contains_key("pr"),
+            "implement-issue flow should have 'pr' step"
+        );
+    }
+
+    /// Verify implement-issue flow uses 'id' placeholder not 'issue'
+    #[test]
+    fn implement_issue_uses_id_placeholder() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/implement-issue.yaml");
+
+        if !flow_path.exists() {
+            panic!("implement-issue.yaml not found at {}", flow_path.display());
+        }
+
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read implement-issue.yaml");
+
+        // Check that {{id}} is present
+        assert!(
+            contents.contains("{{id}}"),
+            "implement-issue.yaml should use {{{{id}}}} placeholder"
+        );
+
+        // Check that {{issue}} is NOT present
+        assert!(
+            !contents.contains("{{issue}}"),
+            "implement-issue.yaml should NOT use {{{{issue}}}} placeholder"
+        );
+
+        // Check usage comment
+        assert!(
+            contents.contains("id=42") || contents.contains("id="),
+            "implement-issue.yaml usage comment should show 'id=' not 'issue='"
+        );
+    }
+
+    /// Verify implement-issue flow implement step includes restatement instruction
+    #[test]
+    fn implement_issue_implement_step_has_restatement() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/implement-issue.yaml");
+
+        if !flow_path.exists() {
+            panic!("implement-issue.yaml not found at {}", flow_path.display());
+        }
+
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read implement-issue.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse implement-issue.yaml");
 
         let implement_step = raw
             .flow
             .get("implement")
-            .expect("fix-issue flow should have 'implement' step");
+            .expect("implement-issue flow should have 'implement' step");
 
         let task = implement_step
             .task
@@ -1110,114 +1185,51 @@ flow:
 
         assert!(
             task_lower.contains("restate"),
-            "fix-issue implement step should include restatement instruction. Got: {}",
+            "implement-issue implement step should include restatement instruction. Got: {}",
             task
         );
 
         assert!(
             task_lower.contains("assumption"),
-            "fix-issue implement step should mention assumptions. Got: {}",
+            "implement-issue implement step should mention assumptions. Got: {}",
             task
         );
     }
 
-    /// Verify fix-issue flow review step has access to original issue
+    /// Verify implement-issue flow review step has fetch input and checks acceptance criteria
     #[test]
-    fn fix_issue_review_step_has_fetch_input() {
+    fn implement_issue_review_step_checks_acceptance_criteria() {
         let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
-        let flow_path = koto_dir.join("flows/fix-issue.yaml");
+        let flow_path = koto_dir.join("flows/implement-issue.yaml");
 
         if !flow_path.exists() {
-            panic!("fix-issue.yaml not found at {}", flow_path.display());
+            panic!("implement-issue.yaml not found at {}", flow_path.display());
         }
 
-        let contents = std::fs::read_to_string(&flow_path).expect("failed to read fix-issue.yaml");
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read implement-issue.yaml");
         let raw: RawFlowConfig =
-            serde_yaml::from_str(&contents).expect("failed to parse fix-issue.yaml");
+            serde_yaml::from_str(&contents).expect("failed to parse implement-issue.yaml");
 
         let review_step = raw
             .flow
             .get("review")
-            .expect("fix-issue flow should have 'review' step");
+            .expect("implement-issue flow should have 'review' step");
 
+        // Check inputs include fetch and implement
         assert!(
             review_step.input.contains(&"fetch".to_string()),
-            "fix-issue review step should have fetch in input array. Got: {:?}",
+            "implement-issue review step should have fetch in input array. Got: {:?}",
             review_step.input
         );
 
         assert!(
             review_step.input.contains(&"implement".to_string()),
-            "fix-issue review step should have implement in input array. Got: {:?}",
+            "implement-issue review step should have implement in input array. Got: {:?}",
             review_step.input
         );
-    }
 
-    /// Verify development flow implement step references original task
-    #[test]
-    fn development_implement_step_references_original_task() {
-        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
-        let flow_path = koto_dir.join("flows/development.yaml");
-
-        if !flow_path.exists() {
-            panic!("development.yaml not found at {}", flow_path.display());
-        }
-
-        let contents =
-            std::fs::read_to_string(&flow_path).expect("failed to read development.yaml");
-        let raw: RawFlowConfig =
-            serde_yaml::from_str(&contents).expect("failed to parse development.yaml");
-
-        let implement_step = raw
-            .flow
-            .get("implement")
-            .expect("development flow should have 'implement' step");
-
-        let task = implement_step
-            .task
-            .as_ref()
-            .expect("implement step should have a task");
-        let task_lower = task.to_lowercase();
-
-        assert!(
-            task_lower.contains("restate"),
-            "development implement step should include restatement instruction. Got: {}",
-            task
-        );
-
-        assert!(
-            task_lower.contains("original task") || task_lower.contains("original requirement"),
-            "development implement step should reference original task. Got: {}",
-            task
-        );
-
-        assert!(
-            task_lower.contains("diverge") && task_lower.contains("flag"),
-            "development implement step should include divergence-flagging instruction. Got: {}",
-            task
-        );
-    }
-
-    /// Verify development flow review step prioritizes original task over design
-    #[test]
-    fn development_review_step_prioritizes_original_task() {
-        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
-        let flow_path = koto_dir.join("flows/development.yaml");
-
-        if !flow_path.exists() {
-            panic!("development.yaml not found at {}", flow_path.display());
-        }
-
-        let contents =
-            std::fs::read_to_string(&flow_path).expect("failed to read development.yaml");
-        let raw: RawFlowConfig =
-            serde_yaml::from_str(&contents).expect("failed to parse development.yaml");
-
-        let review_step = raw
-            .flow
-            .get("review")
-            .expect("development flow should have 'review' step");
-
+        // Check task mentions acceptance criteria
         let task = review_step
             .task
             .as_ref()
@@ -1225,24 +1237,101 @@ flow:
         let task_lower = task.to_lowercase();
 
         assert!(
-            task_lower.contains("original task") || task_lower.contains("original requirement"),
-            "development review step should reference original task. Got: {}",
+            task_lower.contains("acceptance criteria")
+                || task_lower.contains("acceptance criterion"),
+            "implement-issue review step should mention acceptance criteria. Got: {}",
             task
         );
 
         assert!(
-            task_lower.contains("not just the design")
-                || (task_lower.contains("not") && task_lower.contains("design doc")),
-            "development review step should warn against design-only validation. Got: {}",
+            task_lower.contains("original"),
+            "implement-issue review step should reference ORIGINAL issue. Got: {}",
             task
+        );
+    }
+
+    /// Verify obsolete flow files have been deleted
+    #[test]
+    fn obsolete_flows_deleted() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let fix_issue_path = koto_dir.join("flows/fix-issue.yaml");
+        let fix_pr_path = koto_dir.join("flows/fix-pr.yaml");
+
+        assert!(!fix_issue_path.exists(), "fix-issue.yaml should be deleted");
+
+        assert!(!fix_pr_path.exists(), "fix-pr.yaml should be deleted");
+    }
+
+    /// Verify review-pr flow uses 'id' placeholder not 'pr'
+    #[test]
+    fn review_pr_uses_id_placeholder() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/review-pr.yaml");
+
+        if !flow_path.exists() {
+            panic!("review-pr.yaml not found at {}", flow_path.display());
+        }
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read review-pr.yaml");
+
+        // Check that {{id}} is present
+        assert!(
+            contents.contains("{{id}}"),
+            "review-pr.yaml should use {{{{id}}}} placeholder"
         );
 
-        // The design should be mentioned, but as secondary concern
-        assert!(
-            task.to_lowercase().contains("design"),
-            "development review step should mention design (as secondary check). Got: {}",
-            task
+        // Check that {{pr}} is NOT present (except potentially in comments mentioning "PR")
+        let placeholder_count = contents.matches("{{pr}}").count();
+        assert_eq!(
+            placeholder_count, 0,
+            "review-pr.yaml should NOT use {{{{pr}}}} placeholder. Found {} occurrences",
+            placeholder_count
         );
+
+        // Check usage comment
+        assert!(
+            contents.contains("id=67") || contents.contains("id="),
+            "review-pr.yaml usage comment should show 'id=' not 'pr='"
+        );
+    }
+
+    /// Verify all flows use consistent placeholder naming
+    #[test]
+    fn flows_use_consistent_placeholders() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flows_dir = koto_dir.join("flows");
+
+        if !flows_dir.exists() {
+            panic!("flows directory not found");
+        }
+
+        // Read all YAML files in flows directory
+        let entries = std::fs::read_dir(&flows_dir).expect("failed to read flows directory");
+
+        for entry in entries {
+            let entry = entry.expect("failed to read directory entry");
+            let path = entry.path();
+
+            if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
+                continue;
+            }
+
+            let contents = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("failed to read {}", path.display()));
+
+            // No flow should use {{issue}} or {{pr}} placeholders
+            assert!(
+                !contents.contains("{{issue}}"),
+                "Flow {} should not use {{{{issue}}}} placeholder",
+                path.display()
+            );
+
+            assert!(
+                !contents.contains("{{pr}}"),
+                "Flow {} should not use {{{{pr}}}} placeholder",
+                path.display()
+            );
+        }
     }
 
     /// Verify requirement-verification.md documentation exists and contains key sections
