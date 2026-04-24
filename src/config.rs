@@ -463,6 +463,36 @@ pub fn extract_placeholders(prompt: &str) -> HashSet<String> {
         .collect()
 }
 
+/// Validate that provided template variables match declared placeholders.
+pub fn validate_template_vars(
+    provided: &HashSet<String>,
+    declared: &HashSet<String>,
+) -> Result<(), ConfigError> {
+    for key in provided {
+        if !declared.contains(key) {
+            let valid = if declared.is_empty() {
+                String::from("(no template placeholders declared in flow prompt)")
+            } else {
+                let mut sorted: Vec<_> = declared.iter().collect();
+                sorted.sort();
+                format!(
+                    "Valid placeholders: {}",
+                    sorted
+                        .iter()
+                        .map(|s| format!("{{{{{}}}}}", s))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            return Err(ConfigError::Validation(format!(
+                "Unknown template variable '{}'. {}\n\nDeclare template variables in the flow prompt using {{{{key}}}} syntax.",
+                key, valid
+            )));
+        }
+    }
+    Ok(())
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -1295,5 +1325,69 @@ flow:
                 || contents_lower.contains("original task"),
             "Documentation should emphasize original requirement verification"
         );
+    }
+
+    // --- Template Variable Validation Tests (Issue #105) ---
+
+    #[test]
+    fn unknown_var_no_placeholders() {
+        let mut provided = HashSet::new();
+        provided.insert("key".to_string());
+        let declared = HashSet::new();
+
+        let err = validate_template_vars(&provided, &declared).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unknown template variable 'key'"),
+            "got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("(no template placeholders declared in flow prompt)"),
+            "got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn unknown_var_with_placeholders() {
+        let mut provided = HashSet::new();
+        provided.insert("unknown".to_string());
+
+        let mut declared = HashSet::new();
+        declared.insert("topic".to_string());
+
+        let err = validate_template_vars(&provided, &declared).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Unknown template variable 'unknown'"),
+            "got: {}",
+            msg
+        );
+        assert!(msg.contains("Valid placeholders:"), "got: {}", msg);
+        assert!(msg.contains("{{topic}}"), "got: {}", msg);
+    }
+
+    #[test]
+    fn valid_var_accepted() {
+        let mut provided = HashSet::new();
+        provided.insert("topic".to_string());
+
+        let mut declared = HashSet::new();
+        declared.insert("topic".to_string());
+
+        let result = validate_template_vars(&provided, &declared);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
+    }
+
+    #[test]
+    fn empty_vars_no_validation() {
+        let provided = HashSet::new();
+
+        let mut declared = HashSet::new();
+        declared.insert("topic".to_string());
+
+        let result = validate_template_vars(&provided, &declared);
+        assert!(result.is_ok(), "expected Ok, got: {:?}", result);
     }
 }
