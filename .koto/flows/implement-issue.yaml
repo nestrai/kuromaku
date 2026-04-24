@@ -45,11 +45,8 @@ flow:
     role: developer
     input: [fetch, design, test-plan]
     task: |
-      Before coding, restate the requirement from the original issue
-      in your own words. If your understanding differs from the design
-      doc, flag it with BLOCKED: and stop.
-      Otherwise: implement the changes, write the tests defined in the
-      test-plan, and commit with conventional commit messages on a
+      Implement the changes and write the tests defined in the
+      test-plan. Commit with conventional commit messages on a
       feature branch.
 
   review:
