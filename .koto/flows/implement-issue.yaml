@@ -1,15 +1,12 @@
-# Implement a GitHub issue: fetch -> design -> test-plan -> implement -> review -> ship.
-# Usage: koto up implement-issue issue=87
-# Override roles: koto up implement-issue issue=87 developer=Kai reviewer=Levi
+# Implement a GitHub issue: fetch > implement > review > pr.
+# Usage: koto up implement-issue id=42
 version: "1"
 name: implement-issue
 prompt: |
-  Implement issue #{{issue}} in this repository.
+  Implement issue #{{id}} in this repository.
 
 roles:
   fetcher: { default: Minion }
-  architect: { default: Levi }
-  test-planner: { default: Rio }
   developer: { default: Noah }
   reviewer: { default: Bella }
 
@@ -17,55 +14,35 @@ flow:
   fetch:
     role: fetcher
     task: |
-      Fetch issue #{{issue}} using gh issue view --comments.
+      Fetch issue #{{id}} using gh issue view --comments.
       Output the full issue description and comments as-is.
       Do not analyze or comment -- just output the raw data.
 
-  design:
-    role: architect
-    input: [fetch]
-    task: |
-      Design the implementation for this issue. Read the acceptance
-      criteria carefully. Identify which files need changes, propose
-      the approach, and flag any architectural concerns.
-      Output a concrete design doc with specific file changes, not
-      a wishlist. If the issue is ambiguous, list your assumptions
-      explicitly.
-
-  test-plan:
-    role: test-planner
-    input: [fetch, design]
-    task: |
-      Based on the issue acceptance criteria and the design doc,
-      define the expected test coverage. For each acceptance criterion,
-      specify: what to test, how to verify it, edge cases to cover.
-      Do not write the tests -- define what they should check.
-
   implement:
     role: developer
-    input: [fetch, design, test-plan]
+    input: [fetch]
     task: |
-      Implement the changes and write the tests defined in the
-      test-plan. Commit with conventional commit messages on a
-      feature branch.
+      Implement the changes described in the issue. Before coding,
+      restate the requirement from the issue in your own words. If
+      anything is ambiguous, list your assumptions explicitly.
+      Write code and tests. Commit on a feature branch with
+      conventional commit messages.
 
   review:
     role: reviewer
-    input: [fetch, design, test-plan, implement]
+    input: [fetch, implement]
     task: |
       Review the implementation against the ORIGINAL issue acceptance
-      criteria, not just the design doc. For each criterion: PASS or
-      FAIL with evidence.
-      Also verify test coverage matches the test-plan.
-      If you find nothing wrong, list each criterion you verified and
-      explain what you checked. An empty "looks good" is not acceptable.
+      criteria from the fetch step, not subjective code quality.
+      For each acceptance criterion: PASS or FAIL with evidence.
+      If the implementation diverged from the issue requirements,
+      flag the divergence explicitly.
 
-  ship:
+  pr:
     role: developer
     input: [review]
     print_output: true
     task: |
-      If the review has no FAIL verdicts, push the branch and create
-      a PR that references the issue (Closes #{{issue}}).
-      If there are FAIL verdicts, fix them first, then push.
-      Output the PR URL and a one-line summary per acceptance criterion.
+      Push the branch and create a draft PR referencing the issue
+      (Closes #{{id}}). Output the PR URL and a one-line summary
+      per acceptance criterion.

@@ -1,9 +1,9 @@
 # Review a GitHub PR: fetch -> architecture + code-review -> consensus.
-# Usage: koto up review-pr pr=67
+# Usage: koto up review-pr id=67
 version: "1"
 name: review-pr
 prompt: |
-  Review PR #{{pr}} in this repository. Evaluate the changes thoroughly.
+  Review PR #{{id}} in this repository. Evaluate the changes thoroughly.
 
 roles:
   fetcher:
@@ -19,7 +19,7 @@ flow:
   fetch:
     role: fetcher
     task: |
-      Fetch PR #{{pr}} using the gh CLI. Run gh pr view and gh pr diff.
+      Fetch PR #{{id}} using the gh CLI. Run gh pr view and gh pr diff.
       Output the full PR description and diff as-is, nothing else.
       Do not analyze or comment -- just output the raw data.
 
