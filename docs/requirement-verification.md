@@ -111,3 +111,77 @@ When reviewing a flow for requirement-verification compliance:
 - [ ] If a design/planning step exists, does the implementation step explicitly compare design to original task?
 
 If any of these are missing, the flow is vulnerable to requirement drift.
+
+## BLOCKED Output Pattern
+
+Implementer agents (Noah, Kai, etc.) include pre-implementation validation that can block execution when designs are not implementable.
+
+### When BLOCKED is emitted
+
+An implementer outputs `BLOCKED: [category]` when:
+
+- **AMBIGUOUS**: Design has ambiguities that require clarification (missing error handling spec, unclear scope boundaries, unspecified edge cases)
+- **INCOMPLETE**: Design is missing required details to implement (no function signatures, missing data structures, unspecified dependencies)
+- **CONFLICTS_WITH_CONVENTIONS**: Design violates project conventions or rules (e.g., rust-developer rule says "no silent unwraps" but design specifies returning null on error)
+- **DIVERGED_FROM_REQUIREMENT**: Design does not solve the original problem (telephone-game drift detected)
+
+### Output format
+
+```
+BLOCKED: CONFLICTS_WITH_CONVENTIONS
+- Design specifies returning Option<T> for errors, but rust-developer rule requires Result<T, E>
+- Design uses manual loops where iterators would be idiomatic
+```
+
+The implementer lists all issues found, not just the first one. This allows the design step to address everything in one iteration.
+
+### Flow handling
+
+When a step outputs BLOCKED, the orchestrator should:
+
+1. **Do not proceed to downstream steps** -- the implementation did not happen
+2. **Route back to design** -- pass the BLOCKED output as feedback to the design agent
+3. **Re-run implementation** after design is revised
+
+Example flow structure:
+
+```yaml
+design:
+  agent: Levi
+  task: "Design the feature..."
+
+implement:
+  agent: Noah
+  input: [design]
+  task: "Implement the design..."
+  # Noah validates design before implementing
+  # If BLOCKED, output contains the issues
+
+review:
+  agent: Bella
+  input: [implement]
+  # Only runs if implement produced code, not BLOCKED
+```
+
+Current limitation: koto does not yet support conditional routing based on output content. For now, flows that receive BLOCKED output will fail at the review step (no code to review). The BLOCKED output in the step's result indicates what needs to be fixed.
+
+### Noah's Validation Checklist
+
+Before implementing, Noah verifies:
+
+1. **Completeness**
+   - Are error cases specified?
+   - Are edge cases covered?
+   - Are function signatures and return types clear?
+   - Is the scope bounded?
+
+2. **Convention compliance**
+   - Does the design follow rust-developer rules?
+   - Does it match existing project patterns?
+   - Are there contradictions with the codebase?
+
+3. **Requirement alignment**
+   - Does the design solve the original problem?
+   - Did interpretation drift introduce divergence?
+
+If all checks pass, Noah proceeds to implementation. If any check fails, Noah outputs BLOCKED with the category and specific issues.
