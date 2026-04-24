@@ -810,4 +810,97 @@ mod tests {
             "Step task should appear AFTER context block even with multiple inputs"
         );
     }
+
+    #[test]
+    fn context_includes_critical_evaluation_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let stack_path = dir.path();
+
+        // Write a prior step output to the stack
+        let prior_output = crate::stack::StepOutput {
+            step_id: "research".to_string(),
+            agent_id: "researcher".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "Do research".to_string(),
+            response: "Here are my findings...".to_string(),
+            timestamp: "2026-04-20T12:00:00Z".to_string(),
+        };
+        crate::stack::write_step(stack_path, &prior_output).unwrap();
+
+        // Create a step that depends on the prior step
+        let step = Step {
+            id: "review".to_string(),
+            agent: "reviewer".to_string(),
+            task: Some("Review the research".to_string()),
+            input: vec!["research".to_string()],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+        };
+
+        let base_task = "Main task description";
+        let prompt = build_user_prompt(base_task, &step, stack_path).unwrap();
+
+        // Verify the anti-sycophancy instruction is present
+        assert!(
+            prompt.contains("IMPORTANT: The above is work from prior agents"),
+            "Prompt should include anti-sycophancy instruction header"
+        );
+
+        // Verify key phrases from issue #104 acceptance criteria
+        assert!(
+            prompt.contains("evaluate it critically"),
+            "Prompt should instruct agent to evaluate critically"
+        );
+        assert!(
+            prompt.contains("Check for errors"),
+            "Prompt should instruct agent to check for errors"
+        );
+        assert!(
+            prompt.contains("prior agents can be wrong"),
+            "Prompt should warn that prior agents can be wrong"
+        );
+    }
+
+    #[test]
+    fn no_context_no_sycophancy_instruction() {
+        let dir = tempfile::tempdir().unwrap();
+        let stack_path = dir.path();
+
+        // Create a step with no inputs (no prior context)
+        let step = Step {
+            id: "design".to_string(),
+            agent: "architect".to_string(),
+            task: Some("Design the system".to_string()),
+            input: vec![],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+        };
+
+        let base_task = "Main task description";
+        let prompt = build_user_prompt(base_task, &step, stack_path).unwrap();
+
+        // Verify the anti-sycophancy instruction is NOT present
+        assert!(
+            !prompt.contains("IMPORTANT: The above is work from prior agents"),
+            "Prompt should NOT include anti-sycophancy instruction when there is no context"
+        );
+        assert!(
+            !prompt.contains("evaluate it critically"),
+            "Prompt should NOT include critical evaluation instruction when there is no context"
+        );
+        assert!(
+            !prompt.contains("prior agents can be wrong"),
+            "Prompt should NOT warn about prior agents when there is no context"
+        );
+
+        // But should still contain the basic task
+        assert!(
+            prompt.contains("Your task: Design the system"),
+            "Prompt should still contain the step task"
+        );
+    }
 }
