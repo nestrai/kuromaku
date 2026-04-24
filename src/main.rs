@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -411,7 +412,7 @@ async fn run_up(
         .into_iter()
         .partition(|(k, _)| role_names.contains(k));
 
-    // Warn about template vars that aren't placeholders
+    // Validate template vars against declared placeholders
     if !template_vars.is_empty() {
         let flow_config_temp = config::load_flow_from_str(&contents)?;
         let placeholders = flow_config_temp
@@ -420,14 +421,8 @@ async fn run_up(
             .map(|p| config::extract_placeholders(p))
             .unwrap_or_default();
 
-        for key in template_vars.keys() {
-            if !placeholders.contains(key) {
-                eprintln!(
-                    "warning: '{}' is not a declared role or template placeholder",
-                    key
-                );
-            }
-        }
+        let provided_keys: HashSet<String> = template_vars.keys().cloned().collect();
+        config::validate_template_vars(&provided_keys, &placeholders)?;
     }
 
     // Load flow with role overrides
