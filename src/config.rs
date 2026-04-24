@@ -900,12 +900,12 @@ flow:
         let yaml = r#"
 version: "1"
 name: test
-prompt: "Fix issue #{{issue}}"
+prompt: "Fix issue #{{id}}"
 roles:
-  issue: { default: Noah }
+  id: { default: Noah }
 flow:
   code:
-    role: issue
+    role: id
 "#;
         let err = load_flow_from_str(yaml).unwrap_err();
         assert!(
@@ -1247,6 +1247,136 @@ flow:
             task_lower.contains("original"),
             "implement-issue review step should reference ORIGINAL issue. Got: {}",
             task
+        );
+    }
+
+    /// Verify implement-issue flow step dependencies are correct
+    #[test]
+    fn implement_issue_step_dependencies_are_correct() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/implement-issue.yaml");
+
+        if !flow_path.exists() {
+            panic!("implement-issue.yaml not found at {}", flow_path.display());
+        }
+
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read implement-issue.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse implement-issue.yaml");
+
+        // fetch has no inputs
+        let fetch_step = raw
+            .flow
+            .get("fetch")
+            .expect("implement-issue flow should have 'fetch' step");
+        assert!(
+            fetch_step.input.is_empty(),
+            "fetch step should have no inputs. Got: {:?}",
+            fetch_step.input
+        );
+
+        // implement takes fetch
+        let implement_step = raw
+            .flow
+            .get("implement")
+            .expect("implement-issue flow should have 'implement' step");
+        assert_eq!(
+            implement_step.input,
+            vec!["fetch"],
+            "implement step should have [fetch] as input. Got: {:?}",
+            implement_step.input
+        );
+
+        // review takes fetch and implement
+        let review_step = raw
+            .flow
+            .get("review")
+            .expect("implement-issue flow should have 'review' step");
+        assert!(
+            review_step.input.contains(&"fetch".to_string()),
+            "review step should have fetch in input. Got: {:?}",
+            review_step.input
+        );
+        assert!(
+            review_step.input.contains(&"implement".to_string()),
+            "review step should have implement in input. Got: {:?}",
+            review_step.input
+        );
+
+        // pr takes review
+        let pr_step = raw
+            .flow
+            .get("pr")
+            .expect("implement-issue flow should have 'pr' step");
+        assert_eq!(
+            pr_step.input,
+            vec!["review"],
+            "pr step should have [review] as input. Got: {:?}",
+            pr_step.input
+        );
+    }
+
+    /// Verify implement-issue flow uses exactly 3 roles
+    #[test]
+    fn implement_issue_uses_three_roles() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/implement-issue.yaml");
+
+        if !flow_path.exists() {
+            panic!("implement-issue.yaml not found at {}", flow_path.display());
+        }
+
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read implement-issue.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse implement-issue.yaml");
+
+        assert_eq!(
+            raw.roles.len(),
+            3,
+            "implement-issue flow should have exactly 3 roles. Got: {}",
+            raw.roles.len()
+        );
+
+        // Verify the expected roles exist
+        assert!(
+            raw.roles.contains_key("fetcher"),
+            "implement-issue flow should have 'fetcher' role"
+        );
+        assert!(
+            raw.roles.contains_key("developer"),
+            "implement-issue flow should have 'developer' role"
+        );
+        assert!(
+            raw.roles.contains_key("reviewer"),
+            "implement-issue flow should have 'reviewer' role"
+        );
+    }
+
+    /// Verify implement-issue flow pr step has print_output enabled
+    #[test]
+    fn implement_issue_pr_step_has_print_output() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/implement-issue.yaml");
+
+        if !flow_path.exists() {
+            panic!("implement-issue.yaml not found at {}", flow_path.display());
+        }
+
+        let contents =
+            std::fs::read_to_string(&flow_path).expect("failed to read implement-issue.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse implement-issue.yaml");
+
+        let pr_step = raw
+            .flow
+            .get("pr")
+            .expect("implement-issue flow should have 'pr' step");
+
+        assert!(
+            pr_step.print_output,
+            "pr step should have print_output: true"
         );
     }
 

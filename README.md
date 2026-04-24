@@ -5,7 +5,7 @@ Reproducible AI agent teams, defined in YAML, versioned in your repo.
 Define your team once, run it anywhere. No Python, no framework lock-in, no glue code.
 
 ```
-koto up review-pr pr=67
+koto up review-pr id=67
 ```
 
 ## What it does
@@ -47,7 +47,7 @@ cat > .koto/flows/review-pr.yaml << 'EOF'
 version: "1"
 name: review-pr
 prompt: |
-  Review PR #{{pr}} in this repository. Fetch the PR diff
+  Review PR #{{id}} in this repository. Fetch the PR diff
   using the gh CLI. Evaluate the changes thoroughly.
 
 flow:
@@ -56,7 +56,7 @@ flow:
 EOF
 
 # Run it
-koto up review-pr pr=67
+koto up review-pr id=67
 ```
 
 ## Key concepts
