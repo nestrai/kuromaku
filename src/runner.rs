@@ -179,16 +179,17 @@ fn build_user_prompt(task: &str, step: &Step, stack_path: &Path) -> Result<Strin
 
     let mut user_content = task.to_string();
 
-    // If step has its own task, append it
-    if let Some(ref step_task) = step.task {
-        user_content = format!("{user_content}\n\nYour task: {step_task}");
-    }
-
+    // Append context from previous steps first
     if !context_parts.is_empty() {
         user_content = format!(
-            "{user_content}\n\nContext from previous steps:\n\n{}\n\nIMPORTANT: The above is work already completed by other team members. Build on their output -- do not repeat or rephrase what they already covered. Add your own perspective, analysis, or implementation.",
+            "{user_content}\n\nContext from previous steps:\n\n{}\n\nIMPORTANT: The above is work from prior agents. Your job is to evaluate it critically before using it:\n\n1. Check for errors, gaps, or questionable decisions in the prior output\n2. If you find problems, flag them explicitly in your response\n3. Do not repeat or rephrase what was already covered -- add your own analysis or implementation\n4. Think independently -- prior agents can be wrong",
             context_parts.join("\n\n")
         );
+    }
+
+    // Append step task last for maximum recency weight
+    if let Some(ref step_task) = step.task {
+        user_content = format!("{user_content}\n\nYour task: {step_task}");
     }
     Ok(user_content)
 }
@@ -669,5 +670,144 @@ mod tests {
         assert!(name.starts_with("development-"));
         assert!(name.contains("-design-Levi.md"));
         assert!(name.ends_with(".md"));
+    }
+
+    #[test]
+    fn prompt_order_step_task_after_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let stack_path = dir.path();
+
+        // Write a prior step output to the stack
+        let prior_output = crate::stack::StepOutput {
+            step_id: "research".to_string(),
+            agent_id: "researcher".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "Do research".to_string(),
+            response: "Here are my findings...".to_string(),
+            timestamp: "2026-04-20T12:00:00Z".to_string(),
+        };
+        crate::stack::write_step(stack_path, &prior_output).unwrap();
+
+        // Create a step that depends on the prior step
+        let step = Step {
+            id: "implement".to_string(),
+            agent: "developer".to_string(),
+            task: Some("Build the feature based on research".to_string()),
+            input: vec!["research".to_string()],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+        };
+
+        let base_task = "Main task description";
+        let prompt = build_user_prompt(base_task, &step, stack_path).unwrap();
+
+        // Verify ordering: base task, then context, then step task
+        let context_pos = prompt
+            .find("Context from previous steps:")
+            .expect("context block should be present");
+        let step_task_pos = prompt
+            .find("Your task: Build the feature based on research")
+            .expect("step task should be present");
+
+        assert!(
+            context_pos < step_task_pos,
+            "Step task should appear AFTER context block (context at {}, step task at {})",
+            context_pos,
+            step_task_pos
+        );
+
+        // Verify the "Your task:" prefix is present
+        assert!(prompt.contains("Your task: Build the feature based on research"));
+    }
+
+    #[test]
+    fn prompt_order_no_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let stack_path = dir.path();
+
+        // Create a step with no inputs (no prior context)
+        let step = Step {
+            id: "design".to_string(),
+            agent: "architect".to_string(),
+            task: Some("Design the system".to_string()),
+            input: vec![],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+        };
+
+        let base_task = "Main task description";
+        let prompt = build_user_prompt(base_task, &step, stack_path).unwrap();
+
+        // Verify step task is present
+        assert!(prompt.contains("Your task: Design the system"));
+
+        // Verify no context block appears
+        assert!(!prompt.contains("Context from previous steps:"));
+
+        // Verify base task is at the start
+        assert!(prompt.starts_with("Main task description"));
+    }
+
+    #[test]
+    fn prompt_order_multiple_inputs() {
+        let dir = tempfile::tempdir().unwrap();
+        let stack_path = dir.path();
+
+        // Write two prior step outputs
+        let research_output = crate::stack::StepOutput {
+            step_id: "research".to_string(),
+            agent_id: "researcher".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "Do research".to_string(),
+            response: "Research findings...".to_string(),
+            timestamp: "2026-04-20T12:00:00Z".to_string(),
+        };
+        crate::stack::write_step(stack_path, &research_output).unwrap();
+
+        let design_output = crate::stack::StepOutput {
+            step_id: "design".to_string(),
+            agent_id: "architect".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "Design system".to_string(),
+            response: "Architecture design...".to_string(),
+            timestamp: "2026-04-20T12:01:00Z".to_string(),
+        };
+        crate::stack::write_step(stack_path, &design_output).unwrap();
+
+        // Create a step that depends on both prior steps
+        let step = Step {
+            id: "implement".to_string(),
+            agent: "developer".to_string(),
+            task: Some("Implement based on research and design".to_string()),
+            input: vec!["research".to_string(), "design".to_string()],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+        };
+
+        let base_task = "Main task";
+        let prompt = build_user_prompt(base_task, &step, stack_path).unwrap();
+
+        // Verify both context items appear
+        assert!(prompt.contains("--- Output from step 'research' ---"));
+        assert!(prompt.contains("--- Output from step 'design' ---"));
+
+        // Verify ordering: context block comes before step task
+        let context_pos = prompt
+            .find("Context from previous steps:")
+            .expect("context block should be present");
+        let step_task_pos = prompt
+            .find("Your task: Implement based on research and design")
+            .expect("step task should be present");
+
+        assert!(
+            context_pos < step_task_pos,
+            "Step task should appear AFTER context block even with multiple inputs"
+        );
     }
 }
