@@ -1,5 +1,6 @@
 # Iterate on PR review feedback: fetch > fix > verify > push.
 # Usage: koto up rework-pr id=42
+# TODO: Add test coverage
 version: "1"
 name: rework-pr
 prompt: |
