@@ -1,0 +1,142 @@
+# Iterate on PR review feedback: fetch > fix > verify > push.
+# Usage: koto up rework-pr id=42
+version: "1"
+name: rework-pr
+prompt: |
+  Rework PR #{{id}} based on review feedback.
+
+roles:
+  fetcher: { default: Minion }
+  developer: { default: Noah }
+  verifier: { default: Bella }
+
+flow:
+  fetch:
+    role: fetcher
+    task: |
+      Fetch PR #{{id}} review comments and diff using gh CLI.
+      Run both:
+      - gh pr view {{id}} --comments
+      - gh pr diff {{id}}
+
+      Output the full review feedback and diff as-is.
+      Do not analyze or comment -- just output the raw data.
+
+  fix:
+    role: developer
+    input: [fetch]
+    task: |
+      Apply fixes for each review comment from the PR. This is an
+      iteration task, not greenfield implementation -- make targeted
+      fixes that directly address the reviewer's feedback.
+
+      ## How to approach each review comment
+
+      Use the FCoT structure (Thought, Self-correction, Action):
+
+      1. Thought: What does this feedback ask for? Quote the reviewer's
+         exact words. Restate the request in your own words to confirm
+         understanding.
+
+      2. Self-correction check:
+         - Am I addressing the specific feedback or over-rotating?
+         - Am I introducing unrelated changes (scope creep)?
+         - Is this fix the minimal change that satisfies the comment?
+
+      3. Action: Make the targeted fix. Create a fixup commit per
+         logical change using:
+         git commit --fixup=<original-commit-sha>
+
+      ## Required output
+
+      Your response must include a `## Feedback Addressed` section that
+      maps each review comment to the fix you made:
+
+      ### [Review comment text, quoted]
+      - Interpretation: [what the reviewer asked for]
+      - Change made: [file:line, brief description]
+      - Commit: [fixup commit hash]
+      - Scope check: [confirmed minimal | flagged scope creep]
+
+      Repeat for each review comment.
+
+      ## Anti-patterns (do not do this)
+
+      BAD: Refactoring unrelated code "while you're at it"
+      Why bad: Scope creep makes review harder, mixes concerns
+
+      BAD: Implementing suggestions the reviewer did not make
+      Why bad: You're guessing at improvements, not addressing feedback
+
+      GOOD: "Reviewer asked for null check at line 42. Added null check
+      at file.rs:42, fixup commit abc123. No other changes."
+
+  verify:
+    role: verifier
+    input: [fetch, fix]
+    task: |
+      Verify that each review comment from the PR was addressed by the
+      fixes. Check the developer's "Feedback Addressed" section against
+      the original review comments.
+
+      Use the output format defined below. The downstream push step
+      depends on finding "Overall: DONE" or "Overall: INCOMPLETE"
+      exactly as specified.
+
+      ## How to verify
+
+      For each review comment from fetch:
+
+      1. Was it addressed? Check the fix step's "Feedback Addressed"
+         section for this comment.
+      2. Is there evidence? Cite the fixup commit hash and file:line.
+      3. Was there scope creep? Did the developer fix unrelated things
+         or over-rotate beyond the feedback?
+
+      ## Output format
+
+      For each review comment, output exactly:
+
+      ### [Review comment, quoted]
+      - Fix: [commit hash, file:line | "NOT ADDRESSED"]
+      - Scope creep: [none | describe what was changed beyond feedback]
+      - Verdict: ADDRESSED | NOT ADDRESSED
+
+      End with:
+
+      ### Summary
+      - Overall: DONE | INCOMPLETE
+      - Remaining: [list of not-addressed comments or "none"]
+
+      ## Final check
+
+      If all comments show "Verdict: ADDRESSED" but you marked "Overall:
+      INCOMPLETE", something is wrong -- re-check your logic.
+
+      If you found zero issues and marked "Overall: DONE", ask yourself:
+      Did the developer actually address every single point? Spot-check
+      the commits to confirm.
+
+  push:
+    role: developer
+    input: [verify]
+    print_output: true
+    task: |
+      Check the verification verdict from the previous step.
+
+      If the verdict is "Overall: DONE":
+      - Push the fixup commits to the PR branch.
+      - Output: "Fixes pushed. Ready for re-review."
+      - List the fixup commits that were pushed.
+
+      If the verdict is "Overall: INCOMPLETE":
+      - Do NOT push.
+      - Output the remaining items from the verify step.
+      - Provide guidance: which review comments still need work.
+      - Stop here.
+
+      If neither "Overall: DONE" nor "Overall: INCOMPLETE" is found:
+      - Do NOT push.
+      - Output: "Verification verdict unclear. Expected 'Overall: DONE'
+        or 'Overall: INCOMPLETE' in verify output."
+      - Stop here.
