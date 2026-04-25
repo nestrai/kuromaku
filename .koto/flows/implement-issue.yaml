@@ -28,21 +28,109 @@ flow:
       Write code and tests. Commit on a feature branch with
       conventional commit messages.
 
+      ## How to approach this
+
+      Structure your work as Thought, Self-correction, Action:
+
+      1. Thought: What does the issue require? Identify the components
+         that need to change. Quote the acceptance criteria.
+      2. Self-correction check: Does my understanding match what the
+         issue author intended? Am I narrowing scope with assumptions?
+         Would they accept this interpretation as "done"?
+      3. Action: Write the implementation.
+
+      ## Required output
+
+      Your response must include a `## My Reasoning` section BEFORE any
+      code changes. This section documents:
+      - Your interpretation of each acceptance criterion
+      - Any assumptions you made and why
+      - Components you identified as needing changes
+
+      The reviewer will evaluate this reasoning, not just your code.
+
   review:
     role: reviewer
     input: [fetch, implement]
     task: |
-      Review the implementation against the ORIGINAL issue acceptance
-      criteria from the fetch step, not subjective code quality.
-      For each acceptance criterion: PASS or FAIL with evidence.
-      If the implementation diverged from the issue requirements,
-      flag the divergence explicitly.
+      Use the output format defined in this task, not your default agent
+      format. The downstream pr step depends on finding "Overall: PASS"
+      or "Overall: FAIL" exactly as specified below.
+
+      If the implementation solved the wrong problem or drifted from the
+      issue intent, flag it as FAIL -- regardless of code quality.
+      Clean code that does the wrong thing is a failure.
+
+      ## How to review
+
+      Review against the ORIGINAL issue acceptance criteria from fetch.
+      Do not anchor on what the implementer built -- anchor on what the
+      issue asked for. These may differ.
+
+      For each acceptance criterion:
+
+      1. Thought: What does this criterion require? Quote the exact text.
+      2. Self-correction check:
+         - Does the implementation meet this criterion? Cite file:line.
+         - Did the implementer's stated assumptions narrow or change scope?
+         - Would the issue author accept this as "done"?
+      3. Verdict: PASS or FAIL.
+
+      ## Output format
+
+      For each criterion, output exactly:
+
+      ### [Criterion text, quoted]
+      - Thought: [your interpretation]
+      - Evidence: [file:line or "not implemented"]
+      - Assumption drift: [none | describe how assumptions changed scope]
+      - Verdict: PASS | FAIL
+
+      End with:
+
+      ### Summary
+      - Overall: PASS | FAIL
+      - Blocking issues: [list or "none"]
+
+      ## Anti-patterns (do not do this)
+
+      BAD: "Code is clean and well-tested. PASS."
+      Why bad: Evaluates code quality, not requirement fit.
+
+      BAD: "Implementation looks reasonable. PASS."
+      Why bad: No evidence, no criterion-by-criterion check.
+
+      GOOD: "Criterion 'User can filter by date' requires date range.
+      Implementation at src/filters.rs:42 only supports single date.
+      FAIL -- scope narrowed by implementer assumption."
+
+      ## Final check
+
+      Before submitting: Did you find zero issues? That is suspicious.
+      Re-read the issue. Re-read the implementation. What did you miss?
+
+      REMINDER: If the implementation solved the wrong problem or drifted
+      from the issue intent, flag it as FAIL -- regardless of code quality.
 
   pr:
     role: developer
     input: [review]
     print_output: true
     task: |
-      Push the branch and create a draft PR referencing the issue
-      (Closes #{{id}}). Output the PR URL and a one-line summary
-      per acceptance criterion.
+      First, check the review verdict from the previous step.
+
+      If the review verdict is "Overall: FAIL":
+      - Do NOT create a PR.
+      - Output the blocking issues from the review.
+      - Stop here.
+
+      If the review verdict is "Overall: PASS":
+      - Push the branch and create a draft PR referencing the issue
+        (Closes #{{id}}).
+      - Output the PR URL and a one-line summary per acceptance criterion.
+
+      If neither "Overall: PASS" nor "Overall: FAIL" is found:
+      - Do NOT create a PR.
+      - Output: "Review verdict unclear. Expected 'Overall: PASS' or
+        'Overall: FAIL' in review output."
+      - Stop here.
