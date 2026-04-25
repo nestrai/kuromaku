@@ -17,9 +17,12 @@ flow:
     task: |
       Fetch PR #{{id}} review feedback and diff using gh CLI.
       Run: gh pr view {{id}} --comments
-      Run: gh api repos/{owner}/{repo}/pulls/{{id}}/comments
+      Run: gh pr view {{id}} --json reviews
       Run: gh pr diff {{id}}
-      Output all review comments (both general and inline) and the diff as-is.
+      If no review comments found, output: No review feedback to address for
+      PR #{{id}}. Stop here.
+      Otherwise, output all review comments (both general and inline) and the
+      diff as-is.
       Do not analyze or comment -- just output the raw data.
 
   fix:
@@ -43,7 +46,8 @@ flow:
          over-rotating? Am I introducing unrelated changes? Would the
          reviewer accept this as "addressed"?
       3. Action: Make the targeted fix. Use a fixup commit per logical
-         change (git commit --fixup=<original-commit>).
+         change. Run: git log --oneline to find the relevant commit hash,
+         then: git commit --fixup=<commit-hash>.
 
       ## Required output
 
@@ -110,7 +114,7 @@ flow:
       Check the verify output before pushing.
 
       If "Overall: DONE":
-      - Push the fixup commits to the PR branch.
+      - Run: git push
       - Output: "Pushed fixup commits. PR ready for re-review."
 
       If "Overall: INCOMPLETE":
