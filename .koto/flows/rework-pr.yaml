@@ -114,6 +114,9 @@ flow:
       If all comments show "Verdict: ADDRESSED" but you marked "Overall:
       INCOMPLETE", something is wrong -- re-check your logic.
 
+      If any comment shows "Verdict: NOT ADDRESSED" but you marked
+      "Overall: DONE", something is wrong -- re-check your logic.
+
       If you found zero issues and marked "Overall: DONE", ask yourself:
       Did the developer actually address every single point? Spot-check
       the commits to confirm.
