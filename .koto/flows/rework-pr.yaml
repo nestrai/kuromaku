@@ -24,10 +24,17 @@ flow:
       Output the full review feedback and diff as-is.
       Do not analyze or comment -- just output the raw data.
 
+      If there are no review comments, output exactly: "No review
+      comments found. Nothing to rework."
+
   fix:
     role: developer
     input: [fetch]
     task: |
+      If the fetch output contains "No review comments found", do not
+      make any changes. Output: "No review feedback to address. Flow
+      complete."
+
       Apply fixes for each review comment from the PR. This is an
       iteration task, not greenfield implementation -- make targeted
       fixes that directly address the reviewer's feedback.
