@@ -17,8 +17,9 @@ flow:
     task: |
       Fetch PR #{{id}} review feedback and diff using gh CLI.
       Run: gh pr view {{id}} --comments
+      Run: gh api repos/{owner}/{repo}/pulls/{{id}}/comments
       Run: gh pr diff {{id}}
-      Output all review comments and the diff as-is.
+      Output all review comments (both general and inline) and the diff as-is.
       Do not analyze or comment -- just output the raw data.
 
   fix:
@@ -69,6 +70,8 @@ flow:
     input: [fetch, fix]
     task: |
       Verify each review comment from fetch was addressed in fix.
+      You need the original comments (from fetch) to verify nothing was
+      missed in fix.
       Use the exact output format below -- the push step depends on it.
 
       ## How to verify
