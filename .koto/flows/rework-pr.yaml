@@ -25,6 +25,9 @@ flow:
     role: developer
     input: [fetch]
     task: |
+      First, check out the PR branch:
+      Run: gh pr checkout {{id}} && git pull
+
       Address each review comment from the fetch output. This is iteration
       work, not greenfield implementation -- stay focused on what the
       reviewer asked for.
