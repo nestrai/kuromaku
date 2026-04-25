@@ -15,9 +15,10 @@ flow:
     role: fetcher
     task: |
       Fetch PR #{{id}} review comments and diff using gh CLI.
-      Run both:
+      Run:
       - gh pr view {{id}} --comments
       - gh pr diff {{id}}
+      - gh pr view {{id}} --json commits --jq '.commits[] | "\(.oid[0:7]) \(.messageHeadline)"'
 
       Output the full review feedback and diff as-is.
       Do not analyze or comment -- just output the raw data.
