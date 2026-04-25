@@ -126,7 +126,8 @@ flow:
       Check the verification verdict from the previous step.
 
       If the verdict is "Overall: DONE":
-      - Push the fixup commits to the PR branch.
+      - Get the branch name: gh pr view {{id}} --json headRefName -q .headRefName
+      - Push: git push origin HEAD
       - Output: "Fixes pushed. Ready for re-review."
       - List the fixup commits that were pushed.
 
