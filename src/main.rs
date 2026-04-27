@@ -1,14 +1,25 @@
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
+/// Matches `{{vars.<key>}}` placeholders. Compiled once at first use to avoid
+/// re-parsing the pattern on every call to [`substitute_vars`].
+static VARS_RE: LazyLock<regex_lite::Regex> =
+    LazyLock::new(|| regex_lite::Regex::new(r"\{\{vars\.([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap());
+
+/// Matches bare `{{key}}` placeholders. Compiled once at first use.
+static PLACEHOLDER_RE: LazyLock<regex_lite::Regex> =
+    LazyLock::new(|| regex_lite::Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap());
+
 mod config;
 mod dag;
 #[allow(dead_code)]
 mod executor;
+mod koto_config;
 #[allow(dead_code)]
 mod llm;
 mod runner;
@@ -17,6 +28,7 @@ mod stack;
 #[allow(dead_code)]
 mod ui;
 
+use crate::koto_config::KotoConfig;
 use crate::runner::RunContext;
 
 const KOTO_DIR: &str = ".koto";
@@ -39,6 +51,13 @@ enum Command {
         /// Task prompt or template arguments (key=value pairs fill {{key}} placeholders in the flow prompt)
         #[arg(short = 't', long)]
         task: Option<String>,
+
+        /// Override koto.yaml vars (repeatable, e.g. --var owner=foo --var repo=bar)
+        ///
+        /// Values fill `{{vars.<key>}}` placeholders in flow prompts and step
+        /// task strings. Overrides any value defined in koto.yaml.
+        #[arg(long = "var", value_name = "KEY=VALUE")]
+        vars: Vec<String>,
 
         /// Template arguments as key=value pairs (e.g. pr=67 branch=main)
         #[arg(trailing_var_arg = true)]
@@ -75,9 +94,19 @@ async fn main() -> Result<()> {
         Command::Up {
             flow,
             task,
+            vars,
             args,
             file,
-        } => run_up(flow.as_deref(), task.as_deref(), &args, file.as_deref()).await?,
+        } => {
+            run_up(
+                flow.as_deref(),
+                task.as_deref(),
+                &vars,
+                &args,
+                file.as_deref(),
+            )
+            .await?
+        }
         Command::Task { agent, task } => run_task(&agent, &task).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
@@ -218,16 +247,50 @@ fn parse_key_value_args(args: &[String]) -> Result<std::collections::HashMap<Str
     Ok(map)
 }
 
+/// Replace `{{vars.<key>}}` placeholders. Used for project-level vars from
+/// koto.yaml + `--var` CLI flag. Returns an error listing every missing key.
+///
+/// Bare `{{key}}` placeholders (CLI key=value args) are NOT touched here --
+/// see [`substitute_placeholders`].
+fn substitute_vars(text: &str, vars: &std::collections::HashMap<String, String>) -> Result<String> {
+    let mut missing: Vec<String> = Vec::new();
+
+    // Single pass: build the replaced string in one allocation while
+    // collecting any unknown keys for the error path.
+    let result = VARS_RE.replace_all(text, |caps: &regex_lite::Captures<'_>| {
+        let key = &caps[1];
+        match vars.get(key) {
+            Some(value) => value.clone(),
+            None => {
+                if !missing.iter().any(|k| k == key) {
+                    missing.push(key.to_string());
+                }
+                // Leave the placeholder intact so the error message points
+                // at the original text the caller passed in.
+                caps[0].to_string()
+            }
+        }
+    });
+
+    if !missing.is_empty() {
+        return Err(eyre!(
+            "missing vars: {}\n\nhint: define them in koto.yaml or pass --var key=value",
+            missing.join(", ")
+        ));
+    }
+
+    Ok(result.into_owned())
+}
+
 /// Replace `{{key}}` placeholders in a prompt with values from the map.
 fn substitute_placeholders(
     prompt: &str,
     vars: &std::collections::HashMap<String, String>,
 ) -> Result<String> {
-    let re = regex_lite::Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap();
     let mut result = prompt.to_string();
     let mut missing: Vec<String> = Vec::new();
 
-    for cap in re.captures_iter(prompt) {
+    for cap in PLACEHOLDER_RE.captures_iter(prompt) {
         let key = &cap[1];
         match vars.get(key) {
             Some(value) => {
@@ -260,6 +323,9 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     let task_start = Instant::now();
     let koto_dir = Path::new(KOTO_DIR);
 
+    // Optional project-level config -- needed if any agent declares a tier.
+    let koto_config = KotoConfig::load_optional(Path::new("."))?;
+
     // Use defaults matching flow config defaults
     let defaults = config::Defaults {
         model: "claude-sonnet-4-5".to_string(),
@@ -269,7 +335,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     // Load requested agents
     let mut agents = Vec::new();
     for name in agent_names {
-        let agent = config::load_agent_file(koto_dir, name, &defaults)?;
+        let agent = config::load_agent_file(koto_dir, name, &defaults, koto_config.as_ref())?;
         agents.push(agent);
     }
 
@@ -389,6 +455,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
 async fn run_up(
     flow: Option<&str>,
     task: Option<&str>,
+    var_args: &[String],
     args: &[String],
     file: Option<&str>,
 ) -> Result<()> {
@@ -398,11 +465,25 @@ async fn run_up(
 
     ui::print_command(&format!("koto up {}", flow.unwrap_or(&display_path)));
 
+    // Optional project-level config (koto.yaml). When absent everything keeps
+    // working as before -- this is the backward-compat path.
+    let koto_config = KotoConfig::load_optional(Path::new("."))?;
+
+    // Build effective vars: koto.yaml < CLI --var (CLI wins).
+    let cli_vars = parse_key_value_args(var_args)?;
+    let mut effective_vars = koto_config
+        .as_ref()
+        .map(|c| c.vars.clone())
+        .unwrap_or_default();
+    for (k, v) in cli_vars {
+        effective_vars.insert(k, v);
+    }
+
     // Parse role names from YAML to partition args
     let contents = std::fs::read_to_string(&path)?;
     let role_names = config::parse_role_names(&contents)?;
 
-    // Partition args: role overrides vs template vars
+    // Partition positional args: role overrides vs template vars
     let all_args = parse_key_value_args(args)?;
     let (role_overrides, template_vars): (
         std::collections::HashMap<_, _>,
@@ -431,10 +512,29 @@ async fn run_up(
     }
 
     // Load flow with role overrides
-    let flow_config = config::load_flow_from_str_with_overrides(&contents, &role_overrides)?;
+    let mut flow_config = config::load_flow_from_str_with_overrides(&contents, &role_overrides)?;
+
+    // Substitute `{{vars.<key>}}` in the flow prompt, step task strings, and
+    // the `-t` override before any further use. Bare `{{key}}` placeholders
+    // are still handled downstream by `resolve_task` for CLI key=value args.
+    if let Some(ref mut prompt) = flow_config.prompt {
+        *prompt = substitute_vars(prompt, &effective_vars)?;
+    }
+    for step in flow_config.steps.iter_mut() {
+        if let Some(task_str) = step.task.as_mut() {
+            *task_str = substitute_vars(task_str, &effective_vars)?;
+        }
+    }
+    let task_with_vars = task
+        .map(|t| substitute_vars(t, &effective_vars))
+        .transpose()?;
 
     // Resolve task prompt: -t flag > flow default prompt with {{key}} substitution
-    let resolved_task = resolve_task(task, &flow_config.prompt, &template_vars)?;
+    let resolved_task = resolve_task(
+        task_with_vars.as_deref(),
+        &flow_config.prompt,
+        &template_vars,
+    )?;
 
     // Derive flow name for tmux sessions
     let flow_name = flow
@@ -443,7 +543,7 @@ async fn run_up(
 
     // Load agents referenced by the flow
     let koto_dir = Path::new(KOTO_DIR);
-    let agents = config::load_agents_for_flow(koto_dir, &flow_config)?;
+    let agents = config::load_agents_for_flow(koto_dir, &flow_config, koto_config.as_ref())?;
 
     ui::print_flow_start(
         &flow_config.name,
@@ -624,6 +724,89 @@ mod tests {
         let vars = std::collections::HashMap::new();
         let err = substitute_placeholders("Review PR #{{pr}}", &vars).unwrap_err();
         assert!(err.to_string().contains("pr"));
+    }
+
+    // --- vars substitution (issue #128) ---
+
+    #[test]
+    fn substitute_vars_replaces_namespaced_placeholders() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("owner".to_string(), "nestrai".to_string());
+        vars.insert("repo".to_string(), "koto".to_string());
+
+        let result = substitute_vars("clone {{vars.owner}}/{{vars.repo}}", &vars).unwrap();
+        assert_eq!(result, "clone nestrai/koto");
+    }
+
+    #[test]
+    fn substitute_vars_leaves_bare_placeholders_alone() {
+        // Bare `{{id}}` must not be touched by vars substitution -- it's the
+        // CLI key=value namespace handled by substitute_placeholders.
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("owner".to_string(), "nestrai".to_string());
+
+        let result = substitute_vars("Issue #{{id}} in {{vars.owner}}/repo", &vars).unwrap();
+        assert_eq!(result, "Issue #{{id}} in nestrai/repo");
+    }
+
+    #[test]
+    fn substitute_vars_missing_key_errors() {
+        let vars = std::collections::HashMap::new();
+        let err = substitute_vars("repo: {{vars.repo}}", &vars).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("missing vars: repo"), "got: {msg}");
+        assert!(msg.contains("--var"), "got: {msg}");
+    }
+
+    #[test]
+    fn substitute_vars_no_placeholders_passes_through() {
+        let vars = std::collections::HashMap::new();
+        let result = substitute_vars("plain text", &vars).unwrap();
+        assert_eq!(result, "plain text");
+    }
+
+    #[test]
+    fn task_flag_runs_through_substitute_vars() {
+        // Regression: `-t "deploy {{vars.env}}"` used to pass the placeholder
+        // through unchanged. The fix in run_up applies substitute_vars to the
+        // task flag before resolve_task -- mirror that behavior here so the
+        // expectation is documented next to the helper it relies on.
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("env".to_string(), "prod".to_string());
+
+        let task_flag = "deploy {{vars.env}}";
+        let substituted = substitute_vars(task_flag, &vars).unwrap();
+        let resolved =
+            resolve_task(Some(&substituted), &None, &std::collections::HashMap::new()).unwrap();
+
+        assert_eq!(resolved, "deploy prod");
+    }
+
+    #[test]
+    fn substitute_vars_repeated_placeholder_replaces_all() {
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("repo".to_string(), "koto".to_string());
+        let result = substitute_vars("{{vars.repo}} and again {{vars.repo}}", &vars).unwrap();
+        assert_eq!(result, "koto and again koto");
+    }
+
+    #[test]
+    fn cli_vars_override_koto_yaml_vars() {
+        // Replicates the merge logic used in run_up.
+        let mut koto_yaml_vars = std::collections::HashMap::new();
+        koto_yaml_vars.insert("owner".to_string(), "from-yaml".to_string());
+        koto_yaml_vars.insert("repo".to_string(), "from-yaml".to_string());
+
+        let cli_args = vec!["repo=from-cli".to_string()];
+        let cli_vars = parse_key_value_args(&cli_args).unwrap();
+
+        let mut effective = koto_yaml_vars;
+        for (k, v) in cli_vars {
+            effective.insert(k, v);
+        }
+
+        assert_eq!(effective.get("owner").unwrap(), "from-yaml");
+        assert_eq!(effective.get("repo").unwrap(), "from-cli");
     }
 
     #[test]
