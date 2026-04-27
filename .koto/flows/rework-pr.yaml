@@ -103,8 +103,10 @@ flow:
       the original review comments.
 
       Use the output format defined below. The downstream push step
-      depends on finding "Overall: DONE" or "Overall: INCOMPLETE"
-      exactly as specified.
+      depends on finding "FINAL_VERDICT: DONE" or "FINAL_VERDICT:
+      INCOMPLETE" exactly as specified -- this exact prefix only ever
+      appears once in your output (in the Summary section), so it
+      cannot be confused with descriptive text or echoed format specs.
 
       ## How to verify
 
@@ -128,44 +130,54 @@ flow:
       End with:
 
       ### Summary
-      - Overall: DONE | INCOMPLETE
       - Remaining: [list of not-addressed comments or "none"]
+      - FINAL_VERDICT: DONE | INCOMPLETE
+
+      The `FINAL_VERDICT:` line must appear exactly once and on its own
+      line. Do not repeat the literal token elsewhere in your response.
 
       ## Final check
 
-      If all comments show "Verdict: ADDRESSED" but you marked "Overall:
-      INCOMPLETE", something is wrong -- re-check your logic.
+      If all comments show "Verdict: ADDRESSED" but you wrote
+      "FINAL_VERDICT: INCOMPLETE", something is wrong -- re-check your
+      logic.
 
-      If any comment shows "Verdict: NOT ADDRESSED" but you marked
-      "Overall: DONE", something is wrong -- re-check your logic.
+      If any comment shows "Verdict: NOT ADDRESSED" but you wrote
+      "FINAL_VERDICT: DONE", something is wrong -- re-check your logic.
 
-      If you found zero issues and marked "Overall: DONE", ask yourself:
-      Did the developer actually address every single point? Spot-check
-      the commits to confirm.
+      If you found zero issues and wrote "FINAL_VERDICT: DONE", ask
+      yourself: Did the developer actually address every single point?
+      Spot-check the commits to confirm.
 
   push:
     role: developer
     input: [verify]
     print_output: true
     task: |
-      Check the verification verdict from the previous step.
+      Check the verification verdict from the previous step. Look for
+      the line "FINAL_VERDICT: DONE" or "FINAL_VERDICT: INCOMPLETE" in
+      the verify output (this exact prefix is only emitted once, in the
+      Summary section).
 
-      If the verdict is "Overall: DONE":
-      - Capture the branch name into a shell variable:
-            branch=$(gh pr view {{id}} --json headRefName -q .headRefName)
-      - Push to that branch (not HEAD -- the runner may be on main):
-            git push origin "$branch"
+      If "FINAL_VERDICT: DONE":
+      - Push the fixup commits to the PR's head branch in a single
+        atomic command (shell variables do not persist between separate
+        Bash tool invocations -- capture and push must be one call):
+            branch=$(gh pr view {{id}} --json headRefName -q .headRefName) && git push origin "$branch"
+        Pushing the captured branch (not HEAD) ensures fixups land on
+        the PR even if the runner ended up on main.
       - Output: "Fixes pushed. Ready for re-review."
       - List the fixup commits that were pushed.
 
-      If the verdict is "Overall: INCOMPLETE":
+      If "FINAL_VERDICT: INCOMPLETE":
       - Do NOT push.
       - Output the remaining items from the verify step.
       - Provide guidance: which review comments still need work.
       - Stop here.
 
-      If neither "Overall: DONE" nor "Overall: INCOMPLETE" is found:
+      If neither "FINAL_VERDICT: DONE" nor "FINAL_VERDICT: INCOMPLETE"
+      is found:
       - Do NOT push.
-      - Output: "Verification verdict unclear. Expected 'Overall: DONE'
-        or 'Overall: INCOMPLETE' in verify output."
+      - Output: "Verification verdict unclear. Expected 'FINAL_VERDICT:
+        DONE' or 'FINAL_VERDICT: INCOMPLETE' in verify output."
       - Stop here.
