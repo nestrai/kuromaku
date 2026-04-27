@@ -19,40 +19,213 @@ flow:
   fetch:
     role: fetcher
     task: |
-      Fetch PR #{{id}} using the gh CLI. Run gh pr view and gh pr diff.
-      Output the full PR description and diff as-is, nothing else.
-      Do not analyze or comment -- just output the raw data.
+      Fetch PR #{{id}} using the gh CLI. Run:
+      - gh pr view {{id}}
+      - gh pr diff {{id}}
+      - gh api repos/{owner}/{repo}/pulls/{{id}}/comments
+      - gh pr view {{id}} --comments
+
+      Output the full PR description, diff, and any prior review
+      comments as-is, nothing else. Do not analyze or comment -- just
+      output the raw data.
 
   architecture:
     role: architect
     input: [fetch]
     task: |
-      Evaluate the design decisions and architectural impact of this PR.
-      Focus on module boundaries, error handling patterns, and whether
-      the approach fits the existing codebase. Skip cosmetic issues.
+      ## Critical scope (read first, re-read at the end)
+
+      Your job is to challenge whether this PR is solving the right
+      problem the right way -- not to validate it. The user's PR
+      description gets the same scrutiny as any other input. If the PR
+      addresses the wrong problem, say so.
+
+      Evaluate the design decisions and architectural impact of this
+      PR. Focus on module boundaries, error handling patterns, and
+      whether the approach fits the existing codebase. Skip cosmetic
+      issues -- those are for code-review.
+
+      ## Required output format
+
+      For each finding, output:
+
+      ### [Short title]
+      - Severity: Blocking | Suggestion | Nit
+      - File:line: [path/to/file.rs:42 or "N/A" for cross-cutting]
+      - Problem: [what is wrong, with evidence from the diff]
+      - Suggested fix: [concrete change, not "consider revisiting"]
+
+      End with:
+
+      ### Summary
+      - Solving the right problem: yes | no -- [one-sentence reason]
+      - Top blocking concern: [or "none"]
+
+      ## Severity rules
+
+      - Blocking: Architectural mismatch, wrong abstraction, data
+        loss risk, public API break without migration path.
+      - Suggestion: Better-but-not-required design choice, future
+        scalability concern, alternative pattern worth considering.
+      - Nit: Naming, minor structural preference. Do NOT raise nits
+        from this step -- the consensus step will filter them out.
+
+      ## Anti-pattern (do not produce this)
+
+      BAD: "The implementation looks reasonable and follows existing
+      patterns. No major concerns."
+      Why bad: No evidence, no file:line, no challenge. This is
+      validation, not review.
+
+      GOOD: "Severity: Blocking. File: src/runner.rs:88. Problem: New
+      step adds an implicit dependency on stack.rs::write_output but
+      the call site is in a different module with no boundary
+      contract. Suggested fix: introduce StepOutput trait and inject
+      the writer."
+
+      ## Final check (anti-sycophancy)
+
+      Before submitting: did you challenge the PR's premise at all?
+      If every finding is "Suggestion" or "Nit", re-read the PR
+      description -- you may be deferring instead of reviewing.
 
   code-review:
     role: reviewer
     input: [fetch]
     task: |
+      ## Critical scope (read first, re-read at the end)
+
       Review the implementation for correctness, edge cases, and test
-      coverage. List only actual issues with file, line, problem, fix.
-      Verify before reporting -- false positives waste everyone's time.
+      coverage. List only actual issues. Verify before reporting --
+      false positives waste everyone's time. The PR author's framing
+      gets no special weight; review against the diff, not the
+      description.
+
+      ## Required output format
+
+      For each finding, output:
+
+      ### [Short title]
+      - Severity: Blocking | Suggestion | Nit
+      - File:line: [path/to/file.rs:42]
+      - Problem: [what is wrong, why it breaks]
+      - Suggested fix: [concrete code change, not vague advice]
+
+      End with:
+
+      ### Summary
+      - Blocking count: [N]
+      - Suggestion count: [N]
+      - Test coverage gap: yes | no -- [one sentence]
+
+      ## Severity rules
+
+      - Blocking: Bug, missing error handling on a path that runs in
+        production, missing test for a new public function, panic on
+        valid input.
+      - Suggestion: Better naming, refactor for clarity, additional
+        edge-case test that would harden the change.
+      - Nit: Pure formatting, comment wording. Use sparingly.
+
+      ## Anti-pattern (do not produce this)
+
+      BAD: "Code looks clean and tests pass."
+      Why bad: No file:line, no problem, no evidence the reviewer
+      actually read the code.
+
+      GOOD: "Severity: Blocking. File: src/dag.rs:124. Problem:
+      topological_sort returns Ok on a cycle when nodes share a
+      prefix because the visited check uses starts_with instead of
+      eq. Suggested fix: replace starts_with with == on line 124."
+
+      ## Final check (anti-sycophancy)
+
+      If you found zero blocking issues: re-read the diff once more
+      with the question "what would break this in production?".
+      Zero issues on a non-trivial diff is a red flag, not a pass.
 
   consensus:
     role: facilitator
     input: [architecture, code-review]
     print_output: true
     task: |
-      Output ONLY a GitHub PR comment, ready to copy-paste as-is.
-      No preamble, no meta-commentary, no wrapper text -- start directly
+      ## Critical scope (read first, re-read at the end)
+
+      Output ONLY a GitHub PR comment, ready to copy-paste as-is. No
+      preamble, no meta-commentary, no wrapper text. Start directly
       with the verdict line.
-      Your job is to distill the BEST suggestions from the previous reviews,
-      not to invent new ones. Only include suggestions that are within the
-      scope of what the PR is trying to do -- no feature creep, no "while
-      you're at it" additions, no documentation unless the PR introduces
-      something genuinely new.
-      For each suggestion, one sentence why + a minimal code snippet (2-5 lines).
-      Never estimate effort or time.
-      No emojis anywhere in the output. No bonus or extra sections.
-      Keep the entire comment under 40 lines.
+
+      Distill the BEST findings from architecture and code-review.
+      Do not invent new ones. Do not soften them. Do not add
+      complimentary language about the PR.
+
+      ## Output format (exact)
+
+      VERDICT: APPROVE | REQUEST_CHANGES | COMMENT
+
+      ### Blocking
+      [List of [Blocking] findings -- file:line, one-sentence why,
+      minimal 2-5 line code snippet for the fix. If none: "None."]
+
+      ### Suggestions
+      [List of [Suggestion] findings, same format. Cap at the top 3
+      most impactful. If none: "None."]
+
+      ## Scope rules
+
+      - Only include findings within the scope of what the PR is
+        trying to do. No feature creep, no "while you're at it"
+        additions.
+      - No documentation requests unless the PR introduces something
+        genuinely new and undocumented.
+      - Drop all [Nit] findings -- they do not belong in PR review.
+      - Skip findings without a file:line. Vague advice is noise.
+
+      ## Ranking (when trimming)
+
+      When the combined findings exceed the limit, keep them in this
+      priority order:
+      1. Blocking correctness (bugs, panics, data loss)
+      2. Scope adherence (PR doing the wrong thing)
+      3. Test coverage gaps for new code paths
+      4. Style and readability
+
+      ## Verdict rules
+
+      - APPROVE: zero blocking findings, suggestions optional.
+      - REQUEST_CHANGES: at least one blocking finding.
+      - COMMENT: no blocking findings, but the PR's premise is
+        questionable (architecture flagged "solving the right
+        problem: no").
+
+      ## Limits
+
+      - Entire comment under 40 lines.
+      - One sentence per finding plus a 2-5 line snippet.
+      - No emojis. No effort/time estimates. No bonus sections.
+
+      ## Few-shot example (good consensus comment)
+
+      VERDICT: REQUEST_CHANGES
+
+      ### Blocking
+      - `src/dag.rs:124` -- cycle detection uses `starts_with`, so
+        nodes sharing a prefix bypass the check.
+        ```rust
+        if visited.contains(&node.id) { return Err(Cycle); }
+        ```
+
+      ### Suggestions
+      - `src/runner.rs:88` -- inject the writer instead of calling
+        `stack::write_output` directly to keep module boundaries
+        clean.
+        ```rust
+        fn run(step: &Step, writer: &dyn StepOutput) -> Result<()>
+        ```
+
+      ## Final check (anti-sycophancy)
+
+      Before submitting: did you write any sentence that praises the
+      PR or softens a finding ("nice work, just one small thing")?
+      Delete it. The verdict line carries the tone -- the body
+      carries evidence.

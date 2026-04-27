@@ -21,3 +21,7 @@ Thumbs.db
 
 # koto runtime state
 .koto/state/
+
+# AI tool configs
+.claude/
+.codex
