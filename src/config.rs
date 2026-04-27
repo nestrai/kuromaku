@@ -1515,4 +1515,355 @@ flow:
             "Documentation should emphasize original requirement verification"
         );
     }
+
+    /// Verify rework-pr flow has exactly 4 steps with the expected names.
+    #[test]
+    fn rework_pr_has_four_steps() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        if !flow_path.exists() {
+            panic!("rework-pr.yaml not found at {}", flow_path.display());
+        }
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        assert_eq!(
+            raw.flow.len(),
+            4,
+            "rework-pr flow should have exactly 4 steps. Got: {}",
+            raw.flow.len()
+        );
+
+        for step in ["fetch", "fix", "verify", "push"] {
+            assert!(
+                raw.flow.contains_key(step),
+                "rework-pr flow should have '{}' step",
+                step
+            );
+        }
+    }
+
+    /// Verify rework-pr flow uses `id` placeholder, not `pr` or `issue`,
+    /// and the usage comment matches.
+    #[test]
+    fn rework_pr_uses_id_placeholder() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        if !flow_path.exists() {
+            panic!("rework-pr.yaml not found at {}", flow_path.display());
+        }
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+
+        assert!(
+            contents.contains("{{id}}"),
+            "rework-pr.yaml should use {{{{id}}}} placeholder"
+        );
+        assert_eq!(
+            contents.matches("{{pr}}").count(),
+            0,
+            "rework-pr.yaml should NOT use {{{{pr}}}} placeholder"
+        );
+        assert_eq!(
+            contents.matches("{{issue}}").count(),
+            0,
+            "rework-pr.yaml should NOT use {{{{issue}}}} placeholder"
+        );
+        assert!(
+            contents.contains("id="),
+            "rework-pr.yaml usage comment should show 'id='"
+        );
+    }
+
+    /// Verify rework-pr step dependencies match the documented pipeline:
+    /// fetch -> fix -> verify -> push.
+    #[test]
+    fn rework_pr_step_dependencies_are_correct() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        let fetch_step = raw.flow.get("fetch").expect("missing 'fetch' step");
+        assert!(
+            fetch_step.input.is_empty(),
+            "fetch step should have no inputs. Got: {:?}",
+            fetch_step.input
+        );
+
+        let fix_step = raw.flow.get("fix").expect("missing 'fix' step");
+        assert_eq!(
+            fix_step.input,
+            vec!["fetch"],
+            "fix step should have [fetch] as input. Got: {:?}",
+            fix_step.input
+        );
+
+        let verify_step = raw.flow.get("verify").expect("missing 'verify' step");
+        assert!(
+            verify_step.input.contains(&"fetch".to_string()),
+            "verify step should have fetch in input. Got: {:?}",
+            verify_step.input
+        );
+        assert!(
+            verify_step.input.contains(&"fix".to_string()),
+            "verify step should have fix in input. Got: {:?}",
+            verify_step.input
+        );
+
+        let push_step = raw.flow.get("push").expect("missing 'push' step");
+        assert!(
+            push_step.input.contains(&"verify".to_string()),
+            "push step should depend on verify. Got: {:?}",
+            push_step.input
+        );
+    }
+
+    /// Verify rework-pr fix and verify and push steps surface output to the
+    /// terminal (developer needs to see what changed and why).
+    #[test]
+    fn rework_pr_steps_have_print_output() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        for step_name in ["fix", "verify", "push"] {
+            let step = raw
+                .flow
+                .get(step_name)
+                .unwrap_or_else(|| panic!("missing '{}' step", step_name));
+            assert!(
+                step.print_output,
+                "{} step should have print_output: true",
+                step_name
+            );
+        }
+    }
+
+    /// Verify rework-pr uses three roles (fetcher, developer, reviewer)
+    /// matching the implement-issue / review-pr conventions.
+    #[test]
+    fn rework_pr_uses_three_roles() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        assert_eq!(
+            raw.roles.len(),
+            3,
+            "rework-pr flow should have exactly 3 roles. Got: {}",
+            raw.roles.len()
+        );
+
+        for role in ["fetcher", "developer", "reviewer"] {
+            assert!(
+                raw.roles.contains_key(role),
+                "rework-pr flow should declare '{}' role",
+                role
+            );
+        }
+    }
+
+    /// Verify the fetch step uses the inline-comments API endpoint, not the
+    /// issue-tab `gh pr view --comments`. This is a key spec point distilled
+    /// from PR #119 review rounds: inline review comments are anchored to
+    /// file:line and only the API endpoint surfaces them.
+    #[test]
+    fn rework_pr_fetch_uses_inline_comments_api() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        let fetch_step = raw.flow.get("fetch").expect("missing 'fetch' step");
+        let task = fetch_step.task.as_ref().expect("fetch step needs a task");
+
+        assert!(
+            task.contains("gh api repos/{owner}/{repo}/pulls/{{id}}/comments"),
+            "fetch step should call the inline review comments API endpoint. Got: {}",
+            task
+        );
+        assert!(
+            task.to_lowercase().contains("inline"),
+            "fetch step should mention inline review comments. Got: {}",
+            task
+        );
+        assert!(
+            task.contains("commit_id"),
+            "fetch step should preserve per-comment commit_id (the fixup target). Got: {}",
+            task
+        );
+    }
+
+    /// Verify the fix step requires `gh pr checkout {{id}}` before committing
+    /// and stops on checkout failure -- never silently stash.
+    #[test]
+    fn rework_pr_fix_checks_out_pr_branch() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        let fix_step = raw.flow.get("fix").expect("missing 'fix' step");
+        let task = fix_step.task.as_ref().expect("fix step needs a task");
+        let task_lower = task.to_lowercase();
+
+        assert!(
+            task.contains("gh pr checkout {{id}}"),
+            "fix step should run `gh pr checkout {{{{id}}}}`. Got: {}",
+            task
+        );
+        assert!(
+            task_lower.contains("checkout fails")
+                || task_lower.contains("if checkout fails")
+                || task_lower.contains("checkout failure"),
+            "fix step should handle checkout failure explicitly. Got: {}",
+            task
+        );
+        assert!(
+            task_lower.contains("never commit on main")
+                || task_lower.contains("not commit on main"),
+            "fix step should warn against committing on main. Got: {}",
+            task
+        );
+        assert!(
+            task.contains("--fixup="),
+            "fix step should instruct using `git commit --fixup=<sha>`. Got: {}",
+            task
+        );
+    }
+
+    /// Verify the fix step covers the no-comments early-exit path with a
+    /// sentinel that downstream verify can map to FINAL_VERDICT: DONE.
+    #[test]
+    fn rework_pr_fix_handles_no_comments_path() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        let fix_step = raw.flow.get("fix").expect("missing 'fix' step");
+        let fix_task = fix_step.task.as_ref().expect("fix step needs a task");
+
+        assert!(
+            fix_task.contains("NO_REVIEW_COMMENTS"),
+            "fix step should emit a NO_REVIEW_COMMENTS sentinel for the no-comments path. Got: {}",
+            fix_task
+        );
+
+        let verify_step = raw.flow.get("verify").expect("missing 'verify' step");
+        let verify_task = verify_step.task.as_ref().expect("verify step needs a task");
+
+        assert!(
+            verify_task.contains("NO_REVIEW_COMMENTS"),
+            "verify step should recognise the NO_REVIEW_COMMENTS sentinel. Got: {}",
+            verify_task
+        );
+        assert!(
+            verify_task.contains("FINAL_VERDICT: DONE"),
+            "verify step should map no-comments path to FINAL_VERDICT: DONE. Got: {}",
+            verify_task
+        );
+    }
+
+    /// Verify the verify step uses FINAL_VERDICT: DONE / INCOMPLETE markers
+    /// as single-occurrence gate tokens, matching implement-issue conventions.
+    #[test]
+    fn rework_pr_verify_uses_final_verdict_marker() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        let verify_step = raw.flow.get("verify").expect("missing 'verify' step");
+        let task = verify_step.task.as_ref().expect("verify step needs a task");
+        let task_lower = task.to_lowercase();
+
+        assert!(
+            task.contains("FINAL_VERDICT: DONE"),
+            "verify step should specify the DONE verdict marker. Got: {}",
+            task
+        );
+        assert!(
+            task.contains("FINAL_VERDICT: INCOMPLETE"),
+            "verify step should specify the INCOMPLETE verdict marker. Got: {}",
+            task
+        );
+        // Correctness, not presence: verify must read the diff.
+        assert!(
+            task_lower.contains("git show") || task_lower.contains("read the diff"),
+            "verify step should require reading the actual diff, not just counting commits. Got: {}",
+            task
+        );
+    }
+
+    /// Verify the push step branches on all three verdict outcomes (DONE,
+    /// INCOMPLETE, unclear) and uses the atomic shell command for resolving
+    /// the branch name and pushing in a single statement.
+    #[test]
+    fn rework_pr_push_handles_three_verdicts() {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        let raw: RawFlowConfig =
+            serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml");
+
+        let push_step = raw.flow.get("push").expect("missing 'push' step");
+        let task = push_step.task.as_ref().expect("push step needs a task");
+        let task_lower = task.to_lowercase();
+
+        // Three verdict branches.
+        assert!(
+            task.contains("FINAL_VERDICT: DONE"),
+            "push step should branch on DONE. Got: {}",
+            task
+        );
+        assert!(
+            task.contains("FINAL_VERDICT: INCOMPLETE"),
+            "push step should branch on INCOMPLETE. Got: {}",
+            task
+        );
+        assert!(
+            task_lower.contains("unclear") || task_lower.contains("neither"),
+            "push step should handle the unclear/neither-token branch. Got: {}",
+            task
+        );
+
+        // Atomic shell command: branch resolution + push in a single statement.
+        assert!(
+            task.contains(
+                "branch=$(gh pr view {{id}} --json headRefName -q .headRefName) && git push origin \"$branch\""
+            ),
+            "push step should use the atomic `branch=...&& git push origin \"$branch\"` form. Got: {}",
+            task
+        );
+
+        // Pre-push gate: at least one fixup! commit ahead of origin/$branch.
+        assert!(
+            task.contains("fixup!"),
+            "push step should require at least one fixup! commit ahead of origin. Got: {}",
+            task
+        );
+    }
 }
