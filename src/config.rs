@@ -4,6 +4,8 @@ use std::path::Path;
 use indexmap::IndexMap;
 use serde::Deserialize;
 
+use crate::koto_config::KotoConfig;
+
 // --- Errors ---
 
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +128,8 @@ pub struct RawAgentFile {
     #[serde(default)]
     pub skills: Vec<String>,
     pub model: Option<String>,
+    /// Capability tier, resolved against `koto.yaml#tiers` at load time.
+    pub tier: Option<String>,
     pub backend: Option<Backend>,
     #[serde(default)]
     pub env: HashMap<String, String>,
@@ -236,10 +240,17 @@ pub fn parse_role_names(contents: &str) -> Result<HashSet<String>, ConfigError> 
 }
 
 /// Load a single agent file from .koto/agents/<agent_id>.yaml.
+///
+/// `koto_config` is the optional project-level config. When present and the
+/// agent declares a `tier:` field, the tier is resolved to a concrete
+/// `<provider>/<model-id>` string. When absent and a tier is declared, this
+/// returns a validation error -- a tier-bound agent cannot be used without
+/// a tiers map.
 pub fn load_agent_file(
     koto_dir: &Path,
     agent_id: &str,
     defaults: &Defaults,
+    koto_config: Option<&KotoConfig>,
 ) -> Result<Agent, ConfigError> {
     let path = koto_dir.join("agents").join(format!("{agent_id}.yaml"));
     if !path.exists() {
@@ -253,12 +264,14 @@ pub fn load_agent_file(
     let raw: RawAgentFile = serde_yaml::from_str(&contents)?;
     warn_unknown_fields(&format!("agent file '{agent_id}'"), &raw.unknown);
 
+    let model = resolve_agent_model(&raw, defaults, koto_config)?;
+
     Ok(Agent {
         id: agent_id.to_string(),
         name: raw.name,
         title: raw.title,
         role: raw.role,
-        model: raw.model.unwrap_or_else(|| defaults.model.clone()),
+        model,
         backend: raw.backend.unwrap_or(defaults.backend),
         rules: raw.rules,
         skills: raw.skills,
@@ -266,17 +279,45 @@ pub fn load_agent_file(
     })
 }
 
+/// Resolve the model string for an agent.
+///
+/// Precedence (highest first):
+/// 1. `tier:` resolved through `koto.yaml#tiers`
+/// 2. `model:` literal in the agent YAML
+/// 3. `defaults.model` from the flow config
+fn resolve_agent_model(
+    raw: &RawAgentFile,
+    defaults: &Defaults,
+    koto_config: Option<&KotoConfig>,
+) -> Result<String, ConfigError> {
+    match (raw.tier.as_deref(), koto_config) {
+        (Some(tier_name), Some(kc)) => kc
+            .resolve_tier(tier_name)
+            .map(str::to_string)
+            // `.message()` returns the inner payload without thiserror's
+            // "validation error:" prefix, so wrapping in `ConfigError::Validation`
+            // does not duplicate it.
+            .map_err(|e| ConfigError::Validation(e.message())),
+        (Some(tier_name), None) => Err(ConfigError::Validation(format!(
+            "agent \"{}\" declares tier \"{tier_name}\" but no koto.yaml found",
+            raw.name
+        ))),
+        (None, _) => Ok(raw.model.clone().unwrap_or_else(|| defaults.model.clone())),
+    }
+}
+
 /// Load all agents referenced by the flow steps.
 pub fn load_agents_for_flow(
     koto_dir: &Path,
     config: &FlowConfig,
+    koto_config: Option<&KotoConfig>,
 ) -> Result<Vec<Agent>, ConfigError> {
     let mut agents: Vec<Agent> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for step in &config.steps {
         if seen.insert(step.agent.clone()) {
-            let agent = load_agent_file(koto_dir, &step.agent, &config.defaults)?;
+            let agent = load_agent_file(koto_dir, &step.agent, &config.defaults, koto_config)?;
             agents.push(agent);
         }
     }
@@ -733,7 +774,7 @@ env:
             model: "default-model".to_string(),
             backend: Backend::ClaudeCli,
         };
-        let agent = load_agent_file(dir.path(), "kai", &defaults).unwrap();
+        let agent = load_agent_file(dir.path(), "kai", &defaults, None).unwrap();
         assert_eq!(agent.id, "kai");
         assert_eq!(agent.name, "Kai");
         assert_eq!(agent.role, "Senior Rust developer");
@@ -762,11 +803,178 @@ role: "Code reviewer"
             model: "claude-opus-4-5".to_string(),
             backend: Backend::Api,
         };
-        let agent = load_agent_file(dir.path(), "alex", &defaults).unwrap();
+        let agent = load_agent_file(dir.path(), "alex", &defaults, None).unwrap();
         assert_eq!(agent.model, "claude-opus-4-5");
         assert_eq!(agent.backend, Backend::Api);
         assert!(agent.rules.is_empty());
         assert!(agent.skills.is_empty());
+    }
+
+    #[test]
+    fn load_agent_file_resolves_tier_via_koto_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Sage.yaml"),
+            r#"
+name: Sage
+role: "Reasoning agent"
+tier: reasoning
+"#,
+        )
+        .unwrap();
+
+        let koto_config = crate::koto_config::KotoConfig::from_yaml_str(
+            r#"
+version: "1"
+tiers:
+  reasoning: claude/opus-4-7
+  general: claude/sonnet-4-6
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "fallback".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let agent = load_agent_file(dir.path(), "Sage", &defaults, Some(&koto_config)).unwrap();
+        assert_eq!(agent.model, "claude/opus-4-7");
+    }
+
+    #[test]
+    fn load_agent_file_tier_with_no_koto_config_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Sage.yaml"),
+            r#"
+name: Sage
+role: "Reasoning agent"
+tier: reasoning
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "fallback".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let err = load_agent_file(dir.path(), "Sage", &defaults, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"agent "Sage" declares tier "reasoning""#),
+            "got: {msg}"
+        );
+        assert!(msg.contains("no koto.yaml found"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_agent_file_unknown_tier_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Sage.yaml"),
+            r#"
+name: Sage
+role: "Reasoning agent"
+tier: deep-thought
+"#,
+        )
+        .unwrap();
+
+        let koto_config = crate::koto_config::KotoConfig::from_yaml_str(
+            r#"
+version: "1"
+tiers:
+  general: claude/sonnet-4-6
+  quick: claude/haiku-4-5
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "fallback".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let err = load_agent_file(dir.path(), "Sage", &defaults, Some(&koto_config)).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(r#"tier "deep-thought" not defined in koto.yaml"#),
+            "got: {msg}"
+        );
+        assert!(msg.contains("general"), "got: {msg}");
+        assert!(msg.contains("quick"), "got: {msg}");
+    }
+
+    #[test]
+    fn load_agent_file_tier_overrides_model_field() {
+        // If tier is set, the literal `model:` field is ignored.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Sage.yaml"),
+            r#"
+name: Sage
+role: "Reasoning agent"
+tier: reasoning
+model: should-be-ignored
+"#,
+        )
+        .unwrap();
+
+        let koto_config = crate::koto_config::KotoConfig::from_yaml_str(
+            r#"
+version: "1"
+tiers:
+  reasoning: claude/opus-4-7
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "fallback".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let agent = load_agent_file(dir.path(), "Sage", &defaults, Some(&koto_config)).unwrap();
+        assert_eq!(agent.model, "claude/opus-4-7");
+    }
+
+    #[test]
+    fn load_agent_file_no_tier_uses_model_field() {
+        // Backward compat: agents without tier ignore koto.yaml entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("kai.yaml"),
+            r#"
+name: Kai
+role: "dev"
+model: claude-sonnet-4-5
+"#,
+        )
+        .unwrap();
+
+        let koto_config = crate::koto_config::KotoConfig::from_yaml_str(
+            r#"
+version: "1"
+tiers:
+  reasoning: claude/opus-4-7
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "fallback".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let agent = load_agent_file(dir.path(), "kai", &defaults, Some(&koto_config)).unwrap();
+        assert_eq!(agent.model, "claude-sonnet-4-5");
     }
 
     #[test]
@@ -776,7 +984,7 @@ role: "Code reviewer"
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
         };
-        let err = load_agent_file(dir.path(), "ghost", &defaults).unwrap_err();
+        let err = load_agent_file(dir.path(), "ghost", &defaults, None).unwrap_err();
         assert!(err.to_string().contains("agent file not found"));
     }
 
