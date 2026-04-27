@@ -44,6 +44,15 @@ flow:
       iteration task, not greenfield implementation -- make targeted
       fixes that directly address the reviewer's feedback.
 
+      ## Before any commits
+
+      Check out the PR's head branch first, otherwise fixup commits
+      land on the wrong branch (typically main):
+
+          gh pr checkout {{id}}
+
+      Run this once before making any code changes.
+
       ## How to approach each review comment
 
       Use the FCoT structure (Thought, Self-correction, Action):
