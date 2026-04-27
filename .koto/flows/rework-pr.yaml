@@ -17,15 +17,20 @@ flow:
     task: |
       Fetch PR #{{id}} review comments and diff using gh CLI.
       Run:
+      - gh api repos/{owner}/{repo}/pulls/{{id}}/comments
       - gh pr view {{id}} --comments
       - gh pr diff {{id}}
       - gh pr view {{id}} --json commits --jq '.commits[] | "\(.oid[0:7]) \(.messageHeadline)"'
 
+      The first command returns inline (line-level) review comments,
+      which `gh pr view --comments` misses. Both are needed to capture
+      the full review.
+
       Output the full review feedback and diff as-is.
       Do not analyze or comment -- just output the raw data.
 
-      If there are no review comments, output exactly: "No review
-      comments found. Nothing to rework."
+      If both commands return no review comments, output exactly: "No
+      review comments found. Nothing to rework."
 
   fix:
     role: developer
