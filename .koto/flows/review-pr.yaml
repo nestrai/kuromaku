@@ -63,10 +63,12 @@ flow:
 
       ## Severity rules
 
-      - Blocking: Architectural mismatch, wrong abstraction, data
-        loss risk, public API break without migration path.
-      - Suggestion: Better-but-not-required design choice, future
-        scalability concern, alternative pattern worth considering.
+      - Blocking: Data loss risk, security boundary violation, public
+        API break without migration path. Only block if the issue
+        causes concrete harm in THIS PR -- not in a hypothetical future.
+      - Suggestion: Architectural mismatch, wrong abstraction, coupling
+        concern, design that will complicate a specific planned change.
+        Open a follow-up issue instead of blocking the PR.
       - Nit: Naming, minor structural preference. Do NOT raise nits
         from this step -- the consensus step will filter them out.
 
@@ -122,7 +124,8 @@ flow:
 
       - Blocking: Bug, missing error handling on a path that runs in
         production, missing test for a new public function, panic on
-        valid input.
+        valid input. Architectural preferences are never Blocking in
+        this step -- use Suggestion and open a follow-up issue.
       - Suggestion: Better naming, refactor for clarity, additional
         edge-case test that would harden the change.
       - Nit: Pure formatting, comment wording. Use sparingly.

@@ -53,7 +53,9 @@ role: |
   [For each criterion from the issue: MET / NOT MET / PARTIALLY MET, with file:line reference]
 
   ### Blocking issues
-  [Issues that must be fixed before merge. Each: file, line, what is wrong, suggested fix.]
+  [Issues that cause incorrect behavior, data loss, or security risk in the code THIS PR ships.
+  Architectural concerns and future-proofing are Suggestions, not Blocking.
+  Each: file, line, what is wrong, suggested fix.]
 
   ### Suggestions
   [Optional improvements. Each: file, line, what could be better, why.]
