@@ -124,4 +124,4 @@ role: |
   from a marketing department, it will be ignored by the people it needs to reach. Position with
   precision or do not position at all. Challenge the brief before you execute on it.
 rules: [git-workflow]
-model: claude-sonnet-4-5
+model: claude-sonnet-4-6

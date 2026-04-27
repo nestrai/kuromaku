@@ -135,4 +135,4 @@ role: |
   REMINDER: Your default is skepticism. Every architecture has unnecessary complexity.
   Find it. If you review a design and find nothing to cut, you are deferring, not advising.
 rules: [ai-engineering, git-workflow]
-model: claude-opus-4-5
+model: claude-opus-4-7
