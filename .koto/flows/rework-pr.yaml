@@ -152,8 +152,10 @@ flow:
       Check the verification verdict from the previous step.
 
       If the verdict is "Overall: DONE":
-      - Get the branch name: gh pr view {{id}} --json headRefName -q .headRefName
-      - Push: git push origin HEAD
+      - Capture the branch name into a shell variable:
+            branch=$(gh pr view {{id}} --json headRefName -q .headRefName)
+      - Push to that branch (not HEAD -- the runner may be on main):
+            git push origin "$branch"
       - Output: "Fixes pushed. Ready for re-review."
       - List the fixup commits that were pushed.
 
