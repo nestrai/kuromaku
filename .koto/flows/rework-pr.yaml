@@ -88,6 +88,7 @@ flow:
   verify:
     role: verifier
     input: [fetch, fix]
+    print_output: true
     task: |
       Verify that each review comment from the PR was addressed by the
       fixes. Check the developer's "Feedback Addressed" section against
