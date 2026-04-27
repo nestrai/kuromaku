@@ -23,15 +23,20 @@ flow:
       - gh pr view {{id}} --json headRefName,headRefOid,baseRefName
       - gh pr diff {{id}}
       - gh api repos/{owner}/{repo}/pulls/{{id}}/comments
+      - gh api repos/{owner}/{repo}/issues/{{id}}/comments
 
-      Use `gh api .../comments` for INLINE review comments (file:line
-      anchored). Do NOT use `gh pr view --comments` here -- that returns
-      issue-tab comments, not review threads.
+      Two types of review comments exist:
 
-      Each inline comment in the API response carries its own
-      `commit_id` -- that is the fixup target for that specific
-      comment. Preserve it in the output. Also preserve `path`,
-      `line` (or `original_line`), `body`, and `user.login`.
+      1. INLINE comments (`pulls/.../comments`) -- anchored to a
+         specific file:line in the diff. Each carries `path`, `line`
+         (or `original_line`), `commit_id`, `body`, `user.login`.
+      2. GENERAL PR comments (`issues/.../comments`) -- posted on
+         the conversation tab, not anchored to code. Each carries
+         `body`, `user.login`, `created_at`. No `path` or `line`.
+
+      Both are valid review feedback. Fetch both. Preserve all
+      fields. Label each comment's source ("inline" or "general")
+      in the output so downstream steps know which type they have.
 
       Output the raw results as-is. Do not analyze, do not summarize,
       do not filter. The downstream steps need the full data.
@@ -57,9 +62,9 @@ flow:
 
       ## Step 2: handle the no-comments case
 
-      If the inline-comments API response from fetch is an empty
-      array, or contains zero unresolved comments addressed to the
-      author, output exactly this single line and stop:
+      If BOTH comment sources from fetch (inline and general) are
+      empty arrays, or contain zero unresolved comments addressed to
+      the author, output exactly this single line and stop:
 
           NO_REVIEW_COMMENTS
 
@@ -68,7 +73,7 @@ flow:
 
       ## Step 3: classify every comment
 
-      For each inline comment from fetch, classify it:
+      For each comment from fetch (inline or general), classify it:
 
       - Blocking: bug, regression, missing error handling on a
         production path, factually wrong code, broken test.
@@ -84,22 +89,24 @@ flow:
       For each Blocking comment, in order:
 
       1. Read the cited file at the cited line, plus 10 lines of
-         surrounding context. Never fix blind from the comment text
-         alone -- the line may already differ from when the comment
-         was written.
+         surrounding context. For general comments that reference
+         file:line in their body text, find and read those locations.
+         Never fix blind from the comment text alone -- the line may
+         already differ from when the comment was written.
       2. Make the smallest change that resolves the concern. No
          feature creep. No "while I'm here" refactors.
       3. Stage only the files you changed.
-      4. Create a fixup commit targeting the original commit:
-         `git commit --fixup=<comment.commit_id>`
-         The `commit_id` comes from the inline-comments API
-         response, not from the PR head.
+      4. Create a fixup commit:
+         - Inline comments: `git commit --fixup=<comment.commit_id>`
+           (commit_id comes from the inline-comments API response).
+         - General comments: `git commit --fixup=HEAD` (no specific
+           commit anchor; target the branch head).
 
       ## Required output format
 
       For each comment processed, output:
 
-      ### Comment by @<user> on <path>:<line>
+      ### Comment by @<user> on <path>:<line> (inline) | (general)
       - Severity: Blocking | Suggestion | Nit
       - Action: Fixed | Deferred | Skipped (nit)
       - Fixup SHA: <short-sha or "n/a">
@@ -182,7 +189,7 @@ flow:
 
       For each Blocking comment, output exactly:
 
-      ### Comment by @<user> on <path>:<line>
+      ### Comment by @<user> on <path>:<line> (inline) | (general)
       - Concern: [what the reviewer asked for]
       - Fixup: <short-sha or "missing">
       - Diff check: [what the fixup actually changed]
