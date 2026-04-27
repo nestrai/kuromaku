@@ -1690,5 +1690,66 @@ flow:
                 || task.contains("git push origin {{headRefName}}"),
             "push step should push to the captured branch name. Got: {task}"
         );
+        // Capture and push must live in the same shell invocation,
+        // otherwise $branch is empty when the push runs in a separate
+        // Bash call. Enforce the `&&` chain so future edits don't
+        // silently split them.
+        assert!(
+            task.contains("branch=$(gh pr view {{id}} --json headRefName -q .headRefName) && git push origin \"$branch\""),
+            "push step must capture branch and push in one atomic command (joined with &&). Got: {task}"
+        );
+    }
+
+    /// Verify the fix step's no-comments early-exit instruction is present.
+    /// Without it, the developer would still try to apply fixes when the
+    /// fetch step found nothing to rework.
+    #[test]
+    fn rework_pr_fix_step_has_no_comments_early_exit() {
+        let raw = rework_pr_raw();
+        let fix = raw.flow.get("fix").expect("fix step");
+        let task = fix.task.as_ref().expect("fix step should have a task");
+        assert!(
+            task.contains("No review comments found"),
+            "fix step must check for the 'No review comments found' sentinel emitted by fetch. Got: {task}"
+        );
+        assert!(
+            task.contains("No review feedback to address"),
+            "fix step must emit the 'No review feedback to address' early-exit message. Got: {task}"
+        );
+    }
+
+    /// Verify the push step branches on all three verdict cases:
+    /// DONE (push), INCOMPLETE (do not push, report remaining), and
+    /// unclear (do not push, report parse failure). Missing any branch
+    /// would regress the gate logic.
+    #[test]
+    fn rework_pr_push_handles_all_verdict_branches() {
+        let raw = rework_pr_raw();
+        let push = raw.flow.get("push").expect("push step");
+        let task = push.task.as_ref().expect("push step should have a task");
+        assert!(
+            task.contains("FINAL_VERDICT: DONE"),
+            "push step must handle the DONE verdict. Got: {task}"
+        );
+        assert!(
+            task.contains("FINAL_VERDICT: INCOMPLETE"),
+            "push step must handle the INCOMPLETE verdict. Got: {task}"
+        );
+        assert!(
+            task.contains("unclear"),
+            "push step must handle the unclear/missing-verdict fallback. Got: {task}"
+        );
+        // The unclear branch must explicitly refuse to push, otherwise
+        // a malformed verify output could trigger an unintended push.
+        // Anchor on the branch-opening "If neither" so the slice covers
+        // the whole branch body, not just the trailing message text.
+        let unclear_idx = task
+            .find("If neither")
+            .expect("unclear branch should open with `If neither`");
+        let unclear_section = &task[unclear_idx..];
+        assert!(
+            unclear_section.contains("Do NOT push") || unclear_section.contains("do NOT push"),
+            "unclear-verdict branch must explicitly refuse to push. Got: {unclear_section}"
+        );
     }
 }
