@@ -181,6 +181,9 @@ pub struct Agent {
 pub struct Step {
     pub id: String,
     pub agent: String,
+    /// Role name when the step uses `role:` instead of a direct `agent:`.
+    /// `None` for direct agent assignment. Drives the role cascade in #129.
+    pub role: Option<String>,
     pub task: Option<String>,
     pub input: Vec<String>,
     pub needs: Vec<String>,
@@ -219,6 +222,18 @@ pub fn load_flow_from_str_with_overrides(
     contents: &str,
     role_overrides: &HashMap<String, String>,
 ) -> Result<FlowConfig, ConfigError> {
+    load_flow_from_str_with_project(contents, role_overrides, &HashMap::new())
+}
+
+/// Load flow from YAML string with role overrides AND project-level role
+/// bindings (from koto.yaml). Steps that reference a role only defined at the
+/// project level resolve through `project_roles` so the flow does not need to
+/// redeclare every role used.
+pub fn load_flow_from_str_with_project(
+    contents: &str,
+    role_overrides: &HashMap<String, String>,
+    project_roles: &HashMap<String, String>,
+) -> Result<FlowConfig, ConfigError> {
     let raw: RawFlowConfig = serde_yaml::from_str(contents)?;
     warn_unknown_fields("top-level", &raw.unknown);
     if let Some(ref defaults) = raw.defaults {
@@ -230,7 +245,7 @@ pub fn load_flow_from_str_with_overrides(
     if let Some(ref stack) = raw.stack {
         warn_unknown_fields("stack", &stack.unknown);
     }
-    validate_and_resolve(raw, role_overrides)
+    validate_and_resolve(raw, role_overrides, project_roles)
 }
 
 /// Parse just the role names from a flow YAML (for CLI arg partitioning).
@@ -336,6 +351,7 @@ fn warn_unknown_fields(context: &str, fields: &HashMap<String, serde_yaml::Value
 fn validate_and_resolve(
     raw: RawFlowConfig,
     role_overrides: &HashMap<String, String>,
+    project_roles: &HashMap<String, String>,
 ) -> Result<FlowConfig, ConfigError> {
     if raw.version.0 != "1" {
         return Err(ConfigError::Validation(format!(
@@ -431,6 +447,7 @@ fn validate_and_resolve(
                     Ok(Step {
                         id,
                         agent: agent_id.clone(),
+                        role: None,
                         task: s.task,
                         input: s.input,
                         needs,
@@ -440,14 +457,26 @@ fn validate_and_resolve(
                     })
                 }
                 (None, Some(role_name)) => {
-                    // Resolve role to agent ID
+                    // Resolve role to agent ID. Flow-level roles win over
+                    // project-level (koto.yaml) roles; project-level acts as
+                    // the inherited default so a flow can omit roles it does
+                    // not need to override.
+                    if !resolved_roles.contains_key(role_name)
+                        && let Some(project_agent) = project_roles.get(role_name)
+                    {
+                        resolved_roles.insert(role_name.clone(), project_agent.clone());
+                    }
                     let agent_id = resolved_roles.get(role_name).ok_or_else(|| {
-                        let available = resolved_roles.keys()
+                        let mut available: Vec<&str> = resolved_roles
+                            .keys()
                             .map(|s| s.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ");
+                            .chain(project_roles.keys().map(|s| s.as_str()))
+                            .collect();
+                        available.sort();
+                        available.dedup();
                         ConfigError::Validation(format!(
-                            "step '{id}' references undefined role '{role_name}' (available: {available})"
+                            "step '{id}' references undefined role '{role_name}' (available: {})",
+                            available.join(", ")
                         ))
                     })?;
 
@@ -460,6 +489,7 @@ fn validate_and_resolve(
                     Ok(Step {
                         id,
                         agent: agent_id.clone(),
+                        role: Some(role_name.clone()),
                         task: s.task,
                         input: s.input,
                         needs,
@@ -1026,6 +1056,61 @@ flow:
         assert_eq!(config.steps[1].agent, "Bella");
         assert_eq!(config.roles.get("coder").unwrap(), "Noah");
         assert_eq!(config.roles.get("reviewer").unwrap(), "Bella");
+    }
+
+    #[test]
+    fn project_role_inherited_when_flow_does_not_redeclare() {
+        // Step references a role only defined at the project level. The flow
+        // must inherit the binding rather than reject it -- this is the core
+        // of the project-roles feature.
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  review:
+    role: reviewer
+"#;
+        let mut project = HashMap::new();
+        project.insert("reviewer".to_string(), "Bella".to_string());
+        let config = load_flow_from_str_with_project(yaml, &HashMap::new(), &project).unwrap();
+        assert_eq!(config.steps[0].agent, "Bella");
+        assert_eq!(config.roles.get("reviewer").unwrap(), "Bella");
+    }
+
+    #[test]
+    fn flow_role_wins_over_project_role() {
+        // Flow-level declaration overrides the project-level binding.
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  reviewer: { default: Sage }
+flow:
+  review:
+    role: reviewer
+"#;
+        let mut project = HashMap::new();
+        project.insert("reviewer".to_string(), "Bella".to_string());
+        let config = load_flow_from_str_with_project(yaml, &HashMap::new(), &project).unwrap();
+        assert_eq!(config.steps[0].agent, "Sage");
+    }
+
+    #[test]
+    fn role_unknown_in_flow_and_project_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  review:
+    role: phantom
+"#;
+        let mut project = HashMap::new();
+        project.insert("reviewer".to_string(), "Bella".to_string());
+        let err = load_flow_from_str_with_project(yaml, &HashMap::new(), &project).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("undefined role 'phantom'"), "got: {msg}");
+        // Available list should mention the project-level role.
+        assert!(msg.contains("reviewer"), "got: {msg}");
     }
 
     #[test]

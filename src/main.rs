@@ -22,6 +22,7 @@ mod executor;
 mod koto_config;
 #[allow(dead_code)]
 mod llm;
+mod resolver;
 mod runner;
 mod skills;
 mod stack;
@@ -29,6 +30,10 @@ mod stack;
 mod ui;
 
 use crate::koto_config::KotoConfig;
+use crate::resolver::{
+    ResolvedRole, RoleOverride, parse_role_override, print_audit, resolve_role,
+    validate_role_overrides,
+};
 use crate::runner::RunContext;
 
 const KOTO_DIR: &str = ".koto";
@@ -58,6 +63,13 @@ enum Command {
         /// task strings. Overrides any value defined in koto.yaml.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
+
+        /// Override role bindings (repeatable). Two forms:
+        ///   --role developer=Kai             (rebind agent)
+        ///   --role reviewer:model=ollama/x   (override model)
+        ///   --role reviewer:backend=api      (override backend)
+        #[arg(long = "role", value_name = "NAME[:FIELD]=VALUE")]
+        role_overrides: Vec<String>,
 
         /// Template arguments as key=value pairs (e.g. pr=67 branch=main)
         #[arg(trailing_var_arg = true)]
@@ -95,6 +107,7 @@ async fn main() -> Result<()> {
             flow,
             task,
             vars,
+            role_overrides,
             args,
             file,
         } => {
@@ -102,6 +115,7 @@ async fn main() -> Result<()> {
                 flow.as_deref(),
                 task.as_deref(),
                 &vars,
+                &role_overrides,
                 &args,
                 file.as_deref(),
             )
@@ -350,6 +364,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
         steps.push(config::Step {
             id: format!("step-{}", i + 1),
             agent: agent.id.clone(),
+            role: None,
             task: None,
             input,
             needs: vec![],
@@ -456,6 +471,7 @@ async fn run_up(
     flow: Option<&str>,
     task: Option<&str>,
     var_args: &[String],
+    role_override_args: &[String],
     args: &[String],
     file: Option<&str>,
 ) -> Result<()> {
@@ -469,14 +485,22 @@ async fn run_up(
     // working as before -- this is the backward-compat path.
     let koto_config = KotoConfig::load_optional(Path::new("."))?;
 
+    // Parse `--role` flags up front. Errors here surface bad syntax (unknown
+    // field, bad model format, ...) before we touch any YAML.
+    let parsed_role_overrides: Vec<RoleOverride> = role_override_args
+        .iter()
+        .map(|s| parse_role_override(s))
+        .collect::<std::result::Result<_, _>>()
+        .map_err(|e| eyre!("{e}"))?;
+
     // Build effective vars: koto.yaml < CLI --var (CLI wins).
-    let cli_vars = parse_key_value_args(var_args)?;
+    let cli_vars_map = parse_key_value_args(var_args)?;
     let mut effective_vars = koto_config
         .as_ref()
         .map(|c| c.vars.clone())
         .unwrap_or_default();
-    for (k, v) in cli_vars {
-        effective_vars.insert(k, v);
+    for (k, v) in &cli_vars_map {
+        effective_vars.insert(k.clone(), v.clone());
     }
 
     // Parse role names from YAML to partition args
@@ -485,15 +509,32 @@ async fn run_up(
 
     // Partition positional args: role overrides vs template vars
     let all_args = parse_key_value_args(args)?;
-    let (role_overrides, template_vars): (
+    let (legacy_role_overrides, template_vars): (
         std::collections::HashMap<_, _>,
         std::collections::HashMap<_, _>,
     ) = all_args
         .into_iter()
         .partition(|(k, _)| role_names.contains(k));
 
-    // Warn about template vars that aren't placeholders
+    // Deprecation warning for legacy bare key=value template args. They
+    // continue to work for now (one cycle) but encourage migration to --var.
+    // Also copy them into effective_vars so new-style {{vars.<key>}}
+    // placeholders work without requiring an explicit --var flag.
     if !template_vars.is_empty() {
+        let mut keys: Vec<&String> = template_vars.keys().collect();
+        keys.sort();
+        eprintln!(
+            "warning: bare key=value args are deprecated, use --var: {}",
+            keys.iter()
+                .map(|k| format!("--var {k}={}", template_vars[*k]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        for (k, v) in &template_vars {
+            effective_vars.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+
+        // Warn about template vars that aren't placeholders either
         let flow_config_temp = config::load_flow_from_str(&contents)?;
         let placeholders = flow_config_temp
             .prompt
@@ -511,8 +552,36 @@ async fn run_up(
         }
     }
 
-    // Load flow with role overrides
-    let mut flow_config = config::load_flow_from_str_with_overrides(&contents, &role_overrides)?;
+    // Deprecation warning for legacy bare key=value role rebinds. Same one-cycle
+    // grace period as template vars: still applied below via
+    // load_flow_from_str_with_overrides, but users should migrate to --role.
+    if !legacy_role_overrides.is_empty() {
+        let mut keys: Vec<&String> = legacy_role_overrides.keys().collect();
+        keys.sort();
+        eprintln!(
+            "warning: bare key=value role rebinds are deprecated, use --role: {}",
+            keys.iter()
+                .map(|k| format!("--role {k}={}", legacy_role_overrides[*k]))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+
+    // Load flow with legacy positional role overrides AND project-level role
+    // bindings from koto.yaml. Project roles act as inherited defaults so a
+    // flow can reference a role declared only in koto.yaml without redeclaring
+    // it locally.
+    let project_roles: std::collections::HashMap<String, String> = koto_config
+        .as_ref()
+        .map(|c| {
+            c.roles
+                .iter()
+                .map(|(k, v)| (k.clone(), v.agent.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut flow_config =
+        config::load_flow_from_str_with_project(&contents, &legacy_role_overrides, &project_roles)?;
 
     // Substitute `{{vars.<key>}}` in the flow prompt, step task strings, and
     // the `-t` override before any further use. Bare `{{key}}` placeholders
@@ -543,7 +612,44 @@ async fn run_up(
 
     // Load agents referenced by the flow
     let koto_dir = Path::new(KOTO_DIR);
+
+    // Validate that all CLI --role overrides target known roles. This must
+    // happen before agent loading so the user gets a clear error early.
+    validate_role_overrides(&parsed_role_overrides, &flow_config, koto_config.as_ref())
+        .map_err(|e| eyre!("{e}"))?;
+
+    // Apply the agent-cascade decision before agent loading so the right
+    // agent files get loaded. The decision itself comes from
+    // `resolver::resolve_role_agent` -- this call only writes the result back
+    // into the flow's role map and step.agent. The full cascade (with model
+    // and backend) runs below as `build_resolved_roles` and reads from the
+    // already-applied flow values, so the rule lives in one place.
+    apply_role_agent_overrides(
+        &mut flow_config,
+        koto_config.as_ref(),
+        &parsed_role_overrides,
+    );
+
     let agents = config::load_agents_for_flow(koto_dir, &flow_config, koto_config.as_ref())?;
+
+    // Build the per-step role -> resolved binding map for the cascade.
+    let resolved_roles = build_resolved_roles(
+        &flow_config,
+        &agents,
+        koto_config.as_ref(),
+        &parsed_role_overrides,
+    )
+    .map_err(|e| eyre!("{e}"))?;
+
+    // Audit output: show the resolved binding for every role plus a CLI vars
+    // summary. Print before any execution starts so the user can ctrl-C if a
+    // resolution looks wrong.
+    print_audit(&resolved_roles, &cli_vars_map);
+
+    // Apply role-derived model and backend overrides to every step that uses
+    // a role. Steps that already specified `model:` / `backend:` in the flow
+    // YAML keep their explicit choice -- the cascade only fills the gaps.
+    apply_resolved_roles_to_steps(&mut flow_config, &resolved_roles);
 
     ui::print_flow_start(
         &flow_config.name,
@@ -634,6 +740,148 @@ async fn run_up(
     }
 
     Ok(())
+}
+
+/// Apply the resolver-decided agent for every role in the flow. This walks
+/// the flow's role map and every role-bound step and writes back the agent ID
+/// returned by [`resolver::resolve_role_agent`] -- the single source of truth
+/// for the agent cascade (CLI > flow.role.default > koto.yaml roles[X].agent).
+///
+/// Must run before `load_agents_for_flow` so the right agent files are loaded.
+/// This function does NOT compute the cascade itself; it only applies the
+/// resolver's decision, which keeps the rule in exactly one place.
+fn apply_role_agent_overrides(
+    flow_config: &mut config::FlowConfig,
+    koto_config: Option<&KotoConfig>,
+    overrides: &[RoleOverride],
+) {
+    let mut decided: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for role_name in flow_config.roles.keys() {
+        let flow_agent = flow_config.roles.get(role_name).map(String::as_str);
+        let project_role = koto_config.and_then(|c| c.roles.get(role_name));
+        if let Some(agent) =
+            resolver::resolve_role_agent(role_name, flow_agent, project_role, overrides)
+        {
+            decided.insert(role_name.clone(), agent);
+        }
+    }
+    for (role_name, agent_id) in flow_config.roles.iter_mut() {
+        if let Some(new_agent) = decided.get(role_name) {
+            *agent_id = new_agent.clone();
+        }
+    }
+    for step in flow_config.steps.iter_mut() {
+        if let Some(role) = step.role.as_deref()
+            && let Some(new_agent) = decided.get(role)
+        {
+            step.agent = new_agent.clone();
+        }
+    }
+}
+
+/// Build the cascade-resolved binding for every role used in the flow. Returns
+/// one [`ResolvedRole`] per role -- both flow-declared roles and koto.yaml
+/// roles that the flow inherits.
+fn build_resolved_roles(
+    flow_config: &config::FlowConfig,
+    agents: &[config::Agent],
+    koto_config: Option<&KotoConfig>,
+    cli_overrides: &[RoleOverride],
+) -> std::result::Result<Vec<ResolvedRole>, resolver::ResolverError> {
+    use std::collections::HashSet;
+    let agents_by_id: std::collections::HashMap<&str, &config::Agent> =
+        agents.iter().map(|a| (a.id.as_str(), a)).collect();
+
+    // Roles to report on: union of flow-declared and koto.yaml-declared roles
+    // referenced by any step. We only include roles actually used to keep the
+    // audit output focused.
+    let mut used_roles: HashSet<&str> = HashSet::new();
+    for step in &flow_config.steps {
+        if let Some(role) = step.role.as_deref() {
+            used_roles.insert(role);
+        }
+    }
+
+    let mut out = Vec::new();
+    for role_name in used_roles {
+        let flow_agent = flow_config.roles.get(role_name).map(String::as_str);
+        let project_role = koto_config.and_then(|c| c.roles.get(role_name));
+
+        // The agent that load_agents_for_flow used. Use the agent currently
+        // resolved on the role (after CLI rebind), falling back to project.
+        let agent_for_lookup = flow_agent
+            .or_else(|| project_role.map(|r| r.agent.as_str()))
+            .unwrap_or("");
+        let agent = agents_by_id.get(agent_for_lookup).copied();
+
+        let agent_model = agent.map(|a| a.model.as_str()).unwrap_or("");
+        let agent_backend = agent
+            .map(|a| a.backend)
+            .unwrap_or(config::Backend::ClaudeCli);
+
+        // The agent's tier label is read straight from disk -- cheap, and
+        // keeps the audit text honest about why a model was chosen.
+        let agent_tier = agent.and_then(|a| read_agent_tier(a.id.as_str()));
+
+        let input = resolver::RoleResolveInput {
+            role_name,
+            agent_model,
+            agent_tier: agent_tier.as_deref(),
+            agent_backend,
+            flow_default_model: flow_config.defaults.model.as_str(),
+        };
+
+        let resolved = resolve_role(
+            &input,
+            flow_agent,
+            project_role,
+            cli_overrides,
+            koto_config.and_then(|c| c.default_backend),
+        )
+        .ok_or_else(|| resolver::ResolverError::UnknownRole {
+            name: role_name.to_string(),
+        })?;
+        out.push(resolved);
+    }
+    Ok(out)
+}
+
+/// Read the optional `tier:` field from an agent file. Returns `None` if the
+/// file is missing or has no tier -- callers treat both as "no tier", which
+/// matches how the rest of the loader behaves.
+fn read_agent_tier(agent_id: &str) -> Option<String> {
+    let path = Path::new(KOTO_DIR)
+        .join("agents")
+        .join(format!("{agent_id}.yaml"));
+    let contents = std::fs::read_to_string(&path).ok()?;
+    #[derive(serde::Deserialize)]
+    struct TierOnly {
+        tier: Option<String>,
+    }
+    let parsed: TierOnly = serde_yaml::from_str(&contents).ok()?;
+    parsed.tier
+}
+
+/// Apply role-derived model and backend overrides to every step that uses a
+/// role. Steps that already specified `model:` / `backend:` keep their
+/// explicit per-step choice; the cascade only fills the gaps.
+fn apply_resolved_roles_to_steps(flow_config: &mut config::FlowConfig, resolved: &[ResolvedRole]) {
+    let by_role: std::collections::HashMap<&str, &ResolvedRole> =
+        resolved.iter().map(|r| (r.name.as_str(), r)).collect();
+    for step in flow_config.steps.iter_mut() {
+        let Some(role_name) = step.role.as_deref() else {
+            continue;
+        };
+        let Some(rr) = by_role.get(role_name) else {
+            continue;
+        };
+        if step.model.is_none() {
+            step.model = Some(rr.model.clone());
+        }
+        if step.backend.is_none() {
+            step.backend = Some(rr.backend);
+        }
+    }
 }
 
 fn run_pull() -> Result<()> {
@@ -855,6 +1103,142 @@ mod tests {
         assert_eq!(role_overrides.get("reviewer").unwrap(), "Kai");
         assert_eq!(template_vars.len(), 1);
         assert_eq!(template_vars.get("issue").unwrap(), "42");
+    }
+
+    // --- role cascade integration (issue #129) ---
+
+    fn make_step(id: &str, agent: &str, role: Option<&str>) -> config::Step {
+        config::Step {
+            id: id.to_string(),
+            agent: agent.to_string(),
+            role: role.map(String::from),
+            task: None,
+            input: vec![],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+        }
+    }
+
+    fn make_flow_with_roles(
+        roles: &[(&str, &str)],
+        steps: Vec<config::Step>,
+    ) -> config::FlowConfig {
+        config::FlowConfig {
+            version: "1".to_string(),
+            name: "test".to_string(),
+            prompt: None,
+            defaults: config::Defaults {
+                model: "claude-sonnet-4-5".to_string(),
+                backend: config::Backend::ClaudeCli,
+            },
+            roles: roles
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            steps,
+            stack: config::StackConfig {
+                backend: "local".to_string(),
+                path: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn cli_rebind_changes_step_agent() {
+        let steps = vec![make_step("s1", "OldAgent", Some("dev"))];
+        let mut flow = make_flow_with_roles(&[("dev", "OldAgent")], steps);
+
+        let overrides = vec![RoleOverride::Agent {
+            role: "dev".to_string(),
+            agent: "NewAgent".to_string(),
+        }];
+
+        apply_role_agent_overrides(&mut flow, None, &overrides);
+
+        assert_eq!(flow.roles.get("dev").unwrap(), "NewAgent");
+        assert_eq!(flow.steps[0].agent, "NewAgent");
+    }
+
+    #[test]
+    fn cli_rebind_leaves_unrelated_steps_alone() {
+        let steps = vec![
+            make_step("s1", "Reviewer", Some("reviewer")),
+            make_step("s2", "Direct", None), // direct agent, no role
+        ];
+        let mut flow = make_flow_with_roles(&[("reviewer", "Reviewer")], steps);
+
+        let overrides = vec![RoleOverride::Agent {
+            role: "reviewer".to_string(),
+            agent: "Bella2".to_string(),
+        }];
+
+        apply_role_agent_overrides(&mut flow, None, &overrides);
+        assert_eq!(flow.steps[0].agent, "Bella2");
+        // Direct-agent step is untouched
+        assert_eq!(flow.steps[1].agent, "Direct");
+    }
+
+    #[test]
+    fn apply_resolved_roles_fills_step_model_and_backend() {
+        let steps = vec![make_step("s1", "Sage", Some("dev"))];
+        let mut flow = make_flow_with_roles(&[("dev", "Sage")], steps);
+
+        let resolved = vec![ResolvedRole {
+            name: "dev".to_string(),
+            agent: "Sage".to_string(),
+            model: "ollama/codestral".to_string(),
+            backend: config::Backend::Api,
+            model_source: "CLI override".to_string(),
+            backend_source: "CLI override".to_string(),
+        }];
+
+        apply_resolved_roles_to_steps(&mut flow, &resolved);
+
+        assert_eq!(flow.steps[0].model.as_deref(), Some("ollama/codestral"));
+        assert_eq!(flow.steps[0].backend, Some(config::Backend::Api));
+    }
+
+    #[test]
+    fn apply_resolved_roles_does_not_override_explicit_step_model() {
+        // Step explicitly set its own model -- the cascade must respect that.
+        let mut step = make_step("s1", "Sage", Some("dev"));
+        step.model = Some("explicit/model".to_string());
+        let steps = vec![step];
+        let mut flow = make_flow_with_roles(&[("dev", "Sage")], steps);
+
+        let resolved = vec![ResolvedRole {
+            name: "dev".to_string(),
+            agent: "Sage".to_string(),
+            model: "from/role".to_string(),
+            backend: config::Backend::Api,
+            model_source: "role override".to_string(),
+            backend_source: "role override".to_string(),
+        }];
+
+        apply_resolved_roles_to_steps(&mut flow, &resolved);
+        assert_eq!(flow.steps[0].model.as_deref(), Some("explicit/model"));
+    }
+
+    #[test]
+    fn apply_resolved_roles_skips_steps_without_role() {
+        let steps = vec![make_step("s1", "Direct", None)];
+        let mut flow = make_flow_with_roles(&[], steps);
+
+        let resolved = vec![ResolvedRole {
+            name: "dev".to_string(),
+            agent: "Sage".to_string(),
+            model: "from/role".to_string(),
+            backend: config::Backend::Api,
+            model_source: "role override".to_string(),
+            backend_source: "role override".to_string(),
+        }];
+
+        apply_resolved_roles_to_steps(&mut flow, &resolved);
+        // No mutation: step has no role binding to inherit from.
+        assert!(flow.steps[0].model.is_none());
+        assert!(flow.steps[0].backend.is_none());
     }
 
     #[test]
