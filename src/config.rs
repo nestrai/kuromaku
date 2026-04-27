@@ -1515,4 +1515,180 @@ flow:
             "Documentation should emphasize original requirement verification"
         );
     }
+
+    // ---- rework-pr flow tests ----
+
+    fn rework_pr_raw() -> RawFlowConfig {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+        if !flow_path.exists() {
+            panic!("rework-pr.yaml not found at {}", flow_path.display());
+        }
+        let contents = std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml");
+        serde_yaml::from_str(&contents).expect("failed to parse rework-pr.yaml")
+    }
+
+    fn rework_pr_contents() -> String {
+        let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
+        let flow_path = koto_dir.join("flows/rework-pr.yaml");
+        std::fs::read_to_string(&flow_path).expect("failed to read rework-pr.yaml")
+    }
+
+    /// Verify rework-pr flow has exactly 4 steps: fetch, fix, verify, push.
+    #[test]
+    fn rework_pr_has_four_steps() {
+        let raw = rework_pr_raw();
+        assert_eq!(
+            raw.flow.len(),
+            4,
+            "rework-pr flow should have exactly 4 steps. Got: {}",
+            raw.flow.len()
+        );
+        for step in ["fetch", "fix", "verify", "push"] {
+            assert!(
+                raw.flow.contains_key(step),
+                "rework-pr flow should have '{step}' step"
+            );
+        }
+    }
+
+    /// Verify rework-pr flow uses 'id' placeholder.
+    #[test]
+    fn rework_pr_uses_id_placeholder() {
+        let contents = rework_pr_contents();
+        assert!(
+            contents.contains("{{id}}"),
+            "rework-pr.yaml should use {{{{id}}}} placeholder"
+        );
+        assert!(
+            contents.contains("id=42") || contents.contains("id="),
+            "rework-pr.yaml usage comment should show 'id='"
+        );
+    }
+
+    /// Verify rework-pr flow step dependencies form the expected chain.
+    #[test]
+    fn rework_pr_step_dependencies_are_correct() {
+        let raw = rework_pr_raw();
+
+        let fetch = raw.flow.get("fetch").expect("fetch step");
+        assert!(
+            fetch.input.is_empty(),
+            "fetch step should have no inputs. Got: {:?}",
+            fetch.input
+        );
+
+        let fix = raw.flow.get("fix").expect("fix step");
+        assert_eq!(
+            fix.input,
+            vec!["fetch"],
+            "fix step should depend on [fetch]. Got: {:?}",
+            fix.input
+        );
+
+        let verify = raw.flow.get("verify").expect("verify step");
+        assert!(
+            verify.input.contains(&"fetch".to_string())
+                && verify.input.contains(&"fix".to_string()),
+            "verify step should depend on fetch and fix. Got: {:?}",
+            verify.input
+        );
+
+        let push = raw.flow.get("push").expect("push step");
+        assert_eq!(
+            push.input,
+            vec!["verify"],
+            "push step should depend on [verify]. Got: {:?}",
+            push.input
+        );
+    }
+
+    /// Verify rework-pr flow uses exactly 3 roles: fetcher, developer, verifier.
+    #[test]
+    fn rework_pr_uses_three_roles() {
+        let raw = rework_pr_raw();
+        assert_eq!(
+            raw.roles.len(),
+            3,
+            "rework-pr flow should have exactly 3 roles. Got: {}",
+            raw.roles.len()
+        );
+        for role in ["fetcher", "developer", "verifier"] {
+            assert!(
+                raw.roles.contains_key(role),
+                "rework-pr flow should have '{role}' role"
+            );
+        }
+    }
+
+    /// Verify rework-pr push step has print_output enabled.
+    #[test]
+    fn rework_pr_push_step_has_print_output() {
+        let raw = rework_pr_raw();
+        let push = raw.flow.get("push").expect("push step");
+        assert!(
+            push.print_output,
+            "push step should have print_output: true"
+        );
+    }
+
+    /// Verify rework-pr verify step has print_output enabled so the gate
+    /// decision is visible to the user.
+    #[test]
+    fn rework_pr_verify_step_has_print_output() {
+        let raw = rework_pr_raw();
+        let verify = raw.flow.get("verify").expect("verify step");
+        assert!(
+            verify.print_output,
+            "verify step should have print_output: true so the DONE/INCOMPLETE gate decision is visible"
+        );
+    }
+
+    /// Verify rework-pr fetch step uses `gh api` for inline review comments,
+    /// since `gh pr view --comments` only returns issue-tab comments.
+    #[test]
+    fn rework_pr_fetch_uses_gh_api_for_inline_comments() {
+        let raw = rework_pr_raw();
+        let fetch = raw.flow.get("fetch").expect("fetch step");
+        let task = fetch.task.as_ref().expect("fetch step should have a task");
+        assert!(
+            task.contains("gh api") && task.contains("/pulls/") && task.contains("/comments"),
+            "fetch step should call `gh api repos/.../pulls/{{id}}/comments` for inline review comments. Got: {task}"
+        );
+    }
+
+    /// Verify rework-pr fix step instructs the agent to check out the PR's
+    /// head branch before committing, otherwise fixups land on main.
+    #[test]
+    fn rework_pr_fix_step_checks_out_branch() {
+        let raw = rework_pr_raw();
+        let fix = raw.flow.get("fix").expect("fix step");
+        let task = fix.task.as_ref().expect("fix step should have a task");
+        assert!(
+            task.contains("gh pr checkout"),
+            "fix step should instruct `gh pr checkout` before committing. Got: {task}"
+        );
+    }
+
+    /// Verify rework-pr push step uses the captured branch name, not HEAD.
+    #[test]
+    fn rework_pr_push_uses_branch_variable() {
+        let raw = rework_pr_raw();
+        let push = raw.flow.get("push").expect("push step");
+        let task = push.task.as_ref().expect("push step should have a task");
+        assert!(
+            task.contains("headRefName"),
+            "push step should fetch headRefName. Got: {task}"
+        );
+        assert!(
+            !task.contains("git push origin HEAD"),
+            "push step must not push HEAD -- it should push the captured branch name. Got: {task}"
+        );
+        assert!(
+            task.contains("git push origin \"$branch\"")
+                || task.contains("git push origin $branch")
+                || task.contains("git push origin {{headRefName}}"),
+            "push step should push to the captured branch name. Got: {task}"
+        );
+    }
 }
