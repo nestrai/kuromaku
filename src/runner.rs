@@ -4,6 +4,7 @@ use std::time::Instant;
 
 use crate::config::{Agent, Backend, Step};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed};
+use crate::koto_config::Seeds;
 use crate::llm::{self, LlmRequest, Message, Role};
 use crate::skills;
 use crate::stack::{self, StepOutput};
@@ -95,30 +96,73 @@ fn auto_output_filename(flow_name: &str, step_id: &str, agent_name: &str) -> Str
     format!("{flow_name}-{ts}-{step_id}-{agent_name}.md")
 }
 
-/// Load `.koto/Guide.md` if it exists.
+/// Load `.koto/Guide.md` if it exists. Test-only single-dir variant; the
+/// production loader is [`load_guide_from_seeds`].
+#[cfg(test)]
 pub fn load_guide(koto_dir: &Path) -> Option<String> {
     let guide_path = koto_dir.join("Guide.md");
     std::fs::read_to_string(&guide_path).ok()
 }
 
+/// Load `Guide.md` from the first seed that has it. Returns `None` when no
+/// seed contains a Guide -- callers treat the guide as optional context.
+///
+/// Errors only when the seed walk hits a remote seed (issue #130 v1 limit).
+pub fn load_guide_from_seeds(seeds: &Seeds) -> Result<Option<String>, RunError> {
+    let rel = std::path::Path::new("Guide.md");
+    match seeds.find(rel) {
+        Ok(Some((_, path))) => Ok(std::fs::read_to_string(&path).ok()),
+        Ok(None) => Ok(None),
+        Err(e) => Err(RunError::RulesNotFound(e.message())),
+    }
+}
+
 /// Pre-load rules files for all agents that reference them.
-/// Returns a map from rules name -> content.
+/// Test-only single-dir variant; the production loader is
+/// [`load_rules_for_agents_with_seeds`].
+#[cfg(test)]
 pub fn load_rules_for_agents(
     agents: &[Agent],
     koto_dir: &Path,
 ) -> Result<HashMap<String, String>, RunError> {
+    let seeds = Seeds {
+        seeds: vec![crate::koto_config::Seed {
+            source: crate::koto_config::SeedSource::Local {
+                display: koto_dir.display().to_string(),
+                path: koto_dir.to_path_buf(),
+            },
+        }],
+    };
+    load_rules_for_agents_with_seeds(agents, &seeds)
+}
+
+/// Pre-load rules files for all agents, resolving each rule through the seed
+/// list. First match wins, so a project-level seed can override a rule shipped
+/// with a downstream seed.
+///
+/// Errors when a referenced rule isn't found in any seed -- the message lists
+/// every seed that was searched so the user can fix the typo or add a seed.
+pub fn load_rules_for_agents_with_seeds(
+    agents: &[Agent],
+    seeds: &Seeds,
+) -> Result<HashMap<String, String>, RunError> {
     let mut cache: HashMap<String, String> = HashMap::new();
-    let rules_dir = koto_dir.join("rules");
 
     for agent in agents {
         for rules_name in &agent.rules {
             if cache.contains_key(rules_name) {
                 continue;
             }
-            let rules_path = rules_dir.join(format!("{rules_name}.md"));
+            let rel = std::path::Path::new("rules").join(format!("{rules_name}.md"));
+            let (_idx, rules_path) = seeds
+                .find(&rel)
+                .map_err(|e| RunError::RulesNotFound(e.message()))?
+                .ok_or_else(|| {
+                    RunError::RulesNotFound(seeds.not_found_message("rules", rules_name))
+                })?;
             let content = std::fs::read_to_string(&rules_path).map_err(|_| {
                 RunError::RulesNotFound(format!(
-                    "rules file '{}' not found (expected at {})",
+                    "rules file '{}' could not be read (path: {})",
                     rules_name,
                     rules_path.display()
                 ))

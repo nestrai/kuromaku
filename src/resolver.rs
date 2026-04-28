@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 
 use crate::config::{Backend, FlowConfig};
-use crate::koto_config::{KotoBackend, KotoConfig, KotoRole};
+use crate::koto_config::{KotoBackend, KotoConfig, KotoRole, Seeds};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
@@ -66,6 +66,10 @@ pub struct ResolvedRole {
     pub model_source: String,
     /// Where the backend value came from.
     pub backend_source: String,
+    /// Display string of the seed the agent file was loaded from, when known.
+    /// `None` for callers that don't track seeds (e.g. the legacy single-dir
+    /// path). The audit prints this as `<- <seed-display>` when present.
+    pub seed_origin: Option<String>,
 }
 
 // --- Override parsing ---
@@ -307,6 +311,7 @@ pub fn resolve_role(
         backend,
         model_source,
         backend_source,
+        seed_origin: None,
     })
 }
 
@@ -314,11 +319,22 @@ pub fn resolve_role(
 ///
 /// Format mirrors the issue's example with one block per role. We sort by role
 /// name so the output is stable across runs.
-pub fn print_audit(resolved: &[ResolvedRole], cli_vars: &HashMap<String, String>) {
+pub fn print_audit(seeds: &Seeds, resolved: &[ResolvedRole], cli_vars: &HashMap<String, String>) {
+    // Seeds line first -- the user sees the search order before any role-level
+    // detail. We always print it (even with the implicit `.koto/` default) so
+    // the audit makes the resolution path explicit.
+    eprintln!("[resolve] seeds: {}", seeds.audit_line());
+
     let mut sorted: Vec<&ResolvedRole> = resolved.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
     for r in sorted {
-        eprintln!("[resolve] {}: {}", r.name, r.agent);
+        // Append `<- <seed-display>` when we know which seed produced the
+        // agent file. Direct-agent steps don't go through this path; their
+        // origin doesn't appear in the audit (matches issue #130 example).
+        match &r.seed_origin {
+            Some(origin) => eprintln!("[resolve] {}: {} <- {}", r.name, r.agent, origin),
+            None => eprintln!("[resolve] {}: {}", r.name, r.agent),
+        }
         eprintln!("           model: {} ({})", r.model, r.model_source);
         eprintln!(
             "           backend: {} ({})",

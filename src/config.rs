@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::koto_config::KotoConfig;
+use crate::koto_config::{KotoConfig, Seeds};
 
 // --- Errors ---
 
@@ -254,44 +254,93 @@ pub fn parse_role_names(contents: &str) -> Result<HashSet<String>, ConfigError> 
     Ok(raw.roles.keys().cloned().collect())
 }
 
-/// Load a single agent file from .koto/agents/<agent_id>.yaml.
-///
-/// `koto_config` is the optional project-level config. When present and the
-/// agent declares a `tier:` field, the tier is resolved to a concrete
-/// `<provider>/<model-id>` string. When absent and a tier is declared, this
-/// returns a validation error -- a tier-bound agent cannot be used without
-/// a tiers map.
+/// Load a single agent file from a single `.koto/` directory. Test-only
+/// convenience wrapper -- internally builds a single-seed list and delegates
+/// to [`load_agent_file_with_seeds`]. Production callers should construct a
+/// [`Seeds`] up front (run_up/run_task already do).
+#[cfg(test)]
 pub fn load_agent_file(
     koto_dir: &Path,
     agent_id: &str,
     defaults: &Defaults,
     koto_config: Option<&KotoConfig>,
 ) -> Result<Agent, ConfigError> {
-    let path = koto_dir.join("agents").join(format!("{agent_id}.yaml"));
-    if !path.exists() {
-        return Err(ConfigError::Validation(format!(
-            "agent file not found: {} (expected at {})",
-            agent_id,
-            path.display()
-        )));
-    }
+    let seeds = Seeds {
+        seeds: vec![crate::koto_config::Seed {
+            source: crate::koto_config::SeedSource::Local {
+                display: koto_dir.display().to_string(),
+                path: koto_dir.to_path_buf(),
+            },
+        }],
+    };
+    let (agent, _origin_seed) =
+        load_agent_file_with_seeds(&seeds, agent_id, defaults, koto_config)?;
+    Ok(agent)
+}
+
+/// Load a single agent file via the seed list.
+///
+/// Walks the configured seeds top-to-bottom and reads the first
+/// `agents/<agent_id>.yaml` it finds. Returns the loaded [`Agent`] together
+/// with the index of the seed it came from -- callers use that for the
+/// resolution audit ("loaded from seed X").
+///
+/// Agent IDs may contain `/` (e.g. `coding/rust/Sage`); each path segment is
+/// pushed onto the seed's `agents/` directory using `PathBuf::push` so the
+/// lookup is cross-platform safe.
+///
+/// `koto_config` is the optional project-level config. When present and the
+/// agent declares a `tier:` field, the tier resolves to a concrete
+/// `<provider>/<model-id>` string. When absent and a tier is declared, this
+/// returns a validation error -- a tier-bound agent cannot be used without
+/// a tiers map.
+pub fn load_agent_file_with_seeds(
+    seeds: &Seeds,
+    agent_id: &str,
+    defaults: &Defaults,
+    koto_config: Option<&KotoConfig>,
+) -> Result<(Agent, usize), ConfigError> {
+    let rel = agent_rel_path(agent_id);
+    let (seed_idx, path) = seeds
+        .find(&rel)
+        .map_err(|e| ConfigError::Validation(e.message()))?
+        .ok_or_else(|| ConfigError::Validation(seeds.not_found_message("agent", agent_id)))?;
+
     let contents = std::fs::read_to_string(&path)?;
     let raw: RawAgentFile = serde_yaml::from_str(&contents)?;
     warn_unknown_fields(&format!("agent file '{agent_id}'"), &raw.unknown);
 
     let model = resolve_agent_model(&raw, defaults, koto_config)?;
 
-    Ok(Agent {
-        id: agent_id.to_string(),
-        name: raw.name,
-        title: raw.title,
-        role: raw.role,
-        model,
-        backend: raw.backend.unwrap_or(defaults.backend),
-        rules: raw.rules,
-        skills: raw.skills,
-        env: raw.env,
-    })
+    Ok((
+        Agent {
+            id: agent_id.to_string(),
+            name: raw.name,
+            title: raw.title,
+            role: raw.role,
+            model,
+            backend: raw.backend.unwrap_or(defaults.backend),
+            rules: raw.rules,
+            skills: raw.skills,
+            env: raw.env,
+        },
+        seed_idx,
+    ))
+}
+
+/// Build the relative path for an agent ID, splitting on `/` so nested
+/// agent IDs (`coding/rust/Sage`) resolve to `agents/coding/rust/Sage.yaml`.
+/// The split-and-push approach keeps the lookup portable -- on Windows the
+/// resulting `PathBuf` uses native separators.
+fn agent_rel_path(agent_id: &str) -> PathBuf {
+    let parts: Vec<&str> = agent_id.split('/').collect();
+    let last = parts.last().copied().unwrap_or("");
+    let mut p = PathBuf::from("agents");
+    for part in parts.iter().take(parts.len().saturating_sub(1)) {
+        p.push(part);
+    }
+    p.push(format!("{last}.yaml"));
+    p
 }
 
 /// Resolve the model string for an agent.
@@ -321,23 +370,29 @@ fn resolve_agent_model(
     }
 }
 
-/// Load all agents referenced by the flow steps.
-pub fn load_agents_for_flow(
-    koto_dir: &Path,
+/// Load all agents referenced by the flow steps, walking the configured seed
+/// list. Returns the loaded agents in step order plus a parallel map from
+/// agent ID to the seed index it came from -- the audit prints that map so the
+/// user can see overlay decisions at a glance.
+pub fn load_agents_for_flow_with_seeds(
+    seeds: &Seeds,
     config: &FlowConfig,
     koto_config: Option<&KotoConfig>,
-) -> Result<Vec<Agent>, ConfigError> {
+) -> Result<(Vec<Agent>, HashMap<String, usize>), ConfigError> {
     let mut agents: Vec<Agent> = Vec::new();
+    let mut origins: HashMap<String, usize> = HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for step in &config.steps {
         if seen.insert(step.agent.clone()) {
-            let agent = load_agent_file(koto_dir, &step.agent, &config.defaults, koto_config)?;
+            let (agent, seed_idx) =
+                load_agent_file_with_seeds(seeds, &step.agent, &config.defaults, koto_config)?;
+            origins.insert(agent.id.clone(), seed_idx);
             agents.push(agent);
         }
     }
 
-    Ok(agents)
+    Ok((agents, origins))
 }
 
 fn warn_unknown_fields(context: &str, fields: &HashMap<String, serde_yaml::Value>) {
@@ -1014,8 +1069,13 @@ tiers:
             model: "m".to_string(),
             backend: Backend::ClaudeCli,
         };
+        // The seed-aware loader reports the missing agent and the seeds
+        // it searched. The single-dir wrapper used here yields one searched
+        // path -- the temp dir.
         let err = load_agent_file(dir.path(), "ghost", &defaults, None).unwrap_err();
-        assert!(err.to_string().contains("agent file not found"));
+        let msg = err.to_string();
+        assert!(msg.contains("agent \"ghost\" not found"), "got: {msg}");
+        assert!(msg.contains("seeds:"), "got: {msg}");
     }
 
     #[test]
@@ -2127,5 +2187,176 @@ flow:
             "push step should require at least one fixup! commit ahead of origin. Got: {}",
             task
         );
+    }
+
+    // --- multi-source agent lookup (issue #130) ---
+
+    use crate::koto_config::{Seed, SeedSource, Seeds};
+
+    /// Helper: build a [`Seeds`] from a list of local directories.
+    fn local_seeds(dirs: &[&Path]) -> Seeds {
+        Seeds {
+            seeds: dirs
+                .iter()
+                .map(|d| Seed {
+                    source: SeedSource::Local {
+                        display: d.display().to_string(),
+                        path: d.to_path_buf(),
+                    },
+                })
+                .collect(),
+        }
+    }
+
+    /// Helper: write a minimal agent YAML at `<seed>/agents/<rel>.yaml`.
+    fn write_agent(seed: &Path, rel: &str, name: &str) {
+        let path = seed.join("agents").join(format!("{rel}.yaml"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            format!("name: {name}\nrole: \"do work\"\nmodel: claude-sonnet-4-5\n"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn agent_lookup_walks_seeds_top_to_bottom() {
+        // First seed wins: when both seeds define the same agent, the upstream
+        // copy is loaded.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        write_agent(dir1.path(), "Sage", "Sage-from-1");
+        write_agent(dir2.path(), "Sage", "Sage-from-2");
+
+        let seeds = local_seeds(&[dir1.path(), dir2.path()]);
+        let defaults = Defaults {
+            model: "default-model".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let (agent, idx) = load_agent_file_with_seeds(&seeds, "Sage", &defaults, None).unwrap();
+
+        assert_eq!(idx, 0);
+        assert_eq!(agent.name, "Sage-from-1");
+    }
+
+    #[test]
+    fn agent_lookup_falls_through_to_later_seed() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        write_agent(dir2.path(), "Bella", "Bella-from-2");
+
+        let seeds = local_seeds(&[dir1.path(), dir2.path()]);
+        let defaults = Defaults {
+            model: "default-model".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let (agent, idx) = load_agent_file_with_seeds(&seeds, "Bella", &defaults, None).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(agent.name, "Bella-from-2");
+    }
+
+    #[test]
+    fn agent_lookup_supports_arbitrary_depth_path() {
+        // `coding/rust/Sage` -> `agents/coding/rust/Sage.yaml`. No globbing,
+        // no recursive scan -- just path join, as specified in the issue.
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(dir.path(), "coding/rust/Sage", "RustSage");
+
+        let seeds = local_seeds(&[dir.path()]);
+        let defaults = Defaults {
+            model: "default-model".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let (agent, _) =
+            load_agent_file_with_seeds(&seeds, "coding/rust/Sage", &defaults, None).unwrap();
+        assert_eq!(agent.name, "RustSage");
+        // The agent ID retains the full nested form.
+        assert_eq!(agent.id, "coding/rust/Sage");
+    }
+
+    #[test]
+    fn agent_lookup_missing_lists_searched_paths() {
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let seeds = local_seeds(&[dir1.path(), dir2.path()]);
+        let defaults = Defaults {
+            model: "m".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let err =
+            load_agent_file_with_seeds(&seeds, "coding/rust/Sage", &defaults, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("agent \"coding/rust/Sage\" not found"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains(&dir1.path().display().to_string()),
+            "missing dir1 in error: {msg}"
+        );
+        assert!(
+            msg.contains(&dir2.path().display().to_string()),
+            "missing dir2 in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_agents_for_flow_records_seed_origins() {
+        // Two-seed setup: the flow uses two agents; one comes from the upper
+        // seed, the other from the lower. The origins map records exactly one
+        // index per agent.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        write_agent(dir1.path(), "Alpha", "Alpha");
+        write_agent(dir2.path(), "Beta", "Beta");
+
+        let seeds = local_seeds(&[dir1.path(), dir2.path()]);
+
+        let flow_yaml = r#"
+version: "1"
+name: t
+flow:
+  s1:
+    agent: Alpha
+  s2:
+    agent: Beta
+"#;
+        let flow = load_flow_from_str(flow_yaml).unwrap();
+        let (agents, origins) = load_agents_for_flow_with_seeds(&seeds, &flow, None).unwrap();
+
+        assert_eq!(agents.len(), 2);
+        assert_eq!(*origins.get("Alpha").unwrap(), 0);
+        assert_eq!(*origins.get("Beta").unwrap(), 1);
+    }
+
+    #[test]
+    fn agent_lookup_overlay_wins_for_first_seed() {
+        // Overlay semantics: whole-file replacement, never field-level merge.
+        // Both agents have the same ID `Sage` but different model values; the
+        // resolved Agent must mirror seed 1 entirely.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir_all(dir1.path().join("agents")).unwrap();
+        std::fs::create_dir_all(dir2.path().join("agents")).unwrap();
+        std::fs::write(
+            dir1.path().join("agents/Sage.yaml"),
+            "name: Sage\nrole: r\nmodel: from-seed-1\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir2.path().join("agents/Sage.yaml"),
+            "name: Sage\nrole: r\nmodel: from-seed-2\n",
+        )
+        .unwrap();
+
+        let seeds = local_seeds(&[dir1.path(), dir2.path()]);
+        let defaults = Defaults {
+            model: "fallback".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let (agent, idx) = load_agent_file_with_seeds(&seeds, "Sage", &defaults, None).unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(agent.model, "from-seed-1");
     }
 }
