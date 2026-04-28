@@ -119,6 +119,10 @@ pub struct RawStep {
     pub agent: Option<String>,
     pub role: Option<String>,
     pub task: Option<String>,
+    /// Shell command to execute via `sh -c` instead of calling an LLM. When
+    /// set, the step is a shell step: `agent`, `role`, `task`, `model`, and
+    /// `backend` must not be set. stdout is captured as the step output.
+    pub run: Option<String>,
     #[serde(default)]
     pub input: Vec<String>,
     #[serde(default)]
@@ -198,17 +202,33 @@ pub struct Agent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Step {
     pub id: String,
+    /// Agent ID for LLM-backed steps. Empty string for shell steps (where
+    /// `run` is `Some`). Use [`Step::is_shell`] to discriminate; never
+    /// assume non-empty.
     pub agent: String,
     /// Role name when the step uses `role:` instead of a direct `agent:`.
-    /// `None` for direct agent assignment. Drives the role cascade in #129.
+    /// `None` for direct agent assignment or shell steps. Drives the role
+    /// cascade in #129.
     pub role: Option<String>,
     pub task: Option<String>,
+    /// Shell command for `run:` steps. `None` for LLM-backed steps. When
+    /// `Some`, the step bypasses agent/LLM logic entirely: the runner
+    /// executes the command via `sh -c`, captures stdout as the output, and
+    /// stops the flow on non-zero exit.
+    pub run: Option<String>,
     pub input: Vec<String>,
     pub needs: Vec<String>,
     pub model: Option<String>,
     pub backend: Option<Backend>,
     pub print_output: bool,
     pub post_comment: Option<PostCommentTarget>,
+}
+
+impl Step {
+    /// True when this step is a shell step (has `run:` instead of `agent:`).
+    pub fn is_shell(&self) -> bool {
+        self.run.is_some()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -403,6 +423,11 @@ pub fn load_agents_for_flow_with_seeds(
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for step in &config.steps {
+        // Shell steps (issue #23) have no agent. Skip the load so we don't
+        // try to resolve an empty path under `agents/`.
+        if step.is_shell() {
+            continue;
+        }
         if seen.insert(step.agent.clone()) {
             let (agent, seed_idx) =
                 load_agent_file_with_seeds(seeds, &step.agent, &config.defaults, koto_config)?;
@@ -502,79 +527,132 @@ fn validate_and_resolve(
         .flow
         .into_iter()
         .map(|(id, s)| {
-            // Validate: exactly one of agent or role must be set
-            match (&s.agent, &s.role) {
-                (Some(_), Some(_)) => Err(ConfigError::Validation(format!(
-                    "step '{id}' has both 'agent' and 'role' -- use one or the other"
-                ))),
-                (None, None) => Err(ConfigError::Validation(format!(
-                    "step '{id}' must specify either 'agent' or 'role'"
-                ))),
-                (Some(agent_id), None) => {
-                    // Direct agent assignment -- bypass roles
-                    let mut needs: Vec<String> = s.needs;
-                    for input_dep in &s.input {
-                        if !needs.contains(input_dep) {
-                            needs.push(input_dep.clone());
-                        }
-                    }
-                    Ok(Step {
-                        id,
-                        agent: agent_id.clone(),
-                        role: None,
-                        task: s.task,
-                        input: s.input,
-                        needs,
-                        model: s.model,
-                        backend: s.backend,
-                        print_output: s.print_output,
-                        post_comment: s.post_comment,
-                    })
+            // Exactly one of `agent`, `role`, `run` must be set. Listing each
+            // present field in the error makes the conflict obvious instead of
+            // forcing the user to guess which two collided.
+            let mut kinds: Vec<&str> = Vec::new();
+            if s.agent.is_some() {
+                kinds.push("agent");
+            }
+            if s.role.is_some() {
+                kinds.push("role");
+            }
+            if s.run.is_some() {
+                kinds.push("run");
+            }
+            match kinds.len() {
+                0 => {
+                    return Err(ConfigError::Validation(format!(
+                        "step '{id}' must specify one of 'agent', 'role', or 'run'"
+                    )));
                 }
-                (None, Some(role_name)) => {
-                    // Resolve role to agent ID. Flow-level roles win over
-                    // project-level (koto.yaml) roles; project-level acts as
-                    // the inherited default so a flow can omit roles it does
-                    // not need to override.
-                    if !resolved_roles.contains_key(role_name)
-                        && let Some(project_agent) = project_roles.get(role_name)
-                    {
-                        resolved_roles.insert(role_name.clone(), project_agent.clone());
-                    }
-                    let agent_id = resolved_roles.get(role_name).ok_or_else(|| {
-                        let mut available: Vec<&str> = resolved_roles
-                            .keys()
-                            .map(|s| s.as_str())
-                            .chain(project_roles.keys().map(|s| s.as_str()))
-                            .collect();
-                        available.sort();
-                        available.dedup();
-                        ConfigError::Validation(format!(
-                            "step '{id}' references undefined role '{role_name}' (available: {})",
-                            available.join(", ")
-                        ))
-                    })?;
-
-                    let mut needs: Vec<String> = s.needs;
-                    for input_dep in &s.input {
-                        if !needs.contains(input_dep) {
-                            needs.push(input_dep.clone());
-                        }
-                    }
-                    Ok(Step {
-                        id,
-                        agent: agent_id.clone(),
-                        role: Some(role_name.clone()),
-                        task: s.task,
-                        input: s.input,
-                        needs,
-                        model: s.model,
-                        backend: s.backend,
-                        print_output: s.print_output,
-                        post_comment: s.post_comment,
-                    })
+                1 => {}
+                _ => {
+                    return Err(ConfigError::Validation(format!(
+                        "step '{id}' has conflicting fields {kinds:?} -- use exactly one of 'agent', 'role', or 'run'"
+                    )));
                 }
             }
+
+            // Build the merged `needs` list once -- both LLM and shell steps
+            // treat `input:` as an ordering edge in addition to its prompt
+            // semantics (shell steps ignore the prompt side).
+            let mut needs: Vec<String> = s.needs.clone();
+            for input_dep in &s.input {
+                if !needs.contains(input_dep) {
+                    needs.push(input_dep.clone());
+                }
+            }
+
+            if let Some(run_command) = s.run {
+                // Shell step: reject fields that have no meaning for shell
+                // execution. We don't silently drop them -- the user almost
+                // certainly intended an LLM step and got the type wrong.
+                if s.task.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "step '{id}' uses 'run' and cannot also set 'task' -- the shell command is the task"
+                    )));
+                }
+                if s.model.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "step '{id}' uses 'run' and cannot set 'model' -- shell steps don't call an LLM"
+                    )));
+                }
+                if s.backend.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "step '{id}' uses 'run' and cannot set 'backend' -- shell steps don't call an LLM"
+                    )));
+                }
+                return Ok(Step {
+                    id,
+                    agent: String::new(),
+                    role: None,
+                    task: None,
+                    run: Some(run_command),
+                    input: s.input,
+                    needs,
+                    model: None,
+                    backend: None,
+                    print_output: s.print_output,
+                    post_comment: s.post_comment,
+                });
+            }
+
+            if let Some(agent_id) = s.agent {
+                // Direct agent assignment -- bypass roles
+                return Ok(Step {
+                    id,
+                    agent: agent_id,
+                    role: None,
+                    task: s.task,
+                    run: None,
+                    input: s.input,
+                    needs,
+                    model: s.model,
+                    backend: s.backend,
+                    print_output: s.print_output,
+                    post_comment: s.post_comment,
+                });
+            }
+
+            // Role path -- only remaining case after the kind check above.
+            let role_name = s.role.expect("role must be Some after kind check");
+            // Resolve role to agent ID. Flow-level roles win over
+            // project-level (koto.yaml) roles; project-level acts as
+            // the inherited default so a flow can omit roles it does
+            // not need to override.
+            if !resolved_roles.contains_key(&role_name)
+                && let Some(project_agent) = project_roles.get(&role_name)
+            {
+                resolved_roles.insert(role_name.clone(), project_agent.clone());
+            }
+            let agent_id = resolved_roles.get(&role_name).ok_or_else(|| {
+                let mut available: Vec<&str> = resolved_roles
+                    .keys()
+                    .map(|s| s.as_str())
+                    .chain(project_roles.keys().map(|s| s.as_str()))
+                    .collect();
+                available.sort();
+                available.dedup();
+                ConfigError::Validation(format!(
+                    "step '{id}' references undefined role '{role_name}' (available: {})",
+                    available.join(", ")
+                ))
+            })?;
+
+            Ok(Step {
+                id,
+                agent: agent_id.clone(),
+                role: Some(role_name),
+                task: s.task,
+                run: None,
+                input: s.input,
+                needs,
+                model: s.model,
+                backend: s.backend,
+                print_output: s.print_output,
+                post_comment: s.post_comment,
+            })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -1295,10 +1373,10 @@ flow:
     role: coder
 "#;
         let err = load_flow_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("both 'agent' and 'role'"),
-            "got: {}",
-            err
+            msg.contains("conflicting fields") && msg.contains("agent") && msg.contains("role"),
+            "got: {msg}"
         );
     }
 
@@ -1314,7 +1392,7 @@ flow:
         let err = load_flow_from_str(yaml).unwrap_err();
         assert!(
             err.to_string()
-                .contains("must specify either 'agent' or 'role'"),
+                .contains("must specify one of 'agent', 'role', or 'run'"),
             "got: {}",
             err
         );
@@ -2449,5 +2527,193 @@ flow:
         let (agent, idx) = load_agent_file_with_seeds(&seeds, "Sage", &defaults, None).unwrap();
         assert_eq!(idx, 0);
         assert_eq!(agent.model, "from-seed-1");
+    }
+
+    // --- Shell steps (issue #23) ---
+
+    #[test]
+    fn run_step_parses_basic() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  fetch:
+    run: echo hello
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps.len(), 1);
+        let step = &config.steps[0];
+        assert_eq!(step.id, "fetch");
+        assert!(step.is_shell());
+        assert_eq!(step.run.as_deref(), Some("echo hello"));
+        assert_eq!(step.agent, "");
+        assert!(step.role.is_none());
+    }
+
+    #[test]
+    fn run_step_with_input_creates_dependency() {
+        // Acceptance: shell steps participate in DAG validation. The `input:`
+        // field on a shell step should still produce a `needs:` edge.
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  fetch:
+    run: echo hi
+  follow:
+    run: echo bye
+    input: [fetch]
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        let follow = &config.steps[1];
+        assert_eq!(follow.input, vec!["fetch"]);
+        assert!(follow.needs.contains(&"fetch".to_string()));
+    }
+
+    #[test]
+    fn run_step_mixed_with_agent_step_in_same_flow() {
+        // Acceptance: shell steps coexist with LLM steps; the example in the
+        // issue mixes them. Output of the shell step is consumed via input:.
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  fetch:
+    run: gh pr diff 67
+  review:
+    agent: Levi
+    input: [fetch]
+    task: "Evaluate the diff"
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps.len(), 2);
+        assert!(config.steps[0].is_shell());
+        assert!(!config.steps[1].is_shell());
+        assert_eq!(config.steps[1].agent, "Levi");
+    }
+
+    #[test]
+    fn run_and_agent_together_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  bad:
+    run: echo hi
+    agent: Levi
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflicting fields") && msg.contains("agent") && msg.contains("run"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_and_role_together_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+roles:
+  coder: { default: Kai }
+flow:
+  bad:
+    run: echo hi
+    role: coder
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("conflicting fields") && msg.contains("role") && msg.contains("run"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn run_with_task_errors() {
+        // task: only makes sense for LLM steps -- the run command itself is
+        // the task description for shell steps.
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  bad:
+    run: echo hi
+    task: "do something"
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot also set 'task'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_with_model_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  bad:
+    run: echo hi
+    model: claude-opus-4-5
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("cannot set 'model'"), "got: {err}");
+    }
+
+    #[test]
+    fn run_with_backend_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  bad:
+    run: echo hi
+    backend: api
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("cannot set 'backend'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn run_step_skipped_in_agent_loading() {
+        // Shell steps must not be looked up in agents/. Without this guard,
+        // an empty-string agent ID would cause a path-traversal-like lookup.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Levi.yaml"),
+            "name: Levi\nrole: architect\n",
+        )
+        .unwrap();
+
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  fetch:
+    run: echo hi
+  review:
+    agent: Levi
+    input: [fetch]
+"#;
+        let flow = load_flow_from_str(yaml).unwrap();
+        let seeds = Seeds {
+            seeds: vec![crate::koto_config::Seed {
+                source: crate::koto_config::SeedSource::Local {
+                    display: dir.path().display().to_string(),
+                    path: dir.path().to_path_buf(),
+                },
+            }],
+        };
+        let (agents, _) = load_agents_for_flow_with_seeds(&seeds, &flow, None).unwrap();
+        assert_eq!(agents.len(), 1, "shell step must not produce an agent load");
+        assert_eq!(agents[0].id, "Levi");
     }
 }

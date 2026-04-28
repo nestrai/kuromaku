@@ -90,10 +90,14 @@ pub enum RunError {
 }
 
 /// Result of running a single step, used for the summary table.
+///
+/// `backend` is a string rather than the [`Backend`] enum so shell steps
+/// (issue #23) can report `"shell"` without polluting the LLM-backend enum.
+#[derive(Debug)]
 pub struct StepRunResult {
     pub step_id: String,
     pub agent_name: String,
-    pub backend: Backend,
+    pub backend: String,
     pub duration: std::time::Duration,
     pub tokens_in: Option<u32>,
     pub tokens_out: Option<u32>,
@@ -106,6 +110,17 @@ fn auto_output_filename(flow_name: &str, step_id: &str, agent_name: &str) -> Str
     let now = chrono::Local::now();
     let ts = now.format("%Y%m%d-%H%M");
     format!("{flow_name}-{ts}-{step_id}-{agent_name}.md")
+}
+
+/// Output filename for shell steps: `<flow>-<timestamp>-<step>-shell.txt`.
+///
+/// Uses `.txt` rather than `.md` because shell stdout isn't markdown -- a
+/// downstream `print_output: true` would render terminal escapes through
+/// termimad otherwise.
+fn shell_output_filename(flow_name: &str, step_id: &str) -> String {
+    let now = chrono::Local::now();
+    let ts = now.format("%Y%m%d-%H%M");
+    format!("{flow_name}-{ts}-{step_id}-shell.txt")
 }
 
 /// Load `.koto/Guide.md` if it exists. Test-only single-dir variant; the
@@ -322,6 +337,179 @@ async fn run_step_via_api(
     Ok((response.content, response.usage))
 }
 
+/// Execute a shell step (`run:` instead of `agent:`).
+///
+/// Spawns the rendered command via `sh -c` through the local executor:
+/// stdout becomes the step output (saved to the stack and to a `.txt`
+/// artifact), stderr is surfaced to the user via stderr regardless of exit
+/// code, and a non-zero exit aborts the flow with a [`RunError::ExecutorFailed`]
+/// that includes both the exit code and stderr (acceptance criteria, issue #23).
+///
+/// `prior_results` is read-only -- shell steps care about it only when
+/// `post_comment:` is set, to label the comment header with input-step agent
+/// names like the LLM-step path does.
+async fn run_shell_step(
+    executor: &dyn ExecutorBoxed,
+    step: &Step,
+    ctx: &RunContext,
+    step_num: usize,
+    total: usize,
+    prior_results: &[StepRunResult],
+) -> Result<StepRunResult, RunError> {
+    let command = step
+        .run
+        .as_deref()
+        .expect("run_shell_step called on non-shell step");
+
+    ui::print_shell_step_banner(step_num, total, &step.id, command, &step.input);
+
+    // Pre-compute and announce the output path so users can `tail -f` it
+    // even if the command takes a while.
+    let output_file = shell_output_filename(&ctx.flow_name, &step.id);
+    let output_path = ctx.stack_path.join(&output_file);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    eprintln!(
+        "      output: {}",
+        output_path
+            .canonicalize()
+            .unwrap_or(output_path.clone())
+            .display()
+    );
+
+    let start = Instant::now();
+    let spinner = ui::start_spinner();
+
+    // Build a unique task ID, mirroring run_step_via_executor so log/process
+    // listings stay consistent across step types.
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let short_id = &chrono::Utc::now().timestamp_millis().to_string()[8..];
+    let task_id = format!(
+        "koto-{project}-{}-{}-{short_id}-shell",
+        ctx.flow_name, step.id
+    );
+
+    let task = ExecutionTask {
+        id: task_id,
+        command: command.to_string(),
+        env: HashMap::new(),
+    };
+
+    let handle = executor
+        .spawn_boxed(task)
+        .await
+        .map_err(|e| RunError::ExecutorFailed {
+            step: step.id.clone(),
+            source: e,
+        })?;
+
+    let exec_output = executor
+        .wait_boxed(&handle)
+        .await
+        .map_err(|e| RunError::ExecutorFailed {
+            step: step.id.clone(),
+            source: e,
+        })?;
+
+    spinner.stop();
+    let duration = start.elapsed();
+
+    // Surface stderr to the user even on success. Acceptance criterion:
+    // "stderr is shown to the user but not captured as output". On failure
+    // the executor already includes stderr in the error message.
+    if !exec_output.stderr.is_empty() {
+        eprintln!("{}", exec_output.stderr.trim_end());
+    }
+
+    let stdout = exec_output.stdout;
+
+    // Write to stack: agent_id is empty (no agent), model is "shell" so
+    // downstream tooling can tell shell steps apart.
+    let timestamp = chrono::Utc::now().to_rfc3339();
+    let step_output = StepOutput {
+        step_id: step.id.clone(),
+        agent_id: String::new(),
+        model: "shell".to_string(),
+        prompt: command.to_string(),
+        response: stdout.clone(),
+        timestamp,
+    };
+    stack::write_step(&ctx.stack_path, &step_output).map_err(|e| RunError::Stack {
+        step: step.id.clone(),
+        source: e,
+    })?;
+
+    std::fs::write(&output_path, &stdout).map_err(|e| RunError::Stack {
+        step: step.id.clone(),
+        source: stack::StackError::Write(e),
+    })?;
+
+    let display_path = output_path
+        .canonicalize()
+        .unwrap_or(output_path.clone())
+        .display()
+        .to_string();
+    // Tokens are intentionally "—" for shell steps -- acceptance criterion
+    // "report zero tokens and no model in the summary table". Reusing
+    // print_step_done keeps the visual cadence consistent with LLM steps.
+    ui::print_step_done(&format_duration(duration), "—", "—", &display_path);
+
+    // post_comment is allowed on shell steps too -- e.g. post a `gh pr diff`
+    // result back as a comment. Soft-fails like the LLM path.
+    if let Some(target) = step.post_comment {
+        let input_agents: Vec<&str> = step
+            .input
+            .iter()
+            .filter_map(|input_id| {
+                prior_results
+                    .iter()
+                    .find(|r| r.step_id == *input_id)
+                    .map(|r| r.agent_name.as_str())
+            })
+            .collect();
+        let outcome = github::try_post_step_comment(
+            target,
+            "shell",
+            &stdout,
+            &input_agents,
+            &ctx.template_vars,
+            &ctx.poster,
+        );
+        match outcome {
+            PostOutcome::Posted { kind, number } => {
+                eprintln!("      posted comment on {kind} #{number}");
+            }
+            PostOutcome::NoIdProvided => {
+                eprintln!(
+                    "warning: step '{}' declares post_comment but no 'id' template var was provided",
+                    step.id
+                );
+            }
+            PostOutcome::Failed { error } => {
+                eprintln!(
+                    "warning: step '{}' failed to post comment: {error}",
+                    step.id
+                );
+            }
+        }
+    }
+
+    Ok(StepRunResult {
+        step_id: step.id.clone(),
+        agent_name: "shell".to_string(),
+        backend: "shell".to_string(),
+        duration,
+        tokens_in: None,
+        tokens_out: None,
+        output_file,
+        print_output: step.print_output,
+    })
+}
+
 /// Run steps sequentially in topological order.
 pub async fn run_steps(
     steps: &[&Step],
@@ -335,6 +523,15 @@ pub async fn run_steps(
     let executor = executor::create_executor();
 
     for (i, step) in steps.iter().enumerate() {
+        // Shell steps (issue #23) run via `sh -c`, no agent or LLM. Branch
+        // here so the agent-lookup below stays valid for LLM steps.
+        if step.is_shell() {
+            let result =
+                run_shell_step(executor.as_ref(), step, ctx, i + 1, total, &results).await?;
+            results.push(result);
+            continue;
+        }
+
         let agent = agent_map
             .get(step.agent.as_str())
             .ok_or_else(|| RunError::UnknownAgent {
@@ -496,7 +693,7 @@ pub async fn run_steps(
         results.push(StepRunResult {
             step_id: step.id.clone(),
             agent_name: agent.name.clone(),
-            backend: effective_backend,
+            backend: backend_name(effective_backend).to_string(),
             duration,
             tokens_in,
             tokens_out,
@@ -535,7 +732,7 @@ pub fn build_summary(results: &[StepRunResult]) -> Vec<ui::StepResult> {
         .map(|r| ui::StepResult {
             id: r.step_id.clone(),
             agent: r.agent_name.clone(),
-            backend: backend_name(r.backend).to_string(),
+            backend: r.backend.clone(),
             duration: format_duration(r.duration),
             tokens_in: r.tokens_in.map_or("—".to_string(), |t| t.to_string()),
             tokens_out: r.tokens_out.map_or("—".to_string(), |t| t.to_string()),
@@ -586,7 +783,7 @@ mod tests {
         let results = vec![StepRunResult {
             step_id: "design".to_string(),
             agent_name: "Levi".to_string(),
-            backend: Backend::Api,
+            backend: backend_name(Backend::Api).to_string(),
             duration: std::time::Duration::from_secs(5),
             tokens_in: Some(1200),
             tokens_out: Some(800),
@@ -791,5 +988,115 @@ mod tests {
         assert_eq!(pr.post_comment, PostCommentTarget::Pr);
         let issue: Wrap = serde_yaml::from_str(yaml_issue).unwrap();
         assert_eq!(issue.post_comment, PostCommentTarget::Issue);
+    }
+
+    #[test]
+    fn shell_output_filename_uses_txt_extension() {
+        // .txt rather than .md so termimad doesn't try to render shell output
+        // as markdown when print_output: true is set on a shell step.
+        let name = shell_output_filename("dev", "fetch");
+        assert!(name.starts_with("dev-"), "got: {name}");
+        assert!(name.contains("-fetch-shell."), "got: {name}");
+        assert!(name.ends_with(".txt"), "got: {name}");
+    }
+
+    /// Build a minimal RunContext for shell-step tests that don't need a real
+    /// LLM stack. The temp dir's path is the stack path so `write_step` can
+    /// land artifacts somewhere predictable.
+    fn shell_test_ctx(stack_path: PathBuf) -> RunContext {
+        RunContext::new(
+            "test-flow".to_string(),
+            "irrelevant for shell steps".to_string(),
+            stack_path,
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    fn shell_step(id: &str, command: &str) -> crate::config::Step {
+        crate::config::Step {
+            id: id.to_string(),
+            agent: String::new(),
+            role: None,
+            task: None,
+            run: Some(command.to_string()),
+            input: vec![],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+            post_comment: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn shell_step_captures_stdout_to_stack() {
+        // Acceptance: stdout is captured as the step output and written to
+        // the stack same as LLM outputs.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_test_ctx(dir.path().to_path_buf());
+        let executor = executor::create_executor();
+        let step = shell_step("greet", "echo hello-from-shell");
+
+        let result = run_shell_step(executor.as_ref(), &step, &ctx, 1, 1, &[])
+            .await
+            .unwrap();
+
+        assert_eq!(result.step_id, "greet");
+        assert_eq!(result.backend, "shell");
+        assert!(result.tokens_in.is_none());
+        assert!(result.tokens_out.is_none());
+
+        // Stack record uses the same StepOutput schema as LLM steps so
+        // downstream `input:` consumers don't need to know the difference.
+        let saved = stack::read_step(dir.path(), "greet").unwrap();
+        assert_eq!(saved.response, "hello-from-shell");
+        assert_eq!(saved.agent_id, "");
+        assert_eq!(saved.model, "shell");
+        assert_eq!(saved.prompt, "echo hello-from-shell");
+    }
+
+    #[tokio::test]
+    async fn shell_step_nonzero_exit_aborts_with_clear_error() {
+        // Acceptance: non-zero exit fails the step with exit code and stderr
+        // included in the error.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_test_ctx(dir.path().to_path_buf());
+        let executor = executor::create_executor();
+        let step = shell_step("fail", "echo oops 1>&2; exit 7");
+
+        let err = run_shell_step(executor.as_ref(), &step, &ctx, 1, 1, &[])
+            .await
+            .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(
+            matches!(err, RunError::ExecutorFailed { .. }),
+            "expected ExecutorFailed, got: {msg}"
+        );
+        // The wrapped error message contains the exit code and stderr.
+        assert!(msg.contains("7"), "exit code missing from error: {msg}");
+        assert!(msg.contains("oops"), "stderr missing from error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn shell_step_output_consumable_by_downstream_step() {
+        // Acceptance: the output of a shell step is available as context to
+        // downstream steps via input. We exercise the stack roundtrip that
+        // build_user_prompt would use to inject the prior output.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_test_ctx(dir.path().to_path_buf());
+        let executor = executor::create_executor();
+        let step = shell_step("fetch", "printf 'diff content'");
+
+        run_shell_step(executor.as_ref(), &step, &ctx, 1, 1, &[])
+            .await
+            .unwrap();
+
+        // The next step would call stack::read_step("fetch") -- mirror that.
+        let prior = stack::read_step(dir.path(), "fetch").unwrap();
+        assert_eq!(prior.response, "diff content");
     }
 }
