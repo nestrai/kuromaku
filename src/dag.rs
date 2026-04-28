@@ -191,6 +191,7 @@ flow:
                 model: None,
                 backend: None,
                 print_output: false,
+                post_comment: None,
             }],
             stack: crate::config::StackConfig {
                 backend: "local".to_string(),
