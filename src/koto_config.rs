@@ -7,7 +7,7 @@
 //! Resolution cascade and roles are handled in #129; seeds in #130.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -86,6 +86,22 @@ struct RawKotoConfig {
     vars: HashMap<String, String>,
     #[serde(default)]
     roles: HashMap<String, RawKotoRole>,
+    #[serde(default)]
+    seeds: Option<Vec<RawSeed>>,
+    #[serde(flatten)]
+    unknown: HashMap<String, serde_yaml::Value>,
+}
+
+/// One seed entry as it appears in koto.yaml. Either `path:` (local) or
+/// `repo:` (remote). Validated at parse time -- exactly one must be set.
+#[derive(Debug, Deserialize)]
+struct RawSeed {
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default, rename = "ref")]
+    ref_: Option<String>,
     #[serde(flatten)]
     unknown: HashMap<String, serde_yaml::Value>,
 }
@@ -127,6 +143,204 @@ pub struct KotoConfig {
     pub default_backend: Option<KotoBackend>,
     pub vars: HashMap<String, String>,
     pub roles: HashMap<String, KotoRole>,
+    pub seeds: Seeds,
+}
+
+/// One resolved seed source. Carries both the original display string (for
+/// audit output) and -- for local seeds -- the tilde-expanded filesystem path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seed {
+    pub source: SeedSource,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeedSource {
+    /// Local directory. `display` is the user-supplied string (with `~/` if
+    /// present); `path` is the expanded absolute-or-relative path used for
+    /// filesystem lookups.
+    Local { display: String, path: PathBuf },
+    /// Remote git repo. Parsed but not fetched in v1 -- using one in a lookup
+    /// surfaces a "not yet implemented" error.
+    Remote {
+        repo: String,
+        /// Optional ref (tag, branch or SHA) -- captured for future use.
+        ref_: Option<String>,
+    },
+}
+
+impl Seed {
+    /// Display string used in audit and error messages. Local seeds keep the
+    /// user's original `~/...` path so the output is recognizable; remote seeds
+    /// render as `repo[@ref]`.
+    pub fn display(&self) -> String {
+        match &self.source {
+            SeedSource::Local { display, .. } => display.clone(),
+            SeedSource::Remote { repo, ref_ } => match ref_ {
+                Some(r) => format!("{repo}@{r}"),
+                None => repo.clone(),
+            },
+        }
+    }
+
+    /// Stable kind label for audit output (`local` or `remote`).
+    pub fn kind_label(&self) -> &'static str {
+        match self.source {
+            SeedSource::Local { .. } => "local",
+            SeedSource::Remote { .. } => "remote",
+        }
+    }
+
+    /// Local path if this is a local seed, otherwise `None`.
+    pub fn local_path(&self) -> Option<&Path> {
+        match &self.source {
+            SeedSource::Local { path, .. } => Some(path),
+            SeedSource::Remote { .. } => None,
+        }
+    }
+}
+
+/// Ordered list of seed sources. Lookups walk top-to-bottom; first match wins.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Seeds {
+    pub seeds: Vec<Seed>,
+}
+
+impl Seeds {
+    /// Implicit default when no `seeds:` section is present in koto.yaml (or
+    /// koto.yaml itself is absent). Matches v0 behavior: a single `.koto/`
+    /// seed with no eager existence check.
+    pub fn default_local() -> Self {
+        Self {
+            seeds: vec![Seed {
+                source: SeedSource::Local {
+                    display: ".koto/".to_string(),
+                    path: PathBuf::from(".koto"),
+                },
+            }],
+        }
+    }
+
+    /// Build from raw koto.yaml entries. Validates each entry has exactly one
+    /// of `path:` / `repo:`, and that local paths exist on disk.
+    fn from_raw_entries(raw: &[RawSeed]) -> Result<Self, KotoConfigError> {
+        if raw.is_empty() {
+            return Err(KotoConfigError::Validation(
+                "seeds list must contain at least one entry".to_string(),
+            ));
+        }
+        let mut seeds = Vec::with_capacity(raw.len());
+        for (idx, entry) in raw.iter().enumerate() {
+            for key in entry.unknown.keys() {
+                eprintln!("warning: unknown field '{key}' in koto.yaml seed[{idx}]");
+            }
+            let seed = match (entry.path.as_deref(), entry.repo.as_deref()) {
+                (Some(_), Some(_)) => {
+                    return Err(KotoConfigError::Validation(format!(
+                        "seed[{idx}] has both 'path' and 'repo' -- use exactly one"
+                    )));
+                }
+                (None, None) => {
+                    return Err(KotoConfigError::Validation(format!(
+                        "seed[{idx}] must specify either 'path' or 'repo'"
+                    )));
+                }
+                (Some(path_str), None) => {
+                    if path_str.trim().is_empty() {
+                        return Err(KotoConfigError::Validation(format!(
+                            "seed[{idx}] path must not be empty"
+                        )));
+                    }
+                    let expanded = expand_tilde(path_str);
+                    if !expanded.exists() {
+                        return Err(KotoConfigError::Validation(format!(
+                            "seed path \"{path_str}\" does not exist"
+                        )));
+                    }
+                    Seed {
+                        source: SeedSource::Local {
+                            display: path_str.to_string(),
+                            path: expanded,
+                        },
+                    }
+                }
+                (None, Some(repo)) => {
+                    if repo.trim().is_empty() {
+                        return Err(KotoConfigError::Validation(format!(
+                            "seed[{idx}] repo must not be empty"
+                        )));
+                    }
+                    Seed {
+                        source: SeedSource::Remote {
+                            repo: repo.to_string(),
+                            ref_: entry.ref_.clone(),
+                        },
+                    }
+                }
+            };
+            seeds.push(seed);
+        }
+        Ok(Self { seeds })
+    }
+
+    /// Walk seeds top-to-bottom looking for `rel`. Returns the first seed that
+    /// contains the file along with the resolved full path.
+    ///
+    /// If the walk falls through a remote seed -- meaning no earlier local
+    /// seed had the file and we cannot inspect a remote one in v1 -- this
+    /// returns an explicit "remote seeds not yet implemented" error pointing
+    /// at the offending seed. Pure-local lookups never trigger this.
+    pub fn find(&self, rel: &Path) -> Result<Option<(usize, PathBuf)>, KotoConfigError> {
+        for (i, seed) in self.seeds.iter().enumerate() {
+            match &seed.source {
+                SeedSource::Local { path, .. } => {
+                    let candidate = path.join(rel);
+                    if candidate.exists() {
+                        return Ok(Some((i, candidate)));
+                    }
+                }
+                SeedSource::Remote { repo, ref_ } => {
+                    let suffix = ref_.as_deref().map(|r| format!("@{r}")).unwrap_or_default();
+                    return Err(KotoConfigError::Validation(format!(
+                        "remote seeds not yet implemented (repo: {repo}{suffix})"
+                    )));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Format a "not found" error listing every seed path that was searched.
+    /// Remote seeds are still listed -- they explain why the lookup gave up.
+    pub fn not_found_message(&self, kind: &str, name: &str) -> String {
+        let displays: Vec<String> = self.seeds.iter().map(|s| s.display()).collect();
+        format!(
+            "{kind} \"{name}\" not found in seeds: {}",
+            displays.join(", ")
+        )
+    }
+
+    /// Display string for the audit "[resolve] seeds: ..." line.
+    pub fn audit_line(&self) -> String {
+        self.seeds
+            .iter()
+            .map(|s| format!("{} ({})", s.display(), s.kind_label()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// Expand a leading `~/` or bare `~` to `$HOME`. Returns the input as a
+/// `PathBuf` unchanged when no tilde is present or `$HOME` cannot be located.
+fn expand_tilde(path: &str) -> PathBuf {
+    if path == "~" {
+        return dirs::home_dir().unwrap_or_else(|| PathBuf::from(path));
+    }
+    if let Some(stripped) = path.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(stripped);
+    }
+    PathBuf::from(path)
 }
 
 impl KotoConfig {
@@ -206,12 +420,22 @@ impl KotoConfig {
             );
         }
 
+        // Seeds: when the section is absent we use the `.koto/` default to
+        // preserve v0 behavior. Explicit empty list (`seeds: []`) is rejected
+        // because it would point lookups nowhere -- the user almost certainly
+        // meant to write actual entries.
+        let seeds = match raw.seeds {
+            Some(entries) => Seeds::from_raw_entries(&entries)?,
+            None => Seeds::default_local(),
+        };
+
         Ok(Self {
             version: raw.version.0,
             tiers: raw.tiers,
             default_backend: raw.defaults.and_then(|d| d.backend),
             vars: raw.vars,
             roles,
+            seeds,
         })
     }
 
@@ -573,5 +797,318 @@ roles:
         assert_eq!(KotoBackend::parse("cli"), Some(KotoBackend::Cli));
         assert_eq!(KotoBackend::parse("api"), Some(KotoBackend::Api));
         assert_eq!(KotoBackend::parse("nope"), None);
+    }
+
+    // --- seeds (issue #130) ---
+
+    #[test]
+    fn no_seeds_section_yields_default_local() {
+        // Backward-compat: koto.yaml without `seeds:` mirrors v0 behavior, a
+        // single implicit `.koto/` seed.
+        let cfg = KotoConfig::from_yaml_str(r#"version: "1""#).unwrap();
+        assert_eq!(cfg.seeds.seeds.len(), 1);
+        assert_eq!(cfg.seeds.seeds[0].display(), ".koto/");
+        assert_eq!(cfg.seeds.seeds[0].kind_label(), "local");
+    }
+
+    #[test]
+    fn seeds_local_path_validates_existence() {
+        // Eager validation surfaces typos at parse time rather than during a
+        // mid-run lookup.
+        let yaml = r#"
+version: "1"
+seeds:
+  - path: /definitely/does/not/exist/12345
+"#;
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
+    }
+
+    #[test]
+    fn seeds_remote_repo_parses_without_fetching() {
+        // Remote seeds parse but do not fetch in v1. The error fires only when
+        // a lookup actually walks past the remote entry.
+        let yaml = r#"
+version: "1"
+seeds:
+  - repo: nestrai/seeds
+    ref: v0.1
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.seeds.seeds.len(), 1);
+        assert_eq!(cfg.seeds.seeds[0].kind_label(), "remote");
+        assert_eq!(cfg.seeds.seeds[0].display(), "nestrai/seeds@v0.1");
+    }
+
+    #[test]
+    fn seeds_remote_repo_without_ref_displays_repo_only() {
+        let yaml = r#"
+version: "1"
+seeds:
+  - repo: nestrai/seeds
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(cfg.seeds.seeds[0].display(), "nestrai/seeds");
+    }
+
+    #[test]
+    fn seed_with_both_path_and_repo_errors() {
+        let yaml = r#"
+version: "1"
+seeds:
+  - path: ./somewhere
+    repo: nestrai/seeds
+"#;
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("has both 'path' and 'repo'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn seed_with_neither_path_nor_repo_errors() {
+        let yaml = r#"
+version: "1"
+seeds:
+  - {}
+"#;
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must specify either 'path' or 'repo'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_seeds_list_errors() {
+        let yaml = r#"
+version: "1"
+seeds: []
+"#;
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("at least one entry"), "got: {err}");
+    }
+
+    #[test]
+    fn seeds_find_walks_in_order() {
+        // First seed wins for whole-file overlay -- matches issue #130 spec.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir1.path().join("agents")).unwrap();
+        std::fs::create_dir_all(dir2.path().join("agents")).unwrap();
+        std::fs::write(dir1.path().join("agents/Sage.yaml"), "from-dir1").unwrap();
+        std::fs::write(dir2.path().join("agents/Sage.yaml"), "from-dir2").unwrap();
+        std::fs::write(dir2.path().join("agents/OnlyInDir2.yaml"), "x").unwrap();
+
+        let seeds = Seeds {
+            seeds: vec![
+                Seed {
+                    source: SeedSource::Local {
+                        display: dir1.path().display().to_string(),
+                        path: dir1.path().to_path_buf(),
+                    },
+                },
+                Seed {
+                    source: SeedSource::Local {
+                        display: dir2.path().display().to_string(),
+                        path: dir2.path().to_path_buf(),
+                    },
+                },
+            ],
+        };
+
+        // Both seeds have Sage.yaml -- first seed wins.
+        let (idx, path) = seeds
+            .find(std::path::Path::new("agents/Sage.yaml"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(idx, 0);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "from-dir1");
+
+        // OnlyInDir2 falls through to the second seed.
+        let (idx, path) = seeds
+            .find(std::path::Path::new("agents/OnlyInDir2.yaml"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "x");
+    }
+
+    #[test]
+    fn seeds_find_returns_none_when_missing_in_all() {
+        let dir = tempfile::tempdir().unwrap();
+        let seeds = Seeds {
+            seeds: vec![Seed {
+                source: SeedSource::Local {
+                    display: dir.path().display().to_string(),
+                    path: dir.path().to_path_buf(),
+                },
+            }],
+        };
+        let result = seeds
+            .find(std::path::Path::new("agents/Missing.yaml"))
+            .unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn seeds_find_errors_when_walk_reaches_remote() {
+        // Remote seeds in v1 are parse-only. If the walk falls through a
+        // remote seed because no earlier local seed had the file, we error
+        // explicitly so the user knows why the lookup failed.
+        let dir = tempfile::tempdir().unwrap();
+        let seeds = Seeds {
+            seeds: vec![
+                Seed {
+                    source: SeedSource::Local {
+                        display: dir.path().display().to_string(),
+                        path: dir.path().to_path_buf(),
+                    },
+                },
+                Seed {
+                    source: SeedSource::Remote {
+                        repo: "nestrai/seeds".to_string(),
+                        ref_: Some("v0.1".to_string()),
+                    },
+                },
+            ],
+        };
+        let err = seeds
+            .find(std::path::Path::new("agents/Missing.yaml"))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("remote seeds not yet implemented"),
+            "got: {err}"
+        );
+        assert!(err.to_string().contains("nestrai/seeds@v0.1"), "got: {err}");
+    }
+
+    #[test]
+    fn seeds_find_succeeds_before_remote_when_local_has_file() {
+        // Local-first lookups must succeed even if a remote seed is declared
+        // later -- otherwise the user couldn't keep remote seeds in their
+        // koto.yaml until the implementation lands.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("agents")).unwrap();
+        std::fs::write(dir.path().join("agents/Sage.yaml"), "ok").unwrap();
+        let seeds = Seeds {
+            seeds: vec![
+                Seed {
+                    source: SeedSource::Local {
+                        display: dir.path().display().to_string(),
+                        path: dir.path().to_path_buf(),
+                    },
+                },
+                Seed {
+                    source: SeedSource::Remote {
+                        repo: "nestrai/seeds".to_string(),
+                        ref_: None,
+                    },
+                },
+            ],
+        };
+        let (idx, _) = seeds
+            .find(std::path::Path::new("agents/Sage.yaml"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn seeds_audit_line_includes_kind_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let seeds = Seeds {
+            seeds: vec![
+                Seed {
+                    source: SeedSource::Local {
+                        display: ".koto/".to_string(),
+                        path: dir.path().to_path_buf(),
+                    },
+                },
+                Seed {
+                    source: SeedSource::Remote {
+                        repo: "nestrai/seeds".to_string(),
+                        ref_: Some("v0.1".to_string()),
+                    },
+                },
+            ],
+        };
+        let line = seeds.audit_line();
+        assert_eq!(line, ".koto/ (local), nestrai/seeds@v0.1 (remote)");
+    }
+
+    #[test]
+    fn seeds_not_found_message_lists_all_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let seeds = Seeds {
+            seeds: vec![
+                Seed {
+                    source: SeedSource::Local {
+                        display: ".koto/".to_string(),
+                        path: dir.path().to_path_buf(),
+                    },
+                },
+                Seed {
+                    source: SeedSource::Local {
+                        display: "~/other-seed/".to_string(),
+                        path: dir.path().to_path_buf(),
+                    },
+                },
+            ],
+        };
+        let msg = seeds.not_found_message("agent", "coding/rust/Sage");
+        assert!(
+            msg.contains("agent \"coding/rust/Sage\" not found"),
+            "got: {msg}"
+        );
+        assert!(msg.contains(".koto/"), "got: {msg}");
+        assert!(msg.contains("~/other-seed/"), "got: {msg}");
+    }
+
+    #[test]
+    fn seeds_tilde_expansion_uses_home() {
+        // We don't want to depend on dirs::home_dir() being settable, so test
+        // expand_tilde directly with a non-tilde path that should pass through
+        // unchanged plus the simple "~" case.
+        if let Some(home) = dirs::home_dir() {
+            assert_eq!(expand_tilde("~"), home);
+            assert_eq!(expand_tilde("~/foo/bar"), home.join("foo/bar"));
+        }
+        assert_eq!(expand_tilde("./local"), std::path::PathBuf::from("./local"));
+        assert_eq!(
+            expand_tilde("/abs/path"),
+            std::path::PathBuf::from("/abs/path")
+        );
+    }
+
+    #[test]
+    fn full_seeds_config_parses() {
+        // The full koto.yaml example from the issue: seeds + tiers + roles
+        // round-trips through the parser. We use real temp dirs so the eager
+        // existence check passes.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"version: "1"
+
+seeds:
+  - path: {}
+  - path: {}
+  - repo: nestrai/seeds
+    ref: v0.1
+
+tiers:
+  reasoning: claude/opus-4-7
+"#,
+            dir1.path().display(),
+            dir2.path().display(),
+        );
+        let cfg = KotoConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(cfg.seeds.seeds.len(), 3);
+        assert_eq!(cfg.seeds.seeds[0].kind_label(), "local");
+        assert_eq!(cfg.seeds.seeds[1].kind_label(), "local");
+        assert_eq!(cfg.seeds.seeds[2].kind_label(), "remote");
     }
 }

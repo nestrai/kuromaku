@@ -29,7 +29,7 @@ mod stack;
 #[allow(dead_code)]
 mod ui;
 
-use crate::koto_config::KotoConfig;
+use crate::koto_config::{KotoConfig, Seeds};
 use crate::resolver::{
     ResolvedRole, RoleOverride, parse_role_override, print_audit, resolve_role,
     validate_role_overrides,
@@ -37,7 +37,6 @@ use crate::resolver::{
 use crate::runner::RunContext;
 
 const KOTO_DIR: &str = ".koto";
-const FLOWS_DIR: &str = ".koto/flows";
 
 #[derive(Parser)]
 #[command(name = "koto", about = "Reproducible AI agent teams", version)]
@@ -134,9 +133,12 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Resolve the flow config file path from CLI arguments.
-fn resolve_flow_path(flow: Option<&str>, file: Option<&str>) -> Result<PathBuf> {
-    // --file takes precedence
+/// Resolve the flow config file path from CLI arguments, walking the
+/// configured seeds for the lookup. With multiple seeds the auto-select case
+/// aggregates flow names across all local seeds (deduplicated by name; first
+/// seed wins so an upstream override beats a downstream copy).
+fn resolve_flow_path(flow: Option<&str>, file: Option<&str>, seeds: &Seeds) -> Result<PathBuf> {
+    // --file takes precedence -- explicit user choice, never re-resolved.
     if let Some(f) = file {
         let path = PathBuf::from(f);
         if !path.exists() {
@@ -145,57 +147,66 @@ fn resolve_flow_path(flow: Option<&str>, file: Option<&str>) -> Result<PathBuf> 
         return Ok(path);
     }
 
-    // If a flow name is given, look in .koto/flows/
+    // If a flow name is given, look it up across all seeds. First match wins.
     if let Some(name) = flow {
-        let path = PathBuf::from(FLOWS_DIR).join(format!("{name}.yaml"));
-        if !path.exists() {
-            return Err(eyre!(
-                "flow '{name}' not found at {}\n\nhint: create {0} or use --file <path>",
-                path.display()
-            ));
-        }
-        return Ok(path);
-    }
-
-    // No args: auto-select if only one flow exists
-    let flows_dir = Path::new(FLOWS_DIR);
-    if !flows_dir.exists() {
-        return Err(eyre!(
-            "no .koto/flows/ directory found\n\nhint: create .koto/flows/<name>.yaml, or use --file <path>"
-        ));
-    }
-
-    let mut flows: Vec<String> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(flows_dir) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.ends_with(".yaml") || name_str.ends_with(".yml") {
-                flows.push(
-                    name_str
-                        .trim_end_matches(".yaml")
-                        .trim_end_matches(".yml")
-                        .to_string(),
-                );
+        let rel = std::path::Path::new("flows").join(format!("{name}.yaml"));
+        match seeds.find(&rel).map_err(|e| eyre!("{}", e.message()))? {
+            Some((_, path)) => return Ok(path),
+            None => {
+                return Err(eyre!(
+                    "{}\n\nhint: create flows/{name}.yaml in one of the seeds, or use --file <path>",
+                    seeds.not_found_message("flow", name)
+                ));
             }
         }
     }
 
-    if flows.is_empty() {
+    // No args: aggregate flow names from every local seed and auto-select if
+    // exactly one is found. Multi-seed setups still get reproducible behavior
+    // because we deduplicate on name and remember which seed contributed the
+    // first occurrence -- that's the path we return.
+    let mut by_name: std::collections::BTreeMap<String, PathBuf> =
+        std::collections::BTreeMap::new();
+    for seed in &seeds.seeds {
+        let Some(seed_path) = seed.local_path() else {
+            continue;
+        };
+        let flows_dir = seed_path.join("flows");
+        let Ok(entries) = std::fs::read_dir(&flows_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let name_str = file_name.to_string_lossy();
+            if !(name_str.ends_with(".yaml") || name_str.ends_with(".yml")) {
+                continue;
+            }
+            let bare = name_str
+                .trim_end_matches(".yaml")
+                .trim_end_matches(".yml")
+                .to_string();
+            // First seed wins -- skip if a flow with the same name was already
+            // recorded from an earlier seed.
+            by_name
+                .entry(bare)
+                .or_insert_with(|| flows_dir.join(name_str.as_ref()));
+        }
+    }
+
+    if by_name.is_empty() {
         return Err(eyre!(
-            "no flows found in .koto/flows/\n\nhint: create .koto/flows/<name>.yaml"
+            "no flows found in seeds: {}\n\nhint: create flows/<name>.yaml in one of the seed directories",
+            seeds.audit_line()
         ));
     }
 
-    // Auto-select if only one flow
-    if flows.len() == 1 {
-        let name = &flows[0];
-        return Ok(PathBuf::from(FLOWS_DIR).join(format!("{name}.yaml")));
+    if by_name.len() == 1 {
+        let (_name, path) = by_name.into_iter().next().expect("len == 1");
+        return Ok(path);
     }
 
-    flows.sort();
-    let list = flows
-        .iter()
+    let list = by_name
+        .keys()
         .map(|f| format!("  - {f}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -337,8 +348,14 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     let task_start = Instant::now();
     let koto_dir = Path::new(KOTO_DIR);
 
-    // Optional project-level config -- needed if any agent declares a tier.
+    // Optional project-level config -- needed if any agent declares a tier
+    // and to source the seeds list. Without koto.yaml we fall back to the
+    // implicit `.koto/` seed.
     let koto_config = KotoConfig::load_optional(Path::new("."))?;
+    let seeds = koto_config
+        .as_ref()
+        .map(|c| c.seeds.clone())
+        .unwrap_or_else(Seeds::default_local);
 
     // Use defaults matching flow config defaults
     let defaults = config::Defaults {
@@ -346,10 +363,12 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
         backend: config::Backend::ClaudeCli,
     };
 
-    // Load requested agents
+    // Load requested agents through the seed list. Arbitrary-depth IDs
+    // (`coding/rust/Sage`) work the same way as in flow runs.
     let mut agents = Vec::new();
     for name in agent_names {
-        let agent = config::load_agent_file(koto_dir, name, &defaults, koto_config.as_ref())?;
+        let (agent, _seed_idx) =
+            config::load_agent_file_with_seeds(&seeds, name, &defaults, koto_config.as_ref())?;
         agents.push(agent);
     }
 
@@ -405,9 +424,14 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     }
     ui::print_backends_ok(&backend_list);
 
-    // Load context
-    let guide = runner::load_guide(koto_dir);
-    let rules_cache = runner::load_rules_for_agents(&agents, koto_dir)?;
+    // Load context through the seed list -- guide is optional, rules error
+    // with the seeds searched if a referenced rule is missing.
+    let guide = runner::load_guide_from_seeds(&seeds).map_err(|e| eyre!("{e}"))?;
+    let rules_cache =
+        runner::load_rules_for_agents_with_seeds(&agents, &seeds).map_err(|e| eyre!("{e}"))?;
+    // koto_dir kept around for the skills directory below, which is not yet
+    // seed-aware.
+    let _ = koto_dir;
 
     // Skills
     let skills_dir = koto_dir.join("skills");
@@ -476,14 +500,19 @@ async fn run_up(
     file: Option<&str>,
 ) -> Result<()> {
     let flow_start = Instant::now();
-    let path = resolve_flow_path(flow, file)?;
+
+    // Load koto.yaml first -- the seeds list it produces feeds every later
+    // lookup (flow file, agents, rules, Guide).
+    let koto_config = KotoConfig::load_optional(Path::new("."))?;
+    let seeds = koto_config
+        .as_ref()
+        .map(|c| c.seeds.clone())
+        .unwrap_or_else(Seeds::default_local);
+
+    let path = resolve_flow_path(flow, file, &seeds)?;
     let display_path = path.display().to_string();
 
     ui::print_command(&format!("koto up {}", flow.unwrap_or(&display_path)));
-
-    // Optional project-level config (koto.yaml). When absent everything keeps
-    // working as before -- this is the backward-compat path.
-    let koto_config = KotoConfig::load_optional(Path::new("."))?;
 
     // Parse `--role` flags up front. Errors here surface bad syntax (unknown
     // field, bad model format, ...) before we touch any YAML.
@@ -630,10 +659,13 @@ async fn run_up(
         &parsed_role_overrides,
     );
 
-    let agents = config::load_agents_for_flow(koto_dir, &flow_config, koto_config.as_ref())?;
+    // Load agents through seeds. The origins map records which seed each
+    // agent came from -- the audit prints that next to the role name.
+    let (agents, agent_origins) =
+        config::load_agents_for_flow_with_seeds(&seeds, &flow_config, koto_config.as_ref())?;
 
     // Build the per-step role -> resolved binding map for the cascade.
-    let resolved_roles = build_resolved_roles(
+    let mut resolved_roles = build_resolved_roles(
         &flow_config,
         &agents,
         koto_config.as_ref(),
@@ -641,10 +673,22 @@ async fn run_up(
     )
     .map_err(|e| eyre!("{e}"))?;
 
-    // Audit output: show the resolved binding for every role plus a CLI vars
-    // summary. Print before any execution starts so the user can ctrl-C if a
-    // resolution looks wrong.
-    print_audit(&resolved_roles, &cli_vars_map);
+    // Annotate each ResolvedRole with the seed display string of its agent so
+    // print_audit can show "<- <seed>" lines per role. Steps that bind directly
+    // (no role) are still tracked in agent_origins -- they just don't get an
+    // audit block here because the audit walks roles only.
+    for r in resolved_roles.iter_mut() {
+        if let Some(idx) = agent_origins.get(&r.agent)
+            && let Some(seed) = seeds.seeds.get(*idx)
+        {
+            r.seed_origin = Some(seed.display());
+        }
+    }
+
+    // Audit output: show the seed list, the resolved binding for every role
+    // and a CLI vars summary. Print before any execution starts so the user
+    // can ctrl-C if a resolution looks wrong.
+    print_audit(&seeds, &resolved_roles, &cli_vars_map);
 
     // Apply role-derived model and backend overrides to every step that uses
     // a role. Steps that already specified `model:` / `backend:` in the flow
@@ -677,9 +721,12 @@ async fn run_up(
     }
     ui::print_backends_ok(&backend_list);
 
-    // Load guide and rules context
-    let guide = runner::load_guide(koto_dir);
-    let rules_cache = runner::load_rules_for_agents(&agents, koto_dir)?;
+    // Load guide and rules context through the seed list. Guide is optional;
+    // rules error out with the searched seed list if a referenced rule is
+    // missing.
+    let guide = runner::load_guide_from_seeds(&seeds).map_err(|e| eyre!("{e}"))?;
+    let rules_cache =
+        runner::load_rules_for_agents_with_seeds(&agents, &seeds).map_err(|e| eyre!("{e}"))?;
 
     // Check and load skills
     let skills_dir = koto_dir.join("skills");
@@ -1192,6 +1239,7 @@ mod tests {
             backend: config::Backend::Api,
             model_source: "CLI override".to_string(),
             backend_source: "CLI override".to_string(),
+            seed_origin: None,
         }];
 
         apply_resolved_roles_to_steps(&mut flow, &resolved);
@@ -1215,6 +1263,7 @@ mod tests {
             backend: config::Backend::Api,
             model_source: "role override".to_string(),
             backend_source: "role override".to_string(),
+            seed_origin: None,
         }];
 
         apply_resolved_roles_to_steps(&mut flow, &resolved);
@@ -1233,6 +1282,7 @@ mod tests {
             backend: config::Backend::Api,
             model_source: "role override".to_string(),
             backend_source: "role override".to_string(),
+            seed_origin: None,
         }];
 
         apply_resolved_roles_to_steps(&mut flow, &resolved);
