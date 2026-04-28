@@ -1379,7 +1379,7 @@ flow:
 
     /// Verify implement-issue flow has exactly 4 steps
     #[test]
-    fn implement_issue_has_four_steps() {
+    fn implement_issue_has_three_steps() {
         let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
         let flow_path = koto_dir.join("flows/implement-issue.yaml");
 
@@ -1394,16 +1394,12 @@ flow:
 
         assert_eq!(
             raw.flow.len(),
-            4,
-            "implement-issue flow should have exactly 4 steps. Got: {}",
+            3,
+            "implement-issue flow should have exactly 3 steps. Got: {}",
             raw.flow.len()
         );
 
         // Verify step names
-        assert!(
-            raw.flow.contains_key("fetch"),
-            "implement-issue flow should have 'fetch' step"
-        );
         assert!(
             raw.flow.contains_key("implement"),
             "implement-issue flow should have 'implement' step"
@@ -1452,7 +1448,7 @@ flow:
 
     /// Verify implement-issue flow implement step includes restatement instruction
     #[test]
-    fn implement_issue_implement_step_has_restatement() {
+    fn implement_issue_implement_step_fetches_issue() {
         let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
         let flow_path = koto_dir.join("flows/implement-issue.yaml");
 
@@ -1474,22 +1470,21 @@ flow:
             .task
             .as_ref()
             .expect("implement step should have a task");
-        let task_lower = task.to_lowercase();
 
         assert!(
-            task_lower.contains("restate"),
-            "implement-issue implement step should include restatement instruction. Got: {}",
+            task.contains("gh issue view"),
+            "implement step should fetch the issue itself. Got: {}",
             task
         );
 
         assert!(
-            task_lower.contains("assumption"),
-            "implement-issue implement step should mention assumptions. Got: {}",
+            task.contains("ambiguit"),
+            "implement step should mention ambiguities. Got: {}",
             task
         );
     }
 
-    /// Verify implement-issue flow review step has fetch input and checks acceptance criteria
+    /// Verify implement-issue flow review step checks acceptance criteria
     #[test]
     fn implement_issue_review_step_checks_acceptance_criteria() {
         let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
@@ -1509,13 +1504,7 @@ flow:
             .get("review")
             .expect("implement-issue flow should have 'review' step");
 
-        // Check inputs include fetch and implement
-        assert!(
-            review_step.input.contains(&"fetch".to_string()),
-            "implement-issue review step should have fetch in input array. Got: {:?}",
-            review_step.input
-        );
-
+        // Check inputs include implement
         assert!(
             review_step.input.contains(&"implement".to_string()),
             "implement-issue review step should have implement in input array. Got: {:?}",
@@ -1558,42 +1547,26 @@ flow:
         let raw: RawFlowConfig =
             serde_yaml::from_str(&contents).expect("failed to parse implement-issue.yaml");
 
-        // fetch has no inputs
-        let fetch_step = raw
-            .flow
-            .get("fetch")
-            .expect("implement-issue flow should have 'fetch' step");
-        assert!(
-            fetch_step.input.is_empty(),
-            "fetch step should have no inputs. Got: {:?}",
-            fetch_step.input
-        );
-
-        // implement takes fetch
+        // implement has no inputs (fetches issue itself)
         let implement_step = raw
             .flow
             .get("implement")
             .expect("implement-issue flow should have 'implement' step");
-        assert_eq!(
-            implement_step.input,
-            vec!["fetch"],
-            "implement step should have [fetch] as input. Got: {:?}",
+        assert!(
+            implement_step.input.is_empty(),
+            "implement step should have no inputs. Got: {:?}",
             implement_step.input
         );
 
-        // review takes fetch and implement
+        // review takes implement
         let review_step = raw
             .flow
             .get("review")
             .expect("implement-issue flow should have 'review' step");
-        assert!(
-            review_step.input.contains(&"fetch".to_string()),
-            "review step should have fetch in input. Got: {:?}",
-            review_step.input
-        );
-        assert!(
-            review_step.input.contains(&"implement".to_string()),
-            "review step should have implement in input. Got: {:?}",
+        assert_eq!(
+            review_step.input,
+            vec!["implement"],
+            "review step should have [implement] as input. Got: {:?}",
             review_step.input
         );
 
@@ -1610,9 +1583,9 @@ flow:
         );
     }
 
-    /// Verify implement-issue flow uses exactly 3 roles
+    /// Verify implement-issue flow uses exactly 2 roles
     #[test]
-    fn implement_issue_uses_three_roles() {
+    fn implement_issue_uses_two_roles() {
         let koto_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(".koto");
         let flow_path = koto_dir.join("flows/implement-issue.yaml");
 
@@ -1627,16 +1600,12 @@ flow:
 
         assert_eq!(
             raw.roles.len(),
-            3,
-            "implement-issue flow should have exactly 3 roles. Got: {}",
+            2,
+            "implement-issue flow should have exactly 2 roles. Got: {}",
             raw.roles.len()
         );
 
         // Verify the expected roles exist
-        assert!(
-            raw.roles.contains_key("fetcher"),
-            "implement-issue flow should have 'fetcher' role"
-        );
         assert!(
             raw.roles.contains_key("developer"),
             "implement-issue flow should have 'developer' role"

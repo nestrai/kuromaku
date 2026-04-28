@@ -1,4 +1,4 @@
-# Implement a GitHub issue: fetch > implement > review > pr.
+# Implement a GitHub issue: implement > review > pr.
 # Usage: koto up implement-issue id=42
 version: "1"
 name: implement-issue
@@ -6,222 +6,62 @@ prompt: |
   Implement issue #{{id}} in this repository.
 
 roles:
-  fetcher: { default: Minion }
   developer: { default: Noah }
   reviewer: { default: Bella }
 
 flow:
-  fetch:
-    role: fetcher
-    task: |
-      Fetch issue #{{id}} using gh issue view --comments.
-      Output the full issue description and comments as-is.
-      Do not analyze or comment -- just output the raw data.
-
   implement:
     role: developer
-    input: [fetch]
     task: |
-      Implement the changes described in the issue. Before coding,
-      restate the requirement from the issue in your own words. List
-      every ambiguity in the issue explicitly, with the interpretation
-      you chose and a one-sentence reason.
+      Fetch and implement issue #{{id}}.
 
-      ## Git workflow (do this first)
+      ## Step 1: fetch the issue
 
-      1. `git fetch origin && git checkout origin/main` -- always
-         start from up-to-date main, never from a stale local branch.
-      2. `git checkout -b <type>/<short-slug>-{{id}}` -- create a
-         feature branch using one of: feat, fix, docs, refactor,
-         chore, test, ci. The slug must be lowercase, hyphenated, and
-         under 40 characters. Example: `feat/skill-injection-42`.
-      3. Commit on this branch with Conventional Commits messages.
-      4. Never commit directly to main.
+      Run `gh issue view {{id}} --comments` and read the full issue
+      description and acceptance criteria before doing anything else.
 
-      ## How to approach this
+      ## Step 2: git workflow
 
-      Structure your work as Thought, Self-correction, Action:
+      1. `git fetch origin && git checkout origin/main`
+      2. `git checkout -b <type>/<short-slug>-{{id}}`
+      3. Conventional Commits. Never commit to main.
 
-      1. Thought: What does the issue require? Identify the components
-         that need to change. Quote the acceptance criteria verbatim.
-      2. Self-correction check (list ambiguities, do not just ask):
-         - For each acceptance criterion, list any phrases open to
-           multiple interpretations. State the chosen interpretation
-           and the rejected one with a reason.
-         - Identify any scope I am narrowing with assumptions.
-         - Identify any scope I am broadening beyond the issue text.
-      3. Action: Write the implementation and tests.
+      ## Step 3: implement
 
-      ## Required output
-
-      Your response must include a `## My Reasoning` section BEFORE any
-      code changes. This section documents:
-      - Your interpretation of each acceptance criterion
-      - Every ambiguity you found, with the interpretation you chose
-        and the one you rejected
-      - Components you identified as needing changes
-      - Branch name you created
-
-      The reviewer will evaluate this reasoning, not just your code.
-
-      ## Few-shot example (GOOD output)
-
-      ## My Reasoning
-
-      ### Branch
-      `feat/skill-injection-42`
-
-      ### Acceptance criterion 1: "Skills are injected into agent prompts"
-      - Interpretation: Each agent's prompt is post-processed to
-        append referenced skills before the LLM call.
-      - Ambiguity: "injected" could mean "concatenated at end" or
-        "merged into a system message". Chose concatenation because
-        the existing rules system uses concatenation (src/runner.rs:212).
-      - Rejected: middle-of-prompt injection -- would risk
-        lost-in-the-middle on long prompts.
-
-      ### Acceptance criterion 2: "Skills live in .koto/skills/"
-      - Interpretation: Loader reads .koto/skills/<name>.md files.
-      - Ambiguity: none.
-
-      ### Components changed
-      - src/skills.rs (new): loader and injection helper.
-      - src/runner.rs:212: call injection before LLM call.
-      - src/config.rs:340: parse `skills:` field on agents.
-
-      [code changes follow]
-
-      ## Anti-pattern (do not produce this)
-
-      BAD: "Issue is clear. Implementing now." then jumping to code.
-      Why bad: No restatement, no ambiguity list. The reviewer cannot
-      evaluate scope drift without your stated interpretation.
-
-      BAD: "Does my understanding match the author's intent?" left as
-      an open question.
-      Why bad: That is unanswerable in this flow. List the
-      ambiguities and your chosen interpretation instead.
+      Follow your role's workflow (Understanding, Concerns,
+      Implementation, Tests, Verification). For each acceptance
+      criterion, list ambiguities with chosen vs rejected
+      interpretation before coding.
 
   review:
     role: reviewer
-    input: [fetch, implement]
+    input: [implement]
     task: |
-      ## Critical scope (read first, re-read at the end)
+      Review the implementation against the original issue's acceptance criteria.
+      Run `gh issue view {{id}}` to get the original issue if needed -- do not
+      rely only on the implementer's restatement.
 
-      Use the output format defined in this task, not your default
-      agent format. The downstream pr step depends on finding
-      "FINAL_VERDICT: PASS" or "FINAL_VERDICT: FAIL" exactly as
-      specified below. This exact prefix only ever appears once in
-      your output (in the Summary section), so it cannot collide
-      with substring matches in echoed format specs or descriptive
-      text.
-
-      If the implementation solved the wrong problem or drifted from
-      the issue intent, flag it as FAIL -- regardless of code quality.
-      Clean code that does the wrong thing is a failure.
-
-      ## How to review
-
-      Review against the ORIGINAL issue acceptance criteria from fetch.
-      Do not anchor on what the implementer built -- anchor on what the
-      issue asked for. These may differ.
-
-      For each acceptance criterion:
-
-      1. Thought: What does this criterion require? Quote the exact text.
-      2. Self-correction check:
-         - Does the implementation meet this criterion? Cite file:line.
-         - Did the implementer's stated assumptions narrow or change scope?
-         - Would the issue author accept this as "done"?
-      3. Severity (for any gap): Blocking | Suggestion | Nit.
-      4. Verdict: PASS or FAIL.
-
-      ## Output format
-
-      For each criterion, output exactly:
-
-      ### [Criterion text, quoted]
-      - Thought: [your interpretation]
-      - Evidence: [file:line or "not implemented"]
-      - Assumption drift: [none | describe how assumptions changed scope]
-      - Severity: Blocking | Suggestion | Nit | None
-      - Verdict: PASS | FAIL
-
-      End with:
+      Use your role's review format. End with exactly:
 
       ### Summary
       - Blocking issues: [list or "none"]
       - FINAL_VERDICT: PASS | FAIL
 
-      The `FINAL_VERDICT:` line must appear exactly once and on its
-      own line. Do not repeat the literal token elsewhere in your
-      response.
-
-      ## Few-shot examples
-
-      GOOD: "Criterion 'User can filter by date' requires date range.
-      Implementation at src/filters.rs:42 only supports single date.
-      Severity: Blocking. Verdict: FAIL -- scope narrowed by
-      implementer assumption."
-
-      GOOD: "Criterion 'Skills are injected into agent prompts'.
-      Evidence: src/runner.rs:212 calls inject_skills before the LLM
-      call; tests at src/runner.rs:540-588 cover the happy path and
-      missing-skill error path. Assumption drift: none. Severity:
-      None. Verdict: PASS."
-
-      ## Anti-patterns (do not do this)
-
-      BAD: "Code is clean and well-tested. PASS."
-      Why bad: Evaluates code quality, not requirement fit.
-
-      BAD: "Implementation looks reasonable. PASS."
-      Why bad: No evidence, no criterion-by-criterion check.
-
-      ## Final check
-
-      Before submitting: Did you find zero issues? That is suspicious.
-      Re-read the issue. Re-read the implementation. What did you miss?
-
-      If all criteria show "Verdict: PASS" but the implementation
-      solved a narrower problem than the issue described, change the
-      summary to FINAL_VERDICT: FAIL.
-
-      REMINDER: If the implementation solved the wrong problem or drifted
-      from the issue intent, flag it as FAIL -- regardless of code quality.
+      The `FINAL_VERDICT:` line must appear exactly once on its own
+      line. If the implementation solved the wrong problem, FAIL
+      regardless of code quality.
 
   pr:
     role: developer
     input: [review]
     print_output: true
     task: |
-      Check the review verdict from the previous step. Look for the
-      line "FINAL_VERDICT: PASS" or "FINAL_VERDICT: FAIL" in the
-      review output (this exact prefix is only emitted once, in the
-      Summary section).
+      Check the review for `FINAL_VERDICT: PASS` or
+      `FINAL_VERDICT: FAIL`.
 
-      If "FINAL_VERDICT: FAIL":
-      - Do NOT create a PR.
-      - Output the blocking issues from the review.
-      - Stop here.
+      If PASS: push the branch and create a draft PR
+      (`Closes #{{id}}`). Output the PR URL.
 
-      If "FINAL_VERDICT: PASS":
-      - Push the feature branch (the one created in the implement
-        step) and create a draft PR referencing the issue
-        (Closes #{{id}}).
-      - Output the PR URL and a one-line summary per acceptance
-        criterion.
+      If FAIL: output the blocking issues. Do not create a PR.
 
-      If neither "FINAL_VERDICT: PASS" nor "FINAL_VERDICT: FAIL" is
-      found:
-      - Do NOT create a PR.
-      - Output: "Review verdict unclear. Expected 'FINAL_VERDICT:
-        PASS' or 'FINAL_VERDICT: FAIL' in review output."
-      - Stop here.
-
-      ## Final check (anti-sycophancy)
-
-      If you are about to create a PR, ask: did review actually cite
-      file:line evidence for every criterion marked PASS? If review
-      reported PASS without per-criterion evidence, treat that as an
-      unclear verdict and refuse to create a PR.
+      If neither token found: output "Review verdict unclear." Stop.
