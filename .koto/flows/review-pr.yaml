@@ -164,6 +164,8 @@ flow:
 
       ## Output format (exact)
 
+      **PR #{{id}}** -- [link](https://github.com/{owner}/{repo}/pull/{{id}})
+
       VERDICT: APPROVE | REQUEST_CHANGES | COMMENT
 
       ### Blocking
