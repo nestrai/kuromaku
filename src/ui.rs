@@ -173,10 +173,17 @@ pub fn print_shell_step_banner(
     );
 
     // Truncate the command to keep the banner readable; the full command is
-    // preserved in the saved StepOutput.
+    // preserved in the saved StepOutput. Slice on a char boundary so commands
+    // containing multi-byte UTF-8 (emoji, non-ASCII paths) cannot panic the
+    // banner print on a misaligned byte index.
     const MAX_LEN: usize = 80;
-    let display_cmd = if command.len() > MAX_LEN {
-        format!("{}…", &command[..MAX_LEN])
+    let display_cmd = if command.chars().count() > MAX_LEN {
+        let cut = command
+            .char_indices()
+            .nth(MAX_LEN)
+            .map(|(i, _)| i)
+            .unwrap_or(command.len());
+        format!("{}…", &command[..cut])
     } else {
         command.to_string()
     };
