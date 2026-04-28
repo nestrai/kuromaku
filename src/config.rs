@@ -31,6 +31,20 @@ pub enum Backend {
     Ollama,
 }
 
+/// Where a step's output should be auto-posted as a GitHub comment.
+///
+/// Set on a step via `post_comment: pr` or `post_comment: issue`. The runner
+/// picks up the target number from the `id` template variable -- consistent
+/// with the placeholder convention used by every flow that ships with koto
+/// (see the tests in this module that ban `{{pr}}` and `{{issue}}` in flow
+/// YAML).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PostCommentTarget {
+    Pr,
+    Issue,
+}
+
 /// Accepts both `"1"` (string) and `1` (integer) in YAML.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Version(pub String);
@@ -113,6 +127,10 @@ pub struct RawStep {
     pub backend: Option<Backend>,
     #[serde(default)]
     pub print_output: bool,
+    /// Optional GitHub comment target. When set, the runner posts this
+    /// step's output as a PR or issue comment after the step succeeds.
+    #[serde(default)]
+    pub post_comment: Option<PostCommentTarget>,
     #[serde(flatten)]
     pub unknown: HashMap<String, serde_yaml::Value>,
 }
@@ -190,6 +208,7 @@ pub struct Step {
     pub model: Option<String>,
     pub backend: Option<Backend>,
     pub print_output: bool,
+    pub post_comment: Option<PostCommentTarget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -509,6 +528,7 @@ fn validate_and_resolve(
                         model: s.model,
                         backend: s.backend,
                         print_output: s.print_output,
+                        post_comment: s.post_comment,
                     })
                 }
                 (None, Some(role_name)) => {
@@ -551,6 +571,7 @@ fn validate_and_resolve(
                         model: s.model,
                         backend: s.backend,
                         print_output: s.print_output,
+                        post_comment: s.post_comment,
                     })
                 }
             }
@@ -795,6 +816,76 @@ flow:
             err.to_string().contains("unsupported version '2'"),
             "got: {}",
             err
+        );
+    }
+
+    #[test]
+    fn post_comment_field_parses_pr() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  consensus:
+    agent: facilitator
+    post_comment: pr
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(
+            config.steps[0].post_comment,
+            Some(PostCommentTarget::Pr),
+            "post_comment: pr should parse to PostCommentTarget::Pr"
+        );
+    }
+
+    #[test]
+    fn post_comment_field_parses_issue() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  notify:
+    agent: facilitator
+    post_comment: issue
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(
+            config.steps[0].post_comment,
+            Some(PostCommentTarget::Issue),
+            "post_comment: issue should parse to PostCommentTarget::Issue"
+        );
+    }
+
+    #[test]
+    fn post_comment_field_defaults_to_none_for_backwards_compat() {
+        // No post_comment field -> Step::post_comment is None. This is the
+        // backwards-compatibility guarantee in the issue acceptance criteria:
+        // existing flows without post_comment must keep working unchanged.
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  step1:
+    agent: dev
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.steps[0].post_comment, None);
+    }
+
+    #[test]
+    fn post_comment_invalid_value_errors() {
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  step1:
+    agent: dev
+    post_comment: discord
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("post_comment") || msg.contains("variant"),
+            "expected error to mention post_comment or variant, got: {msg}"
         );
     }
 

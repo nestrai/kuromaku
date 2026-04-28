@@ -22,6 +22,7 @@ mod executor;
 mod koto_config;
 #[allow(dead_code)]
 mod llm;
+mod notify;
 mod resolver;
 mod runner;
 mod skills;
@@ -390,6 +391,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
             model: None,
             backend: None,
             print_output: i == agents.len() - 1, // last step prints
+            post_comment: None,
         });
     }
 
@@ -458,6 +460,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
         guide,
         rules_cache,
         skills_cache,
+        std::collections::HashMap::new(),
     );
 
     let results = runner::run_steps(&step_refs, &agents, &ctx).await?;
@@ -747,7 +750,9 @@ async fn run_up(
     // Resolve stack path
     let stack_path = resolve_stack_path(&flow_config.stack.path);
 
-    // Construct RunContext
+    // Construct RunContext. The runner reads `id` from `effective_vars` when
+    // a step declares `post_comment:` -- no extra plumbing needed since the
+    // map is already built up at this point.
     let ctx = RunContext::new(
         flow_name.clone(),
         resolved_task,
@@ -755,6 +760,7 @@ async fn run_up(
         guide,
         rules_cache,
         skills_cache,
+        effective_vars.clone(),
     );
 
     // Run steps
@@ -1165,6 +1171,7 @@ mod tests {
             model: None,
             backend: None,
             print_output: false,
+            post_comment: None,
         }
     }
 

@@ -6,6 +6,7 @@ use crate::config::{Agent, Backend, Step};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed};
 use crate::koto_config::Seeds;
 use crate::llm::{self, LlmRequest, Message, Role};
+use crate::notify::github::{self, PostOutcome};
 use crate::skills;
 use crate::stack::{self, StepOutput};
 use crate::ui::{self, StepInfo, StepState};
@@ -21,6 +22,14 @@ pub struct RunContext {
     pub guide: Option<String>,
     pub rules_cache: HashMap<String, String>,
     pub skills_cache: HashMap<String, String>,
+    /// Effective template vars (`koto.yaml#vars` merged with CLI `--var` and
+    /// bare `key=value` args). The runner reads `id` from this map when a step
+    /// declares `post_comment:` to determine which PR or issue to post on.
+    pub template_vars: HashMap<String, String>,
+    /// Sink used to post step output as a GitHub comment when a step declares
+    /// `post_comment:`. Defaults to the `gh` CLI poster; tests substitute a
+    /// closure to exercise the soft-fail behavior without touching gh.
+    pub poster: github::Poster,
 }
 
 impl RunContext {
@@ -31,6 +40,7 @@ impl RunContext {
         guide: Option<String>,
         rules_cache: HashMap<String, String>,
         skills_cache: HashMap<String, String>,
+        template_vars: HashMap<String, String>,
     ) -> Self {
         let now = chrono::Local::now();
         let ts = now.format("%Y%m%d-%H%M%S").to_string();
@@ -46,6 +56,8 @@ impl RunContext {
             guide,
             rules_cache,
             skills_cache,
+            template_vars,
+            poster: github::gh_poster(),
         }
     }
 }
@@ -318,7 +330,7 @@ pub async fn run_steps(
 ) -> Result<Vec<StepRunResult>, RunError> {
     let agent_map: HashMap<&str, &Agent> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let total = steps.len();
-    let mut results = Vec::with_capacity(total);
+    let mut results: Vec<StepRunResult> = Vec::with_capacity(total);
 
     let executor = executor::create_executor();
 
@@ -433,6 +445,53 @@ pub async fn run_steps(
             &tokens_out.map_or("—".to_string(), |t| t.to_string()),
             &display_path,
         );
+
+        // Post the step output as a GitHub comment when the flow asks for it.
+        // Failures here never abort the flow -- gh outages should not undo
+        // work that's already been written to the stack. The decision logic
+        // lives in `notify::github::try_post_step_comment` so the soft-fail
+        // contract is testable without spinning up the executor; this match
+        // is just translating the outcome to user-facing log lines.
+        if let Some(target) = step.post_comment {
+            // Inputs are the prior step IDs declared on this step. Map them
+            // to agent names from already-finished results so the header
+            // reads "Review by Bella and Levi, consensus by Mika".
+            let input_agents: Vec<&str> = step
+                .input
+                .iter()
+                .filter_map(|input_id| {
+                    results
+                        .iter()
+                        .find(|r| r.step_id == *input_id)
+                        .map(|r| r.agent_name.as_str())
+                })
+                .collect();
+            let outcome = github::try_post_step_comment(
+                target,
+                &agent.name,
+                &content,
+                &input_agents,
+                &ctx.template_vars,
+                &ctx.poster,
+            );
+            match outcome {
+                PostOutcome::Posted { kind, number } => {
+                    eprintln!("      posted comment on {kind} #{number}");
+                }
+                PostOutcome::NoIdProvided => {
+                    eprintln!(
+                        "warning: step '{}' declares post_comment but no 'id' template var was provided",
+                        step.id
+                    );
+                }
+                PostOutcome::Failed { error } => {
+                    eprintln!(
+                        "warning: step '{}' failed to post comment: {error}",
+                        step.id
+                    );
+                }
+            }
+        }
 
         results.push(StepRunResult {
             step_id: step.id.clone(),
@@ -713,5 +772,24 @@ mod tests {
         assert!(name.starts_with("development-"));
         assert!(name.contains("-design-Levi.md"));
         assert!(name.ends_with(".md"));
+    }
+
+    #[test]
+    fn post_comment_target_deserializes_from_yaml() {
+        use crate::config::PostCommentTarget;
+
+        // Both string variants round-trip from the YAML form used in flows.
+        let yaml_pr = "post_comment: pr\n";
+        let yaml_issue = "post_comment: issue\n";
+
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            post_comment: PostCommentTarget,
+        }
+
+        let pr: Wrap = serde_yaml::from_str(yaml_pr).unwrap();
+        assert_eq!(pr.post_comment, PostCommentTarget::Pr);
+        let issue: Wrap = serde_yaml::from_str(yaml_issue).unwrap();
+        assert_eq!(issue.post_comment, PostCommentTarget::Issue);
     }
 }
