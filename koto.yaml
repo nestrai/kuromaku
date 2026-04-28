@@ -1,0 +1,25 @@
+version: "1"
+
+seeds:
+  - path: .koto/
+  - path: ~/code/charemma/nestrai/seeds/rust/
+
+tiers:
+  reasoning: claude/opus-4-7
+  general: claude/sonnet-4-6
+  quick: claude/haiku-4-5
+
+defaults:
+  backend: cli
+
+roles:
+  developer:
+    agent: Noah
+  reviewer:
+    agent: Bella
+  architect:
+    agent: Levi
+  facilitator:
+    agent: Mika
+  fetcher:
+    agent: Minion
