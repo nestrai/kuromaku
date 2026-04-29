@@ -2,7 +2,7 @@
 
 ## What this is
 
-koto is a CLI tool for reproducible AI agent teams with persistent shared state. Define your team in a YAML file (`koto.yaml`), run `koto up`.
+koto is a CLI tool for reproducible AI agent teams with persistent shared state. Define your team in a YAML file (`.koto/config.yaml`), run `koto up`.
 
 ## Language and tooling
 
@@ -38,7 +38,7 @@ Single crate for now. Will split into workspace crates when complexity warrants 
 ## Config format
 
 See `docs/koto-reference-card.html` for the visual spec. Key points:
-- Config file: `koto.yaml` in repo root
+- Config file: `.koto/config.yaml` (legacy `koto.yaml` in repo root still loads with a deprecation warning)
 - Stages are parallel by default, `needs` creates sequencing
 - `flow` as the orchestration keyword (not `workflow` or `pipeline`)
 

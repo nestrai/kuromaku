@@ -22,9 +22,10 @@ pub struct RunContext {
     pub guide: Option<String>,
     pub rules_cache: HashMap<String, String>,
     pub skills_cache: HashMap<String, String>,
-    /// Effective template vars (`koto.yaml#vars` merged with CLI `--var` and
-    /// bare `key=value` args). The runner reads `id` from this map when a step
-    /// declares `post_comment:` to determine which PR or issue to post on.
+    /// Effective template vars (`vars:` from the project config merged with
+    /// CLI `--var` and bare `key=value` args). The runner reads `id` from
+    /// this map when a step declares `post_comment:` to determine which PR
+    /// or issue to post on.
     pub template_vars: HashMap<String, String>,
     /// Sink used to post step output as a GitHub comment when a step declares
     /// `post_comment:`. Defaults to the `gh` CLI poster; tests substitute a

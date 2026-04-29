@@ -4,8 +4,9 @@
 //! for each role used by a flow run:
 //!
 //! 1. CLI `--role NAME=AGENT` and `--role NAME:FIELD=VALUE`
-//! 2. koto.yaml `roles.<name>` (project-level binding)
-//! 3. tiers (when the agent declares one) and koto.yaml `defaults.backend`
+//! 2. Project config `roles.<name>` (project-level binding)
+//! 3. tiers (when the agent declares one) and project config
+//!    `defaults.backend`
 //! 4. Agent YAML `model:` / `backend:` and the flow-level role default
 //!
 //! Each [`ResolvedRole`] carries source labels so the audit output can show
@@ -14,7 +15,7 @@
 use std::collections::HashMap;
 
 use crate::config::{Backend, FlowConfig};
-use crate::koto_config::{KotoBackend, KotoConfig, KotoRole, Seeds};
+use crate::koto_config::{KOTO_CONFIG_FILE, KotoBackend, KotoConfig, KotoRole, Seeds};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ResolverError {
@@ -24,7 +25,7 @@ pub enum ResolverError {
     #[error("unknown role field \"{field}\" (valid: model, backend)")]
     UnknownRoleField { field: String },
 
-    #[error("role \"{name}\" not defined in koto.yaml")]
+    #[error("role \"{name}\" not defined in {KOTO_CONFIG_FILE}")]
     UnknownRole { name: String },
 
     #[error("invalid model format \"{model}\": must be <provider>/<model-id>")]
@@ -147,7 +148,8 @@ fn validate_model_format(model: &str) -> Result<(), ResolverError> {
 }
 
 /// Validate that every CLI `--role` override targets a role that exists in
-/// either koto.yaml or the flow YAML. Run once before flow execution.
+/// either the project config or the flow YAML. Run once before flow
+/// execution.
 pub fn validate_role_overrides(
     overrides: &[RoleOverride],
     flow: &FlowConfig,
@@ -170,7 +172,7 @@ pub fn validate_role_overrides(
 ///
 /// `cli` maps to the existing default of [`Backend::ClaudeCli`] (the only CLI
 /// backend wired in today). `api` maps to [`Backend::Api`]. This bridges the
-/// project-level policy in koto.yaml to the runtime executor enum.
+/// project-level policy in the project config to the runtime executor enum.
 pub fn project_backend_to_runtime(b: KotoBackend) -> Backend {
     match b {
         KotoBackend::Cli => Backend::ClaudeCli,
@@ -194,8 +196,8 @@ pub struct RoleResolveInput<'a> {
 /// Resolve the agent ID for a single role from the cascade.
 ///
 /// Precedence: CLI `--role NAME=AGENT` > flow `roles.<name>.default` >
-/// koto.yaml `roles.<name>.agent`. Returns `None` when no layer provides a
-/// binding -- callers should treat that as an error.
+/// project-config `roles.<name>.agent`. Returns `None` when no layer provides
+/// a binding -- callers should treat that as an error.
 ///
 /// This is THE single rule for the agent cascade. Both pre-flow application
 /// (writing back into `FlowConfig.roles` and `Step.agent` so the right agent

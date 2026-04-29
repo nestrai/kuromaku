@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use indexmap::IndexMap;
 use serde::Deserialize;
 
-use crate::koto_config::{KotoConfig, Seeds};
+use crate::koto_config::{KOTO_CONFIG_FILE, KotoConfig, Seeds};
 
 // --- Errors ---
 
@@ -150,7 +150,8 @@ pub struct RawAgentFile {
     #[serde(default)]
     pub skills: Vec<String>,
     pub model: Option<String>,
-    /// Capability tier, resolved against `koto.yaml#tiers` at load time.
+    /// Capability tier, resolved against `tiers:` in the project config at
+    /// load time.
     pub tier: Option<String>,
     pub backend: Option<Backend>,
     #[serde(default)]
@@ -265,9 +266,9 @@ pub fn load_flow_from_str_with_overrides(
 }
 
 /// Load flow from YAML string with role overrides AND project-level role
-/// bindings (from koto.yaml). Steps that reference a role only defined at the
-/// project level resolve through `project_roles` so the flow does not need to
-/// redeclare every role used.
+/// bindings (from the project config). Steps that reference a role only
+/// defined at the project level resolve through `project_roles` so the flow
+/// does not need to redeclare every role used.
 pub fn load_flow_from_str_with_project(
     contents: &str,
     role_overrides: &HashMap<String, String>,
@@ -385,7 +386,7 @@ fn agent_rel_path(agent_id: &str) -> PathBuf {
 /// Resolve the model string for an agent.
 ///
 /// Precedence (highest first):
-/// 1. `tier:` resolved through `koto.yaml#tiers`
+/// 1. `tier:` resolved through the project config's `tiers:` map
 /// 2. `model:` literal in the agent YAML
 /// 3. `defaults.model` from the flow config
 fn resolve_agent_model(
@@ -397,12 +398,12 @@ fn resolve_agent_model(
         (Some(tier_name), Some(kc)) => kc
             .resolve_tier(tier_name)
             .map(str::to_string)
-            // `.message()` returns the inner payload without thiserror's
+            // `.message()` returns the inner payload without the Display
             // "validation error:" prefix, so wrapping in `ConfigError::Validation`
             // does not duplicate it.
             .map_err(|e| ConfigError::Validation(e.message())),
         (Some(tier_name), None) => Err(ConfigError::Validation(format!(
-            "agent \"{}\" declares tier \"{tier_name}\" but no koto.yaml found",
+            "agent \"{}\" declares tier \"{tier_name}\" but no {KOTO_CONFIG_FILE} found",
             raw.name
         ))),
         (None, _) => Ok(raw.model.clone().unwrap_or_else(|| defaults.model.clone())),
@@ -617,10 +618,9 @@ fn validate_and_resolve(
 
             // Role path -- only remaining case after the kind check above.
             let role_name = s.role.expect("role must be Some after kind check");
-            // Resolve role to agent ID. Flow-level roles win over
-            // project-level (koto.yaml) roles; project-level acts as
-            // the inherited default so a flow can omit roles it does
-            // not need to override.
+            // Resolve role to agent ID. Flow-level roles win over project-level
+            // (project config) roles; project-level acts as the inherited
+            // default so a flow can omit roles it does not need to override.
             if !resolved_roles.contains_key(&role_name)
                 && let Some(project_agent) = project_roles.get(&role_name)
             {
@@ -1122,7 +1122,10 @@ tier: reasoning
             msg.contains(r#"agent "Sage" declares tier "reasoning""#),
             "got: {msg}"
         );
-        assert!(msg.contains("no koto.yaml found"), "got: {msg}");
+        assert!(
+            msg.contains(&format!("no {KOTO_CONFIG_FILE} found")),
+            "got: {msg}"
+        );
     }
 
     #[test]
@@ -1157,7 +1160,9 @@ tiers:
         let err = load_agent_file(dir.path(), "Sage", &defaults, Some(&koto_config)).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains(r#"tier "deep-thought" not defined in koto.yaml"#),
+            msg.contains(&format!(
+                r#"tier "deep-thought" not defined in {KOTO_CONFIG_FILE}"#
+            )),
             "got: {msg}"
         );
         assert!(msg.contains("general"), "got: {msg}");
@@ -1200,7 +1205,7 @@ tiers:
 
     #[test]
     fn load_agent_file_no_tier_uses_model_field() {
-        // Backward compat: agents without tier ignore koto.yaml entirely.
+        // Backward compat: agents without tier ignore the project config entirely.
         let dir = tempfile::tempdir().unwrap();
         let agents_dir = dir.path().join("agents");
         std::fs::create_dir_all(&agents_dir).unwrap();
