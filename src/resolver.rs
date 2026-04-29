@@ -317,15 +317,23 @@ pub fn resolve_role(
     })
 }
 
-/// Print the audit block to stderr before flow execution.
+/// Format the audit block as a single string (newline-terminated lines).
 ///
 /// Format mirrors the issue's example with one block per role. We sort by role
-/// name so the output is stable across runs.
-pub fn print_audit(seeds: &Seeds, resolved: &[ResolvedRole], cli_vars: &HashMap<String, String>) {
+/// name so the output is stable across runs. Used both for stderr printing
+/// and for the `resolution-audit.txt` file written into the run directory
+/// (issue #31), so the on-disk record matches what the user saw in the
+/// terminal.
+pub fn format_audit(
+    seeds: &Seeds,
+    resolved: &[ResolvedRole],
+    cli_vars: &HashMap<String, String>,
+) -> String {
+    let mut out = String::new();
     // Seeds line first -- the user sees the search order before any role-level
-    // detail. We always print it (even with the implicit `.koto/` default) so
+    // detail. We always emit it (even with the implicit `.koto/` default) so
     // the audit makes the resolution path explicit.
-    eprintln!("[resolve] seeds: {}", seeds.audit_line());
+    out.push_str(&format!("[resolve] seeds: {}\n", seeds.audit_line()));
 
     let mut sorted: Vec<&ResolvedRole> = resolved.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
@@ -334,15 +342,21 @@ pub fn print_audit(seeds: &Seeds, resolved: &[ResolvedRole], cli_vars: &HashMap<
         // agent file. Direct-agent steps don't go through this path; their
         // origin doesn't appear in the audit (matches issue #130 example).
         match &r.seed_origin {
-            Some(origin) => eprintln!("[resolve] {}: {} <- {}", r.name, r.agent, origin),
-            None => eprintln!("[resolve] {}: {}", r.name, r.agent),
+            Some(origin) => out.push_str(&format!(
+                "[resolve] {}: {} <- {}\n",
+                r.name, r.agent, origin
+            )),
+            None => out.push_str(&format!("[resolve] {}: {}\n", r.name, r.agent)),
         }
-        eprintln!("           model: {} ({})", r.model, r.model_source);
-        eprintln!(
-            "           backend: {} ({})",
+        out.push_str(&format!(
+            "           model: {} ({})\n",
+            r.model, r.model_source
+        ));
+        out.push_str(&format!(
+            "           backend: {} ({})\n",
             backend_label(r.backend),
             r.backend_source
-        );
+        ));
     }
     if !cli_vars.is_empty() {
         let mut keys: Vec<&String> = cli_vars.keys().collect();
@@ -352,8 +366,18 @@ pub fn print_audit(seeds: &Seeds, resolved: &[ResolvedRole], cli_vars: &HashMap<
             .map(|k| format!("{k}={}", cli_vars[*k]))
             .collect::<Vec<_>>()
             .join(", ");
-        eprintln!("[resolve] vars: {summary}");
+        out.push_str(&format!("[resolve] vars: {summary}\n"));
     }
+    out
+}
+
+/// Print the audit block to stderr before flow execution. Thin wrapper around
+/// [`format_audit`] -- both the terminal and the run-directory copy share the
+/// exact same lines.
+pub fn print_audit(seeds: &Seeds, resolved: &[ResolvedRole], cli_vars: &HashMap<String, String>) {
+    let text = format_audit(seeds, resolved, cli_vars);
+    // Strip the single trailing newline so eprintln! doesn't double up.
+    eprint!("{text}");
 }
 
 fn backend_label(b: Backend) -> &'static str {
