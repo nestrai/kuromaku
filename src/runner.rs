@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::{Agent, Backend, Step};
-use crate::executor::{self, ExecutionTask, ExecutorBoxed};
+use crate::executor::{self, ExecutionTask, ExecutorBoxed, OutputFormat};
 use crate::koto_config::Seeds;
 use crate::llm::{self, LlmRequest, Message, Role};
 use crate::notify::github::{self, PostOutcome};
@@ -304,11 +304,21 @@ async fn run_step_via_executor(
         Backend::Api => unreachable!("API backend does not use executor"),
     };
 
+    // Claude CLI emits structured NDJSON (issue #156); other backends speak
+    // plain text. The executor parses stream-json back into readable text in
+    // the artifact file and uses the `result` event for the canonical step
+    // output.
+    let output_format = match backend {
+        Backend::ClaudeCli => OutputFormat::ClaudeStreamJson,
+        _ => OutputFormat::Raw,
+    };
+
     let task = ExecutionTask {
         id: task_id,
         command,
         env: HashMap::new(),
         stdout_file: Some(output_path.to_path_buf()),
+        output_format,
     };
 
     let handle = executor
@@ -409,6 +419,8 @@ async fn run_shell_step(
         // Streamed: shell stdout fills the artifact file live so the user
         // can `tail -f` long-running commands (issue #16).
         stdout_file: Some(output_path.to_path_buf()),
+        // Shell `run:` steps emit raw text, not NDJSON.
+        output_format: OutputFormat::Raw,
     };
 
     let handle = executor

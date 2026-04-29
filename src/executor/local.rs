@@ -5,8 +5,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use super::stream_json::{self, Fragment};
 use super::{
     ExecutionHandle, ExecutionOutput, ExecutionStatus, ExecutionTask, Executor, ExecutorError,
+    OutputFormat,
 };
 
 /// State tracked per running child process.
@@ -14,10 +16,16 @@ use super::{
 /// stdout/stderr are drained by background tasks at spawn time so the artifact
 /// file can be tailed live (issue #16). The buffers hold the same content the
 /// caller would have received from a single `wait_with_output()` call.
+///
+/// `result_override` is set by the stream-json reader when a `result` event
+/// arrives. It carries the canonical assistant text (matching what
+/// `--output-format text` would have produced). Used in preference to
+/// accumulated deltas when present (issue #156).
 struct RunningProcess {
     child: tokio::process::Child,
     stdout_buf: Arc<Mutex<String>>,
     stderr_buf: Arc<Mutex<String>>,
+    result_override: Arc<Mutex<Option<String>>>,
     stdout_reader: Option<JoinHandle<()>>,
     stderr_reader: Option<JoinHandle<()>>,
 }
@@ -91,32 +99,36 @@ impl Executor for LocalExecutor {
 
         let stdout_buf = Arc::new(Mutex::new(String::new()));
         let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let result_override: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
         let stdout_buf_clone = Arc::clone(&stdout_buf);
+        let result_override_clone = Arc::clone(&result_override);
+        let output_format = task.output_format;
         let stdout_reader = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout).lines();
             let mut file = stdout_file;
-            // next_line() strips the line terminator, so we re-add `\n` to
-            // both the in-memory buffer and the file. Final `\n` is added
-            // unconditionally; trim() in wait() canonicalizes the buffer.
+            // next_line() strips the line terminator. For Raw mode we re-add
+            // `\n` to both the in-memory buffer and the file. For
+            // ClaudeStreamJson we parse each line as NDJSON and only persist
+            // the user-visible fragments (text + tool-use markers); the raw
+            // JSON never lands in the artifact file.
             while let Ok(Some(line)) = reader.next_line().await {
-                {
-                    let mut buf = stdout_buf_clone.lock().await;
-                    buf.push_str(&line);
-                    buf.push('\n');
-                }
-                if let Some(f) = file.as_mut() {
-                    // Best-effort writes: a disk error during stream should
-                    // not poison the in-memory buffer or kill the process.
-                    // The error becomes visible if the user inspects the
-                    // truncated file; the canonical content is the buffer.
-                    if f.write_all(line.as_bytes()).await.is_err() {
-                        break;
+                match output_format {
+                    OutputFormat::Raw => {
+                        write_raw_line(&line, &stdout_buf_clone, file.as_mut()).await;
                     }
-                    if f.write_all(b"\n").await.is_err() {
-                        break;
+                    OutputFormat::ClaudeStreamJson => {
+                        let fragments = stream_json::parse_line(&line);
+                        for fragment in fragments {
+                            write_fragment(
+                                fragment,
+                                &stdout_buf_clone,
+                                &result_override_clone,
+                                file.as_mut(),
+                            )
+                            .await;
+                        }
                     }
-                    let _ = f.flush().await;
                 }
             }
             if let Some(mut f) = file {
@@ -138,6 +150,7 @@ impl Executor for LocalExecutor {
             child,
             stdout_buf,
             stderr_buf,
+            result_override,
             stdout_reader: Some(stdout_reader),
             stderr_reader: Some(stderr_reader),
         };
@@ -180,7 +193,16 @@ impl Executor for LocalExecutor {
             let _ = handle.await;
         }
 
-        let stdout = process.stdout_buf.lock().await.clone();
+        // Prefer the canonical `result` text from a stream-json `result`
+        // event when present (issue #156): it is exactly what
+        // `--output-format text` would have returned, with no tool-use
+        // markers or trailing whitespace from the live-display path. Fall
+        // back to the accumulated text buffer otherwise (Raw mode, or
+        // stream-json without a terminal `result` event).
+        let stdout = match process.result_override.lock().await.clone() {
+            Some(canonical) => canonical,
+            None => process.stdout_buf.lock().await.clone(),
+        };
         let stderr = process.stderr_buf.lock().await.clone();
 
         if !status.success() {
@@ -247,6 +269,59 @@ impl Executor for LocalExecutor {
     }
 }
 
+/// Append a raw stdout line to the in-memory buffer and (if open) the
+/// artifact file, restoring the trailing newline that `next_line()` strips.
+/// Disk errors are swallowed: the canonical content lives in the buffer, and
+/// breaking the loop on a transient write failure would lose subsequent
+/// lines from both the file and the buffer for downstream consumers.
+async fn write_raw_line(line: &str, buf: &Arc<Mutex<String>>, file: Option<&mut tokio::fs::File>) {
+    {
+        let mut b = buf.lock().await;
+        b.push_str(line);
+        b.push('\n');
+    }
+    if let Some(f) = file {
+        let _ = f.write_all(line.as_bytes()).await;
+        let _ = f.write_all(b"\n").await;
+        let _ = f.flush().await;
+    }
+}
+
+/// Apply a single stream-json [`Fragment`] to the artifact file and the
+/// canonical buffer. Text fragments accumulate verbatim. Tool-use fragments
+/// are dropped -- the artifact file is meant to show the agent's prose, not
+/// internal tool plumbing. Result fragments populate `result_override` so
+/// [`Executor::wait`] returns the canonical assistant text in preference to
+/// accumulated deltas.
+async fn write_fragment(
+    fragment: Fragment,
+    buf: &Arc<Mutex<String>>,
+    result_override: &Arc<Mutex<Option<String>>>,
+    file: Option<&mut tokio::fs::File>,
+) {
+    match fragment {
+        Fragment::Text(text) => {
+            {
+                let mut b = buf.lock().await;
+                b.push_str(&text);
+            }
+            if let Some(f) = file {
+                let _ = f.write_all(text.as_bytes()).await;
+                let _ = f.flush().await;
+            }
+        }
+        Fragment::ToolUse { .. } => {
+            // Dropped on purpose: the markers cluttered the live output
+            // without adding value. The parser still emits the variant so
+            // future code paths (e.g. structured logs) can use it.
+        }
+        Fragment::Result(text) => {
+            let mut slot = result_override.lock().await;
+            *slot = Some(text);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +341,7 @@ mod tests {
             command: "echo hello".to_string(),
             env: HashMap::new(),
             stdout_file: None,
+            output_format: OutputFormat::Raw,
         };
 
         let handle = executor.spawn(task).await.unwrap();
@@ -287,6 +363,7 @@ mod tests {
             command: "echo $KOTO_TEST_VAR".to_string(),
             env,
             stdout_file: None,
+            output_format: OutputFormat::Raw,
         };
 
         let handle = executor.spawn(task).await.unwrap();
@@ -302,6 +379,7 @@ mod tests {
             command: "exit 42".to_string(),
             env: HashMap::new(),
             stdout_file: None,
+            output_format: OutputFormat::Raw,
         };
 
         let handle = executor.spawn(task).await.unwrap();
@@ -317,6 +395,7 @@ mod tests {
             command: "sleep 60".to_string(),
             env: HashMap::new(),
             stdout_file: None,
+            output_format: OutputFormat::Raw,
         };
 
         let handle = executor.spawn(task).await.unwrap();
@@ -347,6 +426,7 @@ mod tests {
             command: "echo first; sleep 0.5; echo second".to_string(),
             env: HashMap::new(),
             stdout_file: Some(path.clone()),
+            output_format: OutputFormat::Raw,
         };
 
         let handle = executor.spawn(task).await.unwrap();
@@ -395,6 +475,7 @@ mod tests {
             command: "echo fresh".to_string(),
             env: HashMap::new(),
             stdout_file: Some(path.clone()),
+            output_format: OutputFormat::Raw,
         };
 
         let handle = executor.spawn(task).await.unwrap();
@@ -403,6 +484,125 @@ mod tests {
         let content = tokio::fs::read_to_string(&path).await.unwrap();
         assert!(!content.contains("stale"));
         assert!(content.contains("fresh"));
+    }
+
+    #[tokio::test]
+    async fn claude_stream_json_writes_plain_text_to_artifact_live() {
+        // Acceptance criteria (issue #156):
+        //   1. Artifact file shows incremental output during the run.
+        //   2. Final step output equals what plain --print would have
+        //      returned (here: the `result` event's text).
+        //   3. Tool call events are visible in the artifact file.
+        //
+        // We simulate the claude CLI by emitting hand-crafted stream-json
+        // lines via printf, with a mid-stream sleep so we can observe the
+        // file before the process exits.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("out.txt");
+
+        // NDJSON sequence: a text delta, a tool_use start, another text
+        // delta, then a result event. Each line is a single printf call so
+        // it lands on the pipe at a separate moment, mimicking real
+        // streaming.
+        let cmd = r#"
+printf '%s\n' '{"type":"system","subtype":"init"}'
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello "}}}'
+sleep 0.5
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"tu_1","name":"Bash","input":{}}}}'
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"world"}}}'
+printf '%s\n' '{"type":"result","subtype":"success","result":"Hello world"}'
+"#;
+
+        let executor = LocalExecutor::new();
+        let task = ExecutionTask {
+            id: "test-stream-json".to_string(),
+            command: cmd.to_string(),
+            env: HashMap::new(),
+            stdout_file: Some(path.clone()),
+            output_format: OutputFormat::ClaudeStreamJson,
+        };
+
+        let handle = executor.spawn(task).await.unwrap();
+
+        // Poll for the early "Hello " text to land in the file before the
+        // process finishes. If stream-json parsing only ran at the end,
+        // the file would stay empty for the full 500ms.
+        let mut saw_first_early = false;
+        for _ in 0..20 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            if let Ok(content) = tokio::fs::read_to_string(&path).await
+                && content.contains("Hello ")
+                && !content.contains("world")
+            {
+                saw_first_early = true;
+                break;
+            }
+        }
+        assert!(
+            saw_first_early,
+            "expected 'Hello ' to appear in {} before 'world'",
+            path.display()
+        );
+
+        let output = executor.wait(&handle).await.unwrap();
+
+        // Acceptance criterion 2: canonical step output comes from the
+        // `result` event, not the raw NDJSON.
+        assert_eq!(output.stdout, "Hello world");
+
+        let final_content = tokio::fs::read_to_string(&path).await.unwrap();
+
+        // Acceptance criterion 1+2: artifact contains the human-readable
+        // text, not the raw JSON envelopes.
+        assert!(final_content.contains("Hello "));
+        assert!(final_content.contains("world"));
+        assert!(
+            !final_content.contains("content_block_delta"),
+            "raw JSON must not leak into artifact:\n{final_content}"
+        );
+        assert!(
+            !final_content.contains("text_delta"),
+            "raw JSON must not leak into artifact:\n{final_content}"
+        );
+
+        // Tool-use markers are intentionally dropped: the artifact should
+        // show the agent's prose, not internal tool plumbing.
+        assert!(
+            !final_content.contains("[tool: Bash]"),
+            "tool marker leaked into artifact:\n{final_content}"
+        );
+        assert!(
+            !final_content.contains("[tool:"),
+            "tool marker leaked into artifact:\n{final_content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_stream_json_falls_back_to_accumulated_text_without_result_event() {
+        // Robustness: if a run finishes without a `result` event (e.g.
+        // older CLI version, or process killed before result), the buffer
+        // must still hold the accumulated assistant text so downstream
+        // agents see something useful.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("out.txt");
+
+        let cmd = r#"
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"partial "}}}'
+printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}}'
+"#;
+
+        let executor = LocalExecutor::new();
+        let task = ExecutionTask {
+            id: "test-stream-json-noresult".to_string(),
+            command: cmd.to_string(),
+            env: HashMap::new(),
+            stdout_file: Some(path.clone()),
+            output_format: OutputFormat::ClaudeStreamJson,
+        };
+
+        let handle = executor.spawn(task).await.unwrap();
+        let output = executor.wait(&handle).await.unwrap();
+        assert_eq!(output.stdout, "partial answer");
     }
 
     #[tokio::test]
@@ -415,6 +615,7 @@ mod tests {
             command: "echo hi".to_string(),
             env: HashMap::new(),
             stdout_file: Some("/nonexistent/koto/dir/out.txt".into()),
+            output_format: OutputFormat::Raw,
         };
 
         let err = executor.spawn(task).await.unwrap_err();
