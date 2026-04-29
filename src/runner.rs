@@ -442,12 +442,20 @@ async fn run_shell_step(
 
     // Pre-compute and announce the output path so users can `tail -f` it
     // even if the command takes a while. Layout from issue #31:
-    // `<stack>/<run-id>/NN-<step>.txt` -- numbered by execution order.
+    // `<stack>/<run-id>/steps/NN-<step>.txt` -- numbered by execution order.
     let content_filename = shell_output_filename(step_num, &step.id);
-    let output_path = ctx.run_path.join(&content_filename);
+    let output_path = ctx
+        .run_path
+        .join(stack::STEPS_SUBDIR)
+        .join(&content_filename);
     // The summary table and `print_output:true` resolve via stack_path, so
-    // the relative output_file embeds the run id segment.
-    let output_file = format!("{}/{}", ctx.run_id, content_filename);
+    // the relative output_file embeds both the run id and the steps segment.
+    let output_file = format!(
+        "{}/{}/{}",
+        ctx.run_id,
+        stack::STEPS_SUBDIR,
+        content_filename
+    );
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -614,6 +622,15 @@ pub async fn run_steps(
     agents: &[Agent],
     ctx: &RunContext,
 ) -> Result<Vec<StepRunResult>, RunError> {
+    // Ensure the run directory layout (`steps/`, `messages/`) exists before
+    // any step writes. main.rs `run_up` also calls this for the audit-write
+    // ordering, but the task flow path doesn't, so we do it here too.
+    // Idempotent.
+    stack::init_run_layout(&ctx.run_path).map_err(|e| RunError::Stack {
+        step: "<run-init>".to_string(),
+        source: e,
+    })?;
+
     let agent_map: HashMap<&str, &Agent> = agents.iter().map(|a| (a.id.as_str(), a)).collect();
     let total = steps.len();
     let mut results: Vec<StepRunResult> = Vec::with_capacity(total);
@@ -658,13 +675,21 @@ pub async fn run_steps(
         let user_content = build_user_prompt(&step_task, step, &ctx.run_path)?;
 
         // Pre-compute output path and show it immediately so user can tail -f.
-        // Layout: `<stack>/<run-id>/NN-<step>.md`. The summary table renders
-        // `<run-id>/NN-<step>.md` so `print_output: true` joins it with
-        // `stack_path` to find the file.
+        // Layout: `<stack>/<run-id>/steps/NN-<step>.md`. The summary table
+        // renders `<run-id>/steps/NN-<step>.md` so `print_output: true` joins
+        // it with `stack_path` to find the file.
         let step_num = i + 1;
         let content_filename = llm_output_filename(step_num, &step.id);
-        let output_path = ctx.run_path.join(&content_filename);
-        let output_file = format!("{}/{}", ctx.run_id, content_filename);
+        let output_path = ctx
+            .run_path
+            .join(stack::STEPS_SUBDIR)
+            .join(&content_filename);
+        let output_file = format!(
+            "{}/{}/{}",
+            ctx.run_id,
+            stack::STEPS_SUBDIR,
+            content_filename
+        );
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -1364,26 +1389,75 @@ mod tests {
         let results = run_steps(&steps, &[], &ctx).await.unwrap();
         assert_eq!(results.len(), 2);
 
-        // Step content files are zero-padded and numbered by topo order.
-        assert!(ctx.run_path.join("01-fetch.txt").exists());
-        assert!(ctx.run_path.join("01-fetch.meta.yaml").exists());
-        assert!(ctx.run_path.join("02-collect.txt").exists());
-        assert!(ctx.run_path.join("02-collect.meta.yaml").exists());
+        // Step content files live under `steps/` and are zero-padded and
+        // numbered by topo order (issue #31, fixed in issue #159).
+        let steps_dir = ctx.run_path.join("steps");
+        assert!(steps_dir.join("01-fetch.txt").exists());
+        assert!(steps_dir.join("01-fetch.meta.yaml").exists());
+        assert!(steps_dir.join("02-collect.txt").exists());
+        assert!(steps_dir.join("02-collect.meta.yaml").exists());
 
-        // Meta yaml is parseable as a StepRecord.
-        let meta = std::fs::read_to_string(ctx.run_path.join("01-fetch.meta.yaml")).unwrap();
+        // Regression for #159: nothing must land directly in the run root.
+        assert!(!ctx.run_path.join("01-fetch.txt").exists());
+        assert!(!ctx.run_path.join("01-fetch.meta.yaml").exists());
+
+        // Empty `messages/` dir created at run start (#153 prep, #159).
+        assert!(
+            ctx.run_path.join("messages").is_dir(),
+            "messages/ must exist at run start"
+        );
+
+        // Meta yaml is parseable as a StepRecord. `output_file` is just the
+        // filename -- the `steps/` segment is added by readers/writers.
+        let meta = std::fs::read_to_string(steps_dir.join("01-fetch.meta.yaml")).unwrap();
         let parsed: stack::StepRecord = serde_yaml::from_str(&meta).unwrap();
         assert_eq!(parsed.step_id, "fetch");
         assert_eq!(parsed.kind, "shell");
         assert_eq!(parsed.output_file, "01-fetch.txt");
 
-        // The summary's output_file is `<run_id>/NN-<id>.<ext>` so
+        // The summary's output_file is `<run_id>/steps/NN-<id>.<ext>` so
         // print_output joins it with stack_path correctly.
         assert!(
             results[0].output_file.starts_with(&ctx.run_id),
             "got: {}",
             results[0].output_file
         );
-        assert!(results[0].output_file.ends_with("/01-fetch.txt"));
+        assert!(results[0].output_file.ends_with("/steps/01-fetch.txt"));
+    }
+
+    #[tokio::test]
+    async fn run_steps_step_started_at_differs_between_steps() {
+        // Acceptance criterion (issue #159): per-step `started_at` reflects
+        // each step's actual wall-clock start, not the run's start. Without
+        // this, every step in the manifest collapses onto `ctx.started_at`
+        // and the audit promise -- "when did this step run?" -- breaks.
+        //
+        // Two consecutive shell steps run sequentially, each takes some
+        // real time, so their captured `started_at` strings must differ.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_test_ctx(dir.path().to_path_buf());
+
+        let step_one = shell_step("first", "printf 'a'");
+        let step_two = shell_step("second", "printf 'b'");
+        let steps = vec![&step_one, &step_two];
+
+        let results = run_steps(&steps, &[], &ctx).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        let started_one = &results[0].record.started_at;
+        let started_two = &results[1].record.started_at;
+        assert_ne!(
+            started_one, started_two,
+            "per-step started_at must differ across steps; got both = {started_one}"
+        );
+        // Neither should equal the run's start time -- otherwise we'd be
+        // back to the bug the test guards against.
+        let run_started = ctx.started_at.to_rfc3339();
+        // The first step starts very close to the run start, but capturing
+        // it independently must still produce a distinct nanosecond reading.
+        assert_ne!(
+            started_one, &run_started,
+            "step 1 started_at must come from chrono::Utc::now() at step start, not ctx.started_at"
+        );
     }
 }
