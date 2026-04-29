@@ -70,6 +70,27 @@ pub fn read_step(stack_path: &Path, step_id: &str) -> Result<StepOutput, StackEr
 
 // --- New run-directory layout (issue #31).
 
+/// Subdirectory under a run directory that holds per-step content and meta
+/// files. Pinned by the issue #31 spec, so it's a constant rather than
+/// configuration.
+pub const STEPS_SUBDIR: &str = "steps";
+
+/// Subdirectory under a run directory reserved for inter-agent messages
+/// (issue #153). Created empty at run start so consumers can rely on its
+/// presence even before any messages exist.
+pub const MESSAGES_SUBDIR: &str = "messages";
+
+/// Initialise the on-disk layout for a run directory: the run dir itself,
+/// the `steps/` subdir, and the `messages/` subdir. Idempotent -- safe to
+/// call from multiple sites (main.rs at run start, run_steps when the task
+/// flow path skips main's setup).
+pub fn init_run_layout(run_path: &Path) -> Result<(), StackError> {
+    ensure_dir(run_path)?;
+    ensure_dir(&run_path.join(STEPS_SUBDIR))?;
+    ensure_dir(&run_path.join(MESSAGES_SUBDIR))?;
+    Ok(())
+}
+
 /// Per-step metadata, serialised as `NN-<step-id>.meta.yaml` next to the
 /// content file. Captures everything needed to reconstruct what ran without
 /// re-parsing the content.
@@ -102,9 +123,9 @@ pub struct StepRecord {
     pub exit_code: i32,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_steps: Vec<String>,
-    /// Path of the content file relative to the run directory
-    /// (e.g. `01-fetch.md`). Stored so consumers can find the body without
-    /// scanning the directory.
+    /// Filename of the content file inside the run's `steps/` subdirectory
+    /// (e.g. `01-fetch.md`). The `steps/` segment is mandated by the spec
+    /// (issue #31) and added by readers/writers, not stored here.
     pub output_file: String,
 }
 
@@ -196,14 +217,19 @@ pub fn write_run_step(
     record: &StepRecord,
     content: &str,
 ) -> Result<PathBuf, StackError> {
-    ensure_dir(run_path)?;
+    // Defensive: callers should have called `init_run_layout`, but we ensure
+    // the steps subdir here too so a forgotten init doesn't cost the user a
+    // run. `output_file` is just the filename -- the `steps/` segment lives
+    // here.
+    let steps_dir = run_path.join(STEPS_SUBDIR);
+    ensure_dir(&steps_dir)?;
 
     // Content extension is part of the StepRecord's output_file so the writer
     // and manifest stay in sync with no second source of truth.
-    let content_path = run_path.join(&record.output_file);
+    let content_path = steps_dir.join(&record.output_file);
     std::fs::write(&content_path, content).map_err(StackError::Write)?;
 
-    let meta_path = run_path.join(step_meta_filename(step_num, &record.step_id));
+    let meta_path = steps_dir.join(step_meta_filename(step_num, &record.step_id));
     let yaml = serde_yaml::to_string(record)?;
     std::fs::write(&meta_path, yaml).map_err(StackError::Write)?;
 
@@ -219,7 +245,8 @@ pub fn write_run_step(
 /// `<step_id>.meta.yaml` exactly. This avoids `pre-fetch.meta.yaml` matching
 /// when `fetch` is requested (real collisions surfaced this in tests).
 pub fn read_run_step_content(run_path: &Path, step_id: &str) -> Result<String, StackError> {
-    let entries = std::fs::read_dir(run_path).map_err(StackError::Read)?;
+    let steps_dir = run_path.join(STEPS_SUBDIR);
+    let entries = std::fs::read_dir(&steps_dir).map_err(StackError::Read)?;
     let target = format!("{step_id}.meta.yaml");
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -236,7 +263,7 @@ pub fn read_run_step_content(run_path: &Path, step_id: &str) -> Result<String, S
         let yaml = std::fs::read_to_string(entry.path()).map_err(StackError::Read)?;
         let rec: StepRecord = serde_yaml::from_str(&yaml)?;
         let content =
-            std::fs::read_to_string(run_path.join(&rec.output_file)).map_err(StackError::Read)?;
+            std::fs::read_to_string(steps_dir.join(&rec.output_file)).map_err(StackError::Read)?;
         return Ok(content);
     }
     Err(StackError::StepNotFound(step_id.to_string()))
@@ -342,13 +369,17 @@ mod tests {
 
     #[test]
     fn write_and_read_run_step_roundtrip() {
+        // Issue #31 layout: step content and meta live in `<run>/steps/`,
+        // not directly in the run directory.
         let dir = tempfile::tempdir().unwrap();
         let run_path = dir.path().join("dev-20260429-100000");
 
         let rec = record(1, "design", "md");
         let path = write_run_step(&run_path, 1, &rec, "# Design\nbody").unwrap();
-        assert_eq!(path, run_path.join("01-design.md"));
-        assert!(run_path.join("01-design.meta.yaml").exists());
+        assert_eq!(path, run_path.join("steps").join("01-design.md"));
+        assert!(run_path.join("steps").join("01-design.meta.yaml").exists());
+        // Content must NOT live at the run root -- that was the #159 bug.
+        assert!(!run_path.join("01-design.md").exists());
 
         let body = read_run_step_content(&run_path, "design").unwrap();
         assert_eq!(body, "# Design\nbody");
@@ -357,9 +388,27 @@ mod tests {
     #[test]
     fn read_run_step_not_found_errors() {
         let dir = tempfile::tempdir().unwrap();
-        ensure_dir(dir.path()).unwrap();
+        // The reader scans the `steps/` subdir; without it the read errors
+        // at the directory layer rather than reporting StepNotFound.
+        init_run_layout(dir.path()).unwrap();
         let err = read_run_step_content(dir.path(), "ghost").unwrap_err();
         assert!(matches!(err, StackError::StepNotFound(_)));
+    }
+
+    #[test]
+    fn init_run_layout_creates_subdirs() {
+        // The run-start hook must create `steps/` and an empty `messages/`
+        // (issue #159, #153 prep). Idempotent so callers can invoke it
+        // defensively without checking first.
+        let dir = tempfile::tempdir().unwrap();
+        let run_path = dir.path().join("flow-20260429-100000");
+
+        init_run_layout(&run_path).unwrap();
+        assert!(run_path.join(STEPS_SUBDIR).is_dir());
+        assert!(run_path.join(MESSAGES_SUBDIR).is_dir());
+
+        // Idempotent: a second call must not fail.
+        init_run_layout(&run_path).unwrap();
     }
 
     #[test]
@@ -386,7 +435,8 @@ mod tests {
         let rec = record(1, "design", "md");
         write_run_step(&run_path, 1, &rec, "body").unwrap();
 
-        let meta = std::fs::read_to_string(run_path.join("01-design.meta.yaml")).unwrap();
+        let meta =
+            std::fs::read_to_string(run_path.join("steps").join("01-design.meta.yaml")).unwrap();
         assert!(meta.contains("step_id: design"));
         assert!(meta.contains("type: llm"));
         assert!(meta.contains("backend: claude-cli"));
@@ -409,8 +459,10 @@ mod tests {
         second.started_at = "2026-04-29T10:00:42Z".to_string();
         write_run_step(&run_path, 2, &second, "body").unwrap();
 
-        let meta1 = std::fs::read_to_string(run_path.join("01-design.meta.yaml")).unwrap();
-        let meta2 = std::fs::read_to_string(run_path.join("02-build.meta.yaml")).unwrap();
+        let meta1 =
+            std::fs::read_to_string(run_path.join("steps").join("01-design.meta.yaml")).unwrap();
+        let meta2 =
+            std::fs::read_to_string(run_path.join("steps").join("02-build.meta.yaml")).unwrap();
         assert!(meta1.contains("started_at: 2026-04-29T10:00:00Z"));
         assert!(meta2.contains("started_at: 2026-04-29T10:00:42Z"));
         assert_ne!(

@@ -782,12 +782,12 @@ async fn run_up(
         effective_vars.clone(),
     );
 
-    // Per-run directory layout (issue #31): create the run_path up front and
-    // drop the resolution audit there so the on-disk audit and the per-step
-    // files share the same directory regardless of whether the run later
-    // succeeds. If the run fails, the audit is still recoverable for
-    // post-mortem.
-    stack::ensure_dir(&ctx.run_path).map_err(|e| eyre!("failed to create run dir: {e}"))?;
+    // Per-run directory layout (issue #31): create the run_path up front --
+    // including its `steps/` and `messages/` subdirs (issue #159) -- and drop
+    // the resolution audit there so the on-disk audit and the per-step files
+    // share the same directory regardless of whether the run later succeeds.
+    // If the run fails, the audit is still recoverable for post-mortem.
+    stack::init_run_layout(&ctx.run_path).map_err(|e| eyre!("failed to create run dir: {e}"))?;
     if let Err(e) = stack::write_resolution_audit(&ctx.run_path, &audit_text) {
         eprintln!("warning: failed to write resolution-audit.txt: {e}");
     }
