@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::path::PathBuf;
 
 use crate::config::Backend;
 
@@ -22,13 +23,21 @@ pub enum ExecutorError {
 // --- Types ---
 
 /// Describes what to execute.
+///
+/// `stdout_file`, when set, instructs the executor to stream the child's
+/// stdout to that file line-by-line while the process runs, so a watcher
+/// (`tail -f`) sees output as it is produced. The same content is also
+/// captured in memory and returned via [`ExecutionOutput::stdout`] when
+/// [`Executor::wait`] resolves.
 pub struct ExecutionTask {
     pub id: String,
     pub command: String,
     pub env: HashMap<String, String>,
+    pub stdout_file: Option<PathBuf>,
 }
 
 /// Handle to a running execution, used to poll/wait/stop.
+#[derive(Debug)]
 pub struct ExecutionHandle {
     pub id: String,
     pub metadata: HashMap<String, String>,

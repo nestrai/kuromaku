@@ -266,6 +266,12 @@ fn build_user_prompt(task: &str, step: &Step, stack_path: &Path) -> Result<Strin
 }
 
 /// Run a step via the Executor (CLI backends: claude-cli, ollama).
+///
+/// `output_path`, when set, is passed to the executor so stdout streams to
+/// that file line-by-line during execution -- the file fills up live and a
+/// concurrent `tail -f` sees output without waiting for the agent to finish
+/// (issue #16).
+#[allow(clippy::too_many_arguments)]
 async fn run_step_via_executor(
     executor: &dyn ExecutorBoxed,
     step: &Step,
@@ -274,6 +280,7 @@ async fn run_step_via_executor(
     user_content: &str,
     model: &str,
     backend: Backend,
+    output_path: &Path,
 ) -> Result<(String, Option<llm::Usage>), RunError> {
     // Build unique session name: koto-<project>-<flow>-<step>-<short-id>
     let project = std::env::current_dir()
@@ -301,6 +308,7 @@ async fn run_step_via_executor(
         id: task_id,
         command,
         env: HashMap::new(),
+        stdout_file: Some(output_path.to_path_buf()),
     };
 
     let handle = executor
@@ -398,6 +406,9 @@ async fn run_shell_step(
         id: task_id,
         command: command.to_string(),
         env: HashMap::new(),
+        // Streamed: shell stdout fills the artifact file live so the user
+        // can `tail -f` long-running commands (issue #16).
+        stdout_file: Some(output_path.to_path_buf()),
     };
 
     let handle = executor
@@ -444,10 +455,9 @@ async fn run_shell_step(
         source: e,
     })?;
 
-    std::fs::write(&output_path, &stdout).map_err(|e| RunError::Stack {
-        step: step.id.clone(),
-        source: stack::StackError::Write(e),
-    })?;
+    // The artifact file was streamed to during execution (issue #16) so no
+    // post-hoc write is needed here. The on-disk content matches `stdout`
+    // modulo a trailing newline preserved from the raw stream.
 
     let display_path = output_path
         .canonicalize()
@@ -590,6 +600,7 @@ pub async fn run_steps(
                 &user_content,
                 effective_model,
                 effective_backend,
+                &output_path,
             )
             .await?
         } else {
@@ -623,11 +634,15 @@ pub async fn run_steps(
             source: e,
         })?;
 
-        // Write artifact to pre-computed output path
-        std::fs::write(&output_path, &content).map_err(|e| RunError::Stack {
-            step: step.id.clone(),
-            source: stack::StackError::Write(e),
-        })?;
+        // Executor backends stream stdout to the artifact file during
+        // execution (issue #16). Only the API backend, which has no live
+        // process to read from, still needs a post-hoc write.
+        if !executor::backend_needs_executor(effective_backend) {
+            std::fs::write(&output_path, &content).map_err(|e| RunError::Stack {
+                step: step.id.clone(),
+                source: stack::StackError::Write(e),
+            })?;
+        }
 
         let tokens_in = usage.as_ref().map(|u| u.input_tokens);
         let tokens_out = usage.as_ref().map(|u| u.output_tokens);
