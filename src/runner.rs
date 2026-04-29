@@ -8,17 +8,30 @@ use crate::koto_config::Seeds;
 use crate::llm::{self, LlmRequest, Message, Role};
 use crate::notify::github::{self, PostOutcome};
 use crate::skills;
-use crate::stack::{self, StepOutput};
+use crate::stack::{self, StepRecord};
 use crate::ui::{self, StepInfo, StepState};
 
 /// Immutable context for a single flow run.
 /// Constructed once in main::run_up(), passed to run_steps() and internal helpers.
 pub struct RunContext {
-    #[allow(dead_code)] // Placeholder for Phase 1.2 (run-ID stack)
+    /// Run-ID, format `<flow>-<YYYYMMDD-HHmmss>` (issue #31).
+    /// Sortable, human-readable, embeds the flow name so multiple flow types
+    /// can share a project's `~/.koto/stacks/<project>/` directory.
     pub run_id: String,
     pub flow_name: String,
     pub task: String,
+    /// Project-level stack directory (`~/.koto/stacks/<project>/`). Kept for
+    /// backward compat -- legacy flat-file callers and tests still reference
+    /// it. New runs write into [`RunContext::run_path`].
     pub stack_path: PathBuf,
+    /// Per-run directory: `<stack_path>/<run_id>/`. Every artifact for this
+    /// run -- step content, step metadata, manifest, resolution audit -- lives
+    /// here. Created on construction so callers can write to it without
+    /// further mkdir bookkeeping.
+    pub run_path: PathBuf,
+    /// UTC start timestamp for the run, captured at construction so the
+    /// manifest's `started_at` matches the run-id timestamp segment exactly.
+    pub started_at: chrono::DateTime<chrono::Utc>,
     pub guide: Option<String>,
     pub rules_cache: HashMap<String, String>,
     pub skills_cache: HashMap<String, String>,
@@ -43,23 +56,58 @@ impl RunContext {
         skills_cache: HashMap<String, String>,
         template_vars: HashMap<String, String>,
     ) -> Self {
-        let now = chrono::Local::now();
-        let ts = now.format("%Y%m%d-%H%M%S").to_string();
-        // Short hash from timestamp nanos for uniqueness
-        let hash = format!("{:03x}", now.timestamp_subsec_nanos() & 0xFFF);
-        let run_id = format!("{ts}-{hash}");
+        // Single source of truth for both run_id and started_at. The local
+        // timezone is used for the human-readable id so it lines up with the
+        // user's wall clock; UTC is recorded separately for the manifest.
+        let started_at_utc = chrono::Utc::now();
+        let local = started_at_utc.with_timezone(&chrono::Local);
+        let ts = local.format("%Y%m%d-%H%M%S").to_string();
+        // Two `koto up` calls in the same wall-clock second would otherwise
+        // share a run_id and clobber each other's outputs. Bump a numeric
+        // suffix until we find a free directory so the timestamp stays
+        // human-readable in the common case and only collisions get `-2`,
+        // `-3`, ... appended.
+        let (run_id, run_path) = unique_run_path(&stack_path, &format!("{flow_name}-{ts}"));
 
         Self {
             run_id,
             flow_name,
             task,
             stack_path,
+            run_path,
+            started_at: started_at_utc,
             guide,
             rules_cache,
             skills_cache,
             template_vars,
             poster: github::gh_poster(),
         }
+    }
+}
+
+/// Pick a run directory that does not already exist, appending `-2`, `-3`, ...
+/// when the timestamp-based base name collides. The base name format
+/// (`<flow>-YYYYMMDD-HHmmss`) only resolves to seconds, so two runs started in
+/// the same wall-clock second would otherwise share a directory and overwrite
+/// each other -- which defeats the per-run audit promise behind issue #31.
+///
+/// There is a TOCTOU window between the `exists()` check and the directory
+/// being created later in the run, but `koto up` invocations are user-driven
+/// (not a service loop), so the race is bounded by how fast a human can press
+/// Enter twice. The overwrite bug, by contrast, hits any back-to-back run.
+fn unique_run_path(stack_path: &Path, base: &str) -> (String, PathBuf) {
+    let direct = stack_path.join(base);
+    if !direct.exists() {
+        return (base.to_string(), direct);
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}-{n}");
+        let path = stack_path.join(&candidate);
+        if !path.exists() {
+            return (candidate, path);
+        }
+        n += 1;
     }
 }
 
@@ -90,7 +138,8 @@ pub enum RunError {
     Skill(#[from] skills::SkillsError),
 }
 
-/// Result of running a single step, used for the summary table.
+/// Result of running a single step, used for the summary table and the run
+/// manifest (issue #31).
 ///
 /// `backend` is a string rather than the [`Backend`] enum so shell steps
 /// (issue #23) can report `"shell"` without polluting the LLM-backend enum.
@@ -102,26 +151,31 @@ pub struct StepRunResult {
     pub duration: std::time::Duration,
     pub tokens_in: Option<u32>,
     pub tokens_out: Option<u32>,
+    /// Path of the content file relative to [`RunContext::stack_path`]
+    /// (e.g. `dev-20260429-100000/01-design.md`). The summary table prints
+    /// this and `main` joins it with `stack_path` to render output via
+    /// termimad when `print_output: true`.
     pub output_file: String,
     pub print_output: bool,
+    /// Per-step record assembled while the step ran. Used by `main` to build
+    /// the run manifest. Cloned from the same data written to
+    /// `<step_num>-<step_id>.meta.yaml` so the manifest and the per-step file
+    /// are guaranteed to match.
+    pub record: StepRecord,
 }
 
-/// Generate an auto-named output filename: `<flow>-<timestamp>-<step>-<agent>.md`
-fn auto_output_filename(flow_name: &str, step_id: &str, agent_name: &str) -> String {
-    let now = chrono::Local::now();
-    let ts = now.format("%Y%m%d-%H%M");
-    format!("{flow_name}-{ts}-{step_id}-{agent_name}.md")
-}
-
-/// Output filename for shell steps: `<flow>-<timestamp>-<step>-shell.txt`.
+/// Output filename for shell steps inside a run directory: `NN-<step_id>.txt`.
 ///
 /// Uses `.txt` rather than `.md` because shell stdout isn't markdown -- a
 /// downstream `print_output: true` would render terminal escapes through
-/// termimad otherwise.
-fn shell_output_filename(flow_name: &str, step_id: &str) -> String {
-    let now = chrono::Local::now();
-    let ts = now.format("%Y%m%d-%H%M");
-    format!("{flow_name}-{ts}-{step_id}-shell.txt")
+/// termimad otherwise. The numbering matches the topo order of the run.
+fn shell_output_filename(step_num: usize, step_id: &str) -> String {
+    stack::step_content_filename(step_num, step_id, "txt")
+}
+
+/// Output filename for LLM steps inside a run directory: `NN-<step_id>.md`.
+fn llm_output_filename(step_num: usize, step_id: &str) -> String {
+    stack::step_content_filename(step_num, step_id, "md")
 }
 
 /// Load `.koto/Guide.md` if it exists. Test-only single-dir variant; the
@@ -234,18 +288,22 @@ fn build_system_prompt(
 }
 
 /// Build the user-facing prompt with context from prior steps.
-fn build_user_prompt(task: &str, step: &Step, stack_path: &Path) -> Result<String, RunError> {
+///
+/// Reads the prior step content from the per-run directory (issue #31). The
+/// runner writes both an LLM `.md` and a shell `.txt` body keyed by step id;
+/// this lookup doesn't care about the kind because it just splices the body
+/// text into the next agent's prompt.
+fn build_user_prompt(task: &str, step: &Step, run_path: &Path) -> Result<String, RunError> {
     let mut context_parts: Vec<String> = Vec::new();
     for input_id in &step.input {
-        let prior = stack::read_step(stack_path, input_id).map_err(|e| RunError::Stack {
-            step: step.id.clone(),
-            source: e,
-        })?;
-        let output_label = prior.step_id.clone();
-        ui::print_context_injection(&output_label, &format!("{input_id}.json"), "");
+        let body =
+            stack::read_run_step_content(run_path, input_id).map_err(|e| RunError::Stack {
+                step: step.id.clone(),
+                source: e,
+            })?;
+        ui::print_context_injection(input_id, input_id, "");
         context_parts.push(format!(
-            "--- Output from step '{output_label}' ---\n{}\n---",
-            prior.response
+            "--- Output from step '{input_id}' ---\n{body}\n---"
         ));
     }
 
@@ -383,9 +441,13 @@ async fn run_shell_step(
     ui::print_shell_step_banner(step_num, total, &step.id, command, &step.input);
 
     // Pre-compute and announce the output path so users can `tail -f` it
-    // even if the command takes a while.
-    let output_file = shell_output_filename(&ctx.flow_name, &step.id);
-    let output_path = ctx.stack_path.join(&output_file);
+    // even if the command takes a while. Layout from issue #31:
+    // `<stack>/<run-id>/NN-<step>.txt` -- numbered by execution order.
+    let content_filename = shell_output_filename(step_num, &step.id);
+    let output_path = ctx.run_path.join(&content_filename);
+    // The summary table and `print_output:true` resolve via stack_path, so
+    // the relative output_file embeds the run id segment.
+    let output_file = format!("{}/{}", ctx.run_id, content_filename);
     if let Some(parent) = output_path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
@@ -398,6 +460,10 @@ async fn run_shell_step(
     );
 
     let start = Instant::now();
+    // Capture the step's wall-clock start so the manifest reflects when this
+    // step actually began -- not when the run started. Without this, every
+    // step shares `ctx.started_at` and the audit trail collapses.
+    let step_started_at = chrono::Utc::now();
     let spinner = ui::start_spinner();
 
     // Build a unique task ID, mirroring run_step_via_executor so log/process
@@ -451,25 +517,33 @@ async fn run_shell_step(
 
     let stdout = exec_output.stdout;
 
-    // Write to stack: agent_id is empty (no agent), model is "shell" so
-    // downstream tooling can tell shell steps apart.
-    let timestamp = chrono::Utc::now().to_rfc3339();
-    let step_output = StepOutput {
+    // Build the per-step record, then write it alongside the content file.
+    // The content was streamed during execution (issue #16); we still
+    // overwrite to make sure the on-disk body matches the stdout the manifest
+    // refers to (the streamed file may carry a trailing newline that the
+    // collected stdout doesn't, and vice versa).
+    let started_at = step_started_at.to_rfc3339();
+    let record = StepRecord {
         step_id: step.id.clone(),
-        agent_id: String::new(),
-        model: "shell".to_string(),
-        prompt: command.to_string(),
-        response: stdout.clone(),
-        timestamp,
+        kind: "shell".to_string(),
+        agent: None,
+        model_requested: None,
+        model_actual: None,
+        backend: "shell".to_string(),
+        tokens_in: None,
+        tokens_out: None,
+        duration_ms: duration.as_millis(),
+        started_at,
+        exit_code: 0,
+        input_steps: step.input.clone(),
+        output_file: content_filename.clone(),
     };
-    stack::write_step(&ctx.stack_path, &step_output).map_err(|e| RunError::Stack {
-        step: step.id.clone(),
-        source: e,
+    stack::write_run_step(&ctx.run_path, step_num, &record, &stdout).map_err(|e| {
+        RunError::Stack {
+            step: step.id.clone(),
+            source: e,
+        }
     })?;
-
-    // The artifact file was streamed to during execution (issue #16) so no
-    // post-hoc write is needed here. The on-disk content matches `stdout`
-    // modulo a trailing newline preserved from the raw stream.
 
     let display_path = output_path
         .canonicalize()
@@ -530,6 +604,7 @@ async fn run_shell_step(
         tokens_out: None,
         output_file,
         print_output: step.print_output,
+        record,
     })
 }
 
@@ -580,11 +655,16 @@ pub async fn run_steps(
         // All steps get the flow prompt; step.task is appended in build_user_prompt
         let step_task = ctx.task.to_string();
 
-        let user_content = build_user_prompt(&step_task, step, &ctx.stack_path)?;
+        let user_content = build_user_prompt(&step_task, step, &ctx.run_path)?;
 
-        // Pre-compute output path and show it immediately so user can tail -f
-        let output_file = auto_output_filename(&ctx.flow_name, &step.id, &agent.name);
-        let output_path = ctx.stack_path.join(&output_file);
+        // Pre-compute output path and show it immediately so user can tail -f.
+        // Layout: `<stack>/<run-id>/NN-<step>.md`. The summary table renders
+        // `<run-id>/NN-<step>.md` so `print_output: true` joins it with
+        // `stack_path` to find the file.
+        let step_num = i + 1;
+        let content_filename = llm_output_filename(step_num, &step.id);
+        let output_path = ctx.run_path.join(&content_filename);
+        let output_file = format!("{}/{}", ctx.run_id, content_filename);
         if let Some(parent) = output_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -601,6 +681,10 @@ pub async fn run_steps(
             build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
 
         let start = Instant::now();
+        // Capture per-step wall-clock start. Sharing `ctx.started_at` across
+        // every step would make the manifest's `started_at` indistinguishable
+        // between steps even when their durations differ.
+        let step_started_at = chrono::Utc::now();
         let spinner = ui::start_spinner();
 
         let (content, usage) = if executor::backend_needs_executor(effective_backend) {
@@ -631,33 +715,39 @@ pub async fn run_steps(
         spinner.stop();
         let duration = start.elapsed();
 
-        // Save to stack
-        let timestamp = chrono::Utc::now().to_rfc3339();
-        let step_output = StepOutput {
-            step_id: step.id.clone(),
-            agent_id: agent.id.clone(),
-            model: effective_model.to_string(),
-            prompt: user_content,
-            response: content.clone(),
-            timestamp,
-        };
-        stack::write_step(&ctx.stack_path, &step_output).map_err(|e| RunError::Stack {
-            step: step.id.clone(),
-            source: e,
-        })?;
-
-        // Executor backends stream stdout to the artifact file during
-        // execution (issue #16). Only the API backend, which has no live
-        // process to read from, still needs a post-hoc write.
-        if !executor::backend_needs_executor(effective_backend) {
-            std::fs::write(&output_path, &content).map_err(|e| RunError::Stack {
-                step: step.id.clone(),
-                source: stack::StackError::Write(e),
-            })?;
-        }
-
         let tokens_in = usage.as_ref().map(|u| u.input_tokens);
         let tokens_out = usage.as_ref().map(|u| u.output_tokens);
+
+        // Build the per-step record. `model_actual` mirrors `model_requested`
+        // today because no backend reports back a server-side concrete model
+        // id; the field exists so audits stay schema-stable when one does.
+        let record = StepRecord {
+            step_id: step.id.clone(),
+            kind: "llm".to_string(),
+            agent: Some(agent.name.clone()),
+            model_requested: Some(effective_model.to_string()),
+            model_actual: Some(effective_model.to_string()),
+            backend: backend_name(effective_backend).to_string(),
+            tokens_in,
+            tokens_out,
+            duration_ms: duration.as_millis(),
+            started_at: step_started_at.to_rfc3339(),
+            exit_code: 0,
+            input_steps: step.input.clone(),
+            output_file: content_filename.clone(),
+        };
+
+        // Write the canonical content file plus the meta.yaml. Executor
+        // backends stream stdout into the artifact file during execution
+        // (issue #16); we still rewrite from `content` here so the byte-for-byte
+        // body referenced by the manifest matches what `read_run_step_content`
+        // returns when downstream steps consume this output.
+        stack::write_run_step(&ctx.run_path, step_num, &record, &content).map_err(|e| {
+            RunError::Stack {
+                step: step.id.clone(),
+                source: e,
+            }
+        })?;
 
         let display_path = output_path
             .canonicalize()
@@ -727,6 +817,7 @@ pub async fn run_steps(
             tokens_out,
             output_file,
             print_output: step.print_output,
+            record,
         });
     }
 
@@ -815,8 +906,23 @@ mod tests {
             duration: std::time::Duration::from_secs(5),
             tokens_in: Some(1200),
             tokens_out: Some(800),
-            output_file: "dev-20260421-1052-design-Levi.md".to_string(),
+            output_file: "dev-20260421-105200/01-design.md".to_string(),
             print_output: false,
+            record: StepRecord {
+                step_id: "design".to_string(),
+                kind: "llm".to_string(),
+                agent: Some("Levi".to_string()),
+                model_requested: Some("claude-sonnet-4-5".to_string()),
+                model_actual: Some("claude-sonnet-4-5".to_string()),
+                backend: "api".to_string(),
+                tokens_in: Some(1200),
+                tokens_out: Some(800),
+                duration_ms: 5000,
+                started_at: "2026-04-21T10:52:00Z".to_string(),
+                exit_code: 0,
+                input_steps: vec![],
+                output_file: "01-design.md".to_string(),
+            },
         }];
         let summary = build_summary(&results);
         assert_eq!(summary.len(), 1);
@@ -992,11 +1098,10 @@ mod tests {
     }
 
     #[test]
-    fn auto_output_filename_format() {
-        let name = auto_output_filename("development", "design", "Levi");
-        assert!(name.starts_with("development-"));
-        assert!(name.contains("-design-Levi.md"));
-        assert!(name.ends_with(".md"));
+    fn llm_output_filename_format() {
+        // Issue #31 layout: NN-<step>.md, two-digit zero-padded.
+        assert_eq!(llm_output_filename(1, "design"), "01-design.md");
+        assert_eq!(llm_output_filename(12, "review"), "12-review.md");
     }
 
     #[test]
@@ -1022,10 +1127,38 @@ mod tests {
     fn shell_output_filename_uses_txt_extension() {
         // .txt rather than .md so termimad doesn't try to render shell output
         // as markdown when print_output: true is set on a shell step.
-        let name = shell_output_filename("dev", "fetch");
-        assert!(name.starts_with("dev-"), "got: {name}");
-        assert!(name.contains("-fetch-shell."), "got: {name}");
-        assert!(name.ends_with(".txt"), "got: {name}");
+        // Layout: NN-<step>.txt under the run directory (issue #31).
+        let name = shell_output_filename(1, "fetch");
+        assert_eq!(name, "01-fetch.txt");
+    }
+
+    #[test]
+    fn unique_run_path_uses_base_when_free() {
+        // Happy path: nothing on disk yet, so the base name is taken verbatim
+        // and the timestamp stays human-readable.
+        let dir = tempfile::tempdir().unwrap();
+        let (id, path) = unique_run_path(dir.path(), "review-20260429-100000");
+        assert_eq!(id, "review-20260429-100000");
+        assert_eq!(path, dir.path().join("review-20260429-100000"));
+    }
+
+    #[test]
+    fn unique_run_path_bumps_suffix_when_directory_exists() {
+        // Two `koto up` calls in the same wall-clock second must not collide.
+        // The first creates `<base>`, the second falls back to `<base>-2`,
+        // and so on. Without this, the second run silently overwrites the
+        // first run's outputs and the audit trail is destroyed.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("review-20260429-100000")).unwrap();
+        std::fs::create_dir_all(dir.path().join("review-20260429-100000-2")).unwrap();
+
+        let (id, path) = unique_run_path(dir.path(), "review-20260429-100000");
+        assert_eq!(id, "review-20260429-100000-3");
+        assert_eq!(path, dir.path().join("review-20260429-100000-3"));
+        assert!(
+            !path.exists(),
+            "unique_run_path must return a path that doesn't exist yet"
+        );
     }
 
     /// Build a minimal RunContext for shell-step tests that don't need a real
@@ -1062,7 +1195,7 @@ mod tests {
     #[tokio::test]
     async fn shell_step_captures_stdout_to_stack() {
         // Acceptance: stdout is captured as the step output and written to
-        // the stack same as LLM outputs.
+        // the run directory same as LLM outputs (issue #31).
         let dir = tempfile::tempdir().unwrap();
         let ctx = shell_test_ctx(dir.path().to_path_buf());
         let executor = executor::create_executor();
@@ -1077,13 +1210,15 @@ mod tests {
         assert!(result.tokens_in.is_none());
         assert!(result.tokens_out.is_none());
 
-        // Stack record uses the same StepOutput schema as LLM steps so
-        // downstream `input:` consumers don't need to know the difference.
-        let saved = stack::read_step(dir.path(), "greet").unwrap();
-        assert_eq!(saved.response, "hello-from-shell");
-        assert_eq!(saved.agent_id, "");
-        assert_eq!(saved.model, "shell");
-        assert_eq!(saved.prompt, "echo hello-from-shell");
+        // Run-directory layout: NN-<id>.txt + NN-<id>.meta.yaml. The body is
+        // discoverable by step id without a reader needing to know the
+        // numbering, so downstream `input:` consumers stay simple.
+        let body = stack::read_run_step_content(&ctx.run_path, "greet").unwrap();
+        assert_eq!(body, "hello-from-shell");
+        // Per-step metadata records that this was a shell step.
+        assert_eq!(result.record.kind, "shell");
+        assert_eq!(result.record.backend, "shell");
+        assert!(result.record.agent.is_none());
     }
 
     #[tokio::test]
@@ -1123,8 +1258,132 @@ mod tests {
             .await
             .unwrap();
 
-        // The next step would call stack::read_step("fetch") -- mirror that.
-        let prior = stack::read_step(dir.path(), "fetch").unwrap();
-        assert_eq!(prior.response, "diff content");
+        // The next step would call stack::read_run_step_content("fetch") via
+        // build_user_prompt -- mirror that read here so the test matches the
+        // live consumer path.
+        let prior = stack::read_run_step_content(&ctx.run_path, "fetch").unwrap();
+        assert_eq!(prior, "diff content");
+    }
+
+    // --- run-ID stack layout (issue #31) ---
+
+    #[test]
+    fn run_id_format_is_flow_then_timestamp() {
+        // Acceptance: run-ID is `<flow>-<YYYYMMDD-HHmmss>`. The flow name and
+        // the timestamp segment are visible in the produced id; the run_path
+        // is `<stack_path>/<run_id>`.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "review".to_string(),
+            "task".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+
+        assert!(
+            ctx.run_id.starts_with("review-"),
+            "run_id should start with flow name: {}",
+            ctx.run_id
+        );
+        // Trailing segment is YYYYMMDD-HHmmss = 8+1+6 = 15 chars.
+        let suffix = &ctx.run_id["review-".len()..];
+        assert_eq!(suffix.len(), 15, "got: {suffix}");
+        assert!(
+            suffix.chars().nth(8) == Some('-'),
+            "missing date/time separator: {suffix}"
+        );
+
+        assert_eq!(ctx.run_path, dir.path().join(&ctx.run_id));
+    }
+
+    #[tokio::test]
+    async fn build_user_prompt_reads_prior_step_from_run_dir() {
+        // Acceptance: build_user_prompt resolves `input:` against the per-run
+        // directory layout. We seed the run dir via the public stack helpers
+        // -- same code path the runner uses.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_test_ctx(dir.path().to_path_buf());
+        let rec = stack::StepRecord {
+            step_id: "fetch".to_string(),
+            kind: "shell".to_string(),
+            agent: None,
+            model_requested: None,
+            model_actual: None,
+            backend: "shell".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 5,
+            started_at: ctx.started_at.to_rfc3339(),
+            exit_code: 0,
+            input_steps: vec![],
+            output_file: stack::step_content_filename(1, "fetch", "txt"),
+        };
+        stack::write_run_step(&ctx.run_path, 1, &rec, "PR diff goes here").unwrap();
+
+        let downstream = crate::config::Step {
+            id: "review".to_string(),
+            agent: "Bella".to_string(),
+            role: None,
+            task: Some("Review the diff".to_string()),
+            run: None,
+            input: vec!["fetch".to_string()],
+            needs: vec![],
+            model: None,
+            backend: None,
+            print_output: false,
+            post_comment: None,
+        };
+
+        let prompt = build_user_prompt("Top-level task", &downstream, &ctx.run_path).unwrap();
+        // Top-level task and per-step task are both present.
+        assert!(prompt.contains("Top-level task"));
+        assert!(prompt.contains("Your task: Review the diff"));
+        // Prior step body is spliced in.
+        assert!(prompt.contains("PR diff goes here"));
+        assert!(prompt.contains("Output from step 'fetch'"));
+    }
+
+    #[tokio::test]
+    async fn run_steps_writes_per_step_files_and_meta_in_run_dir() {
+        // Acceptance: every koto up creates a run directory with NN-<step>.md
+        // (or .txt) and NN-<step>.meta.yaml per step. Two shell steps are
+        // enough to exercise the numbering and the input-handoff.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_test_ctx(dir.path().to_path_buf());
+
+        let step_one = shell_step("fetch", "printf 'one'");
+        let mut step_two = shell_step("collect", "printf 'two'");
+        // collect depends on fetch so we exercise the input read on the new
+        // layout while we are at it.
+        step_two.input = vec!["fetch".to_string()];
+        let steps = vec![&step_one, &step_two];
+
+        let results = run_steps(&steps, &[], &ctx).await.unwrap();
+        assert_eq!(results.len(), 2);
+
+        // Step content files are zero-padded and numbered by topo order.
+        assert!(ctx.run_path.join("01-fetch.txt").exists());
+        assert!(ctx.run_path.join("01-fetch.meta.yaml").exists());
+        assert!(ctx.run_path.join("02-collect.txt").exists());
+        assert!(ctx.run_path.join("02-collect.meta.yaml").exists());
+
+        // Meta yaml is parseable as a StepRecord.
+        let meta = std::fs::read_to_string(ctx.run_path.join("01-fetch.meta.yaml")).unwrap();
+        let parsed: stack::StepRecord = serde_yaml::from_str(&meta).unwrap();
+        assert_eq!(parsed.step_id, "fetch");
+        assert_eq!(parsed.kind, "shell");
+        assert_eq!(parsed.output_file, "01-fetch.txt");
+
+        // The summary's output_file is `<run_id>/NN-<id>.<ext>` so
+        // print_output joins it with stack_path correctly.
+        assert!(
+            results[0].output_file.starts_with(&ctx.run_id),
+            "got: {}",
+            results[0].output_file
+        );
+        assert!(results[0].output_file.ends_with("/01-fetch.txt"));
     }
 }

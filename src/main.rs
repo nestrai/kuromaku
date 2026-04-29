@@ -32,10 +32,11 @@ mod ui;
 
 use crate::koto_config::{KOTO_CONFIG_FILE, KotoConfig, Seeds};
 use crate::resolver::{
-    ResolvedRole, RoleOverride, parse_role_override, print_audit, resolve_role,
+    ResolvedRole, RoleOverride, format_audit, parse_role_override, print_audit, resolve_role,
     validate_role_overrides,
 };
-use crate::runner::RunContext;
+use crate::runner::{RunContext, StepRunResult};
+use crate::stack::{Manifest, ResourceRecord, RoleResolution, SeedRecord};
 
 const KOTO_DIR: &str = ".koto";
 
@@ -369,7 +370,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     // (`coding/rust/Sage`) work the same way as in flow runs.
     let mut agents = Vec::new();
     for name in agent_names {
-        let (agent, _seed_idx) =
+        let (agent, _seed_idx, _sha) =
             config::load_agent_file_with_seeds(&seeds, name, &defaults, koto_config.as_ref())?;
         agents.push(agent);
     }
@@ -676,8 +677,10 @@ async fn run_up(
     );
 
     // Load agents through seeds. The origins map records which seed each
-    // agent came from -- the audit prints that next to the role name.
-    let (agents, agent_origins) =
+    // agent came from (used by the audit). `agent_hashes` captures the
+    // SHA-256 of the bytes that were actually read from disk so the manifest
+    // can record what the LLM saw, not what's on disk at manifest-write time.
+    let (agents, agent_origins, agent_hashes) =
         config::load_agents_for_flow_with_seeds(&seeds, &flow_config, koto_config.as_ref())?;
 
     // Build the per-step role -> resolved binding map for the cascade.
@@ -703,7 +706,10 @@ async fn run_up(
 
     // Audit output: show the seed list, the resolved binding for every role
     // and a CLI vars summary. Print before any execution starts so the user
-    // can ctrl-C if a resolution looks wrong.
+    // can ctrl-C if a resolution looks wrong. The same text is captured below
+    // for the run directory's `resolution-audit.txt` (issue #31), so the
+    // on-disk audit matches what the user saw in the terminal.
+    let audit_text = format_audit(&seeds, &resolved_roles, &cli_vars_map);
     print_audit(&seeds, &resolved_roles, &cli_vars_map);
 
     // Apply role-derived model and backend overrides to every step that uses
@@ -776,8 +782,43 @@ async fn run_up(
         effective_vars.clone(),
     );
 
+    // Per-run directory layout (issue #31): create the run_path up front and
+    // drop the resolution audit there so the on-disk audit and the per-step
+    // files share the same directory regardless of whether the run later
+    // succeeds. If the run fails, the audit is still recoverable for
+    // post-mortem.
+    stack::ensure_dir(&ctx.run_path).map_err(|e| eyre!("failed to create run dir: {e}"))?;
+    if let Err(e) = stack::write_resolution_audit(&ctx.run_path, &audit_text) {
+        eprintln!("warning: failed to write resolution-audit.txt: {e}");
+    }
+
     // Run steps
     let results = runner::run_steps(&steps, &agents, &ctx).await?;
+
+    // Manifest write happens only on success (issue #31). On failure the
+    // per-step files and the resolution audit are still on disk; the absence
+    // of `manifest.yaml` is the signal that the run did not complete.
+    let manifest = build_manifest(
+        &ctx,
+        &flow_name,
+        &path,
+        &contents,
+        &seeds,
+        &agents,
+        &agent_origins,
+        &agent_hashes,
+        &resolved_roles,
+        &effective_vars,
+        &results,
+        flow_start.elapsed(),
+    );
+    // Manifest write must propagate. The doc comment on this run path
+    // promises that the absence of `manifest.yaml` signals an incomplete
+    // run; swallowing a disk-full or permission failure with `eprintln!`
+    // would silently violate that invariant on a successful exit code.
+    // Fail the run instead so the absence is genuine.
+    stack::write_manifest(&ctx.run_path, &manifest)
+        .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
 
     // Print summary
     let total_elapsed = flow_start.elapsed();
@@ -806,6 +847,189 @@ async fn run_up(
     }
 
     Ok(())
+}
+
+/// Build the run manifest (issue #31). Pure function so it can be tested in
+/// isolation -- no I/O is performed here; the caller writes the result to
+/// `<run_path>/manifest.yaml`.
+///
+/// Resource hashes are best-effort: a missing file (broken symlink, removed
+/// after load) becomes an empty SHA. The manifest stays internally consistent
+/// because every entry whose hash failed will compare unequal across runs --
+/// callers that demand strict reproducibility can flag empty hashes.
+#[allow(clippy::too_many_arguments)]
+fn build_manifest(
+    ctx: &RunContext,
+    flow_name: &str,
+    flow_path: &Path,
+    flow_contents: &str,
+    seeds: &Seeds,
+    agents: &[config::Agent],
+    agent_origins: &std::collections::HashMap<String, usize>,
+    agent_hashes: &std::collections::HashMap<String, String>,
+    roles: &[ResolvedRole],
+    vars: &std::collections::HashMap<String, String>,
+    results: &[StepRunResult],
+    total_elapsed: std::time::Duration,
+) -> Manifest {
+    let finished_at = chrono::Utc::now();
+
+    // Seed records: track display, tilde-expanded path (local seeds only), and
+    // a `dirty` flag. Git SHA pinning is left for #152's full audit work and
+    // intentionally None here so the field is stable for forward compat.
+    let seed_records: Vec<SeedRecord> = seeds
+        .seeds
+        .iter()
+        .map(|s| SeedRecord {
+            display: s.display(),
+            path: s.local_path().map(|p| p.display().to_string()),
+            git_sha: None,
+            dirty: false,
+        })
+        .collect();
+
+    // Resources: flow + agents + rules + guide. Each entry pins the file
+    // path and its SHA-256, so two runs that produced the same output can be
+    // compared by hash alone.
+    let mut resources: Vec<ResourceRecord> = Vec::new();
+    resources.push(ResourceRecord {
+        kind: "flow".to_string(),
+        name: flow_name.to_string(),
+        path: flow_path.display().to_string(),
+        sha256: stack::sha256_hex(flow_contents.as_bytes()),
+    });
+    for agent in agents {
+        // Re-find the agent's source file via seeds. This re-walks the seed
+        // list but is cheap (a couple of stat()s) and keeps `build_manifest`
+        // free of the agent loader's internal state. Nested ids
+        // (`coding/rust/Sage`) are preserved verbatim.
+        let rel = std::path::Path::new("agents").join(format!("{}.yaml", agent.id));
+        let path_str = match seeds.find(&rel) {
+            Ok(Some((_, p))) => p.display().to_string(),
+            _ => agent_origins
+                .get(&agent.id)
+                .and_then(|idx| seeds.seeds.get(*idx))
+                .map(|s| s.display())
+                .unwrap_or_default(),
+        };
+        // Use the SHA captured when the agent file was loaded -- not a fresh
+        // read of disk now. If the user edited the agent file mid-run, the
+        // bytes the LLM saw are gone from disk; the manifest must record the
+        // hash of what was actually used, otherwise the "same hash = same
+        // run" audit promise breaks. Empty fallback only triggers when the
+        // hash map is somehow missing the entry (shouldn't happen for any
+        // agent in `agents`, since the loader populates both in lockstep).
+        let sha = agent_hashes.get(&agent.id).cloned().unwrap_or_default();
+        resources.push(ResourceRecord {
+            kind: "agent".to_string(),
+            name: agent.id.clone(),
+            path: path_str,
+            sha256: sha,
+        });
+    }
+    // Rules: iterate `ctx.rules_cache` so we hash exactly what was injected
+    // into the prompt, not whatever happens to be on disk now.
+    let mut rule_names: Vec<&String> = ctx.rules_cache.keys().collect();
+    rule_names.sort();
+    for name in rule_names {
+        let rel = std::path::Path::new("rules").join(format!("{name}.md"));
+        let path_str = match seeds.find(&rel) {
+            Ok(Some((_, p))) => p.display().to_string(),
+            _ => String::new(),
+        };
+        let content = ctx.rules_cache.get(name).map(String::as_str).unwrap_or("");
+        resources.push(ResourceRecord {
+            kind: "rules".to_string(),
+            name: name.clone(),
+            path: path_str,
+            sha256: stack::sha256_hex(content.as_bytes()),
+        });
+    }
+    // Skills: hash exactly what was injected into the prompt. Two runs that
+    // differ only in skill content would otherwise produce identical hashes
+    // here -- breaking the "same hash = same inputs" audit promise. Skills
+    // live at `.koto/skills/<name>/` (project-local, not in seeds), so the
+    // recorded path stays relative and machine-portable.
+    let mut skill_names: Vec<&String> = ctx.skills_cache.keys().collect();
+    skill_names.sort();
+    for name in skill_names {
+        let content = ctx.skills_cache.get(name).map(String::as_str).unwrap_or("");
+        resources.push(ResourceRecord {
+            kind: "skill".to_string(),
+            name: name.clone(),
+            path: format!(".koto/skills/{name}"),
+            sha256: stack::sha256_hex(content.as_bytes()),
+        });
+    }
+    if let Some(guide) = ctx.guide.as_deref() {
+        let path_str = seeds
+            .find(std::path::Path::new("Guide.md"))
+            .ok()
+            .flatten()
+            .map(|(_, p)| p.display().to_string())
+            .unwrap_or_default();
+        resources.push(ResourceRecord {
+            kind: "guide".to_string(),
+            name: "Guide".to_string(),
+            path: path_str,
+            sha256: stack::sha256_hex(guide.as_bytes()),
+        });
+    }
+
+    let role_records: Vec<RoleResolution> = roles
+        .iter()
+        .map(|r| RoleResolution {
+            role: r.name.clone(),
+            agent: r.agent.clone(),
+            model: r.model.clone(),
+            backend: backend_label_static(r.backend).to_string(),
+            model_source: r.model_source.clone(),
+            backend_source: r.backend_source.clone(),
+            seed_origin: r.seed_origin.clone(),
+        })
+        .collect();
+
+    // Vars: sort by key for stable manifest output. IndexMap preserves
+    // insertion order so YAML diffs across runs stay readable.
+    let mut keys: Vec<&String> = vars.keys().collect();
+    keys.sort();
+    let var_map: indexmap::IndexMap<String, String> = keys
+        .into_iter()
+        .map(|k| (k.clone(), vars[k].clone()))
+        .collect();
+
+    let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
+    let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
+
+    Manifest {
+        version: 1,
+        run_id: ctx.run_id.clone(),
+        flow_name: flow_name.to_string(),
+        flow_path: flow_path.display().to_string(),
+        flow_sha256: stack::sha256_hex(flow_contents.as_bytes()),
+        started_at: ctx.started_at.to_rfc3339(),
+        finished_at: finished_at.to_rfc3339(),
+        duration_ms: total_elapsed.as_millis(),
+        total_tokens_in: total_in,
+        total_tokens_out: total_out,
+        cost: None,
+        vars: var_map,
+        seeds: seed_records,
+        resources,
+        roles: role_records,
+        steps: results.iter().map(|r| r.record.clone()).collect(),
+    }
+}
+
+/// Static label for a backend variant. Mirrors `resolver::backend_label` but
+/// kept here to avoid making that helper public for one caller.
+fn backend_label_static(b: config::Backend) -> &'static str {
+    match b {
+        config::Backend::Api => "api",
+        config::Backend::ClaudeCli => "claude-cli",
+        config::Backend::Codex => "codex",
+        config::Backend::Ollama => "ollama",
+    }
 }
 
 /// Apply the resolver-decided agent for every role in the flow. This walks
@@ -1328,5 +1552,133 @@ mod tests {
 
         assert!(role_overrides.is_empty());
         assert_eq!(template_vars.len(), 2);
+    }
+
+    // --- run manifest (issue #31) ---
+
+    #[test]
+    fn build_manifest_records_run_metadata_and_resources() {
+        use crate::stack::StepRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "review".to_string(),
+            "task".to_string(),
+            dir.path().to_path_buf(),
+            Some("guide content".to_string()),
+            std::collections::HashMap::from([(
+                "rust-developer".to_string(),
+                "Use iterators".to_string(),
+            )]),
+            // Populate a skill so the manifest skill-pinning assertion below
+            // is meaningful. Without this, two runs that differ only in
+            // skill content would hash identically.
+            std::collections::HashMap::from([(
+                "domain-cli".to_string(),
+                "skill content".to_string(),
+            )]),
+            std::collections::HashMap::new(),
+        );
+
+        let flow_path = dir.path().join("flow.yaml");
+        let flow_contents = "version: '1'\nname: review\n";
+        std::fs::write(&flow_path, flow_contents).unwrap();
+
+        let seeds = Seeds::default_local();
+        let agents: Vec<config::Agent> = vec![];
+        let agent_origins: std::collections::HashMap<String, usize> =
+            std::collections::HashMap::new();
+        let agent_hashes: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
+        let roles = vec![ResolvedRole {
+            name: "developer".to_string(),
+            agent: "Sage".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: config::Backend::ClaudeCli,
+            model_source: "agent".to_string(),
+            backend_source: "agent".to_string(),
+            seed_origin: Some(".koto/".to_string()),
+        }];
+        let mut vars = std::collections::HashMap::new();
+        vars.insert("owner".to_string(), "nestrai".to_string());
+        let results: Vec<StepRunResult> = vec![StepRunResult {
+            step_id: "design".to_string(),
+            agent_name: "Sage".to_string(),
+            backend: "api".to_string(),
+            duration: std::time::Duration::from_millis(1234),
+            tokens_in: Some(100),
+            tokens_out: Some(50),
+            output_file: format!("{}/01-design.md", ctx.run_id),
+            print_output: false,
+            record: StepRecord {
+                step_id: "design".to_string(),
+                kind: "llm".to_string(),
+                agent: Some("Sage".to_string()),
+                model_requested: Some("claude-sonnet-4-5".to_string()),
+                model_actual: Some("claude-sonnet-4-5".to_string()),
+                backend: "api".to_string(),
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                duration_ms: 1234,
+                started_at: ctx.started_at.to_rfc3339(),
+                exit_code: 0,
+                input_steps: vec![],
+                output_file: "01-design.md".to_string(),
+            },
+        }];
+
+        let manifest = build_manifest(
+            &ctx,
+            "review",
+            &flow_path,
+            flow_contents,
+            &seeds,
+            &agents,
+            &agent_origins,
+            &agent_hashes,
+            &roles,
+            &vars,
+            &results,
+            std::time::Duration::from_secs(2),
+        );
+
+        // Run identification matches the context.
+        assert_eq!(manifest.run_id, ctx.run_id);
+        assert_eq!(manifest.flow_name, "review");
+        assert_eq!(manifest.flow_path, flow_path.display().to_string());
+        // Hash is a 64-char hex SHA-256.
+        assert_eq!(manifest.flow_sha256.len(), 64);
+        // Resources cover flow + rules + skill + guide (no agents in this fixture).
+        let kinds: Vec<&str> = manifest.resources.iter().map(|r| r.kind.as_str()).collect();
+        assert!(kinds.contains(&"flow"));
+        assert!(kinds.contains(&"rules"));
+        assert!(kinds.contains(&"skill"));
+        assert!(kinds.contains(&"guide"));
+        // Each resource record carries a populated SHA-256.
+        for r in &manifest.resources {
+            assert_eq!(r.sha256.len(), 64, "missing hash for {:?}", r);
+        }
+        // Skill record uses a project-relative path (.koto/skills/<name>) and
+        // its hash matches the cached content -- confirming runs that differ
+        // only in skill content produce different manifest hashes.
+        let skill = manifest
+            .resources
+            .iter()
+            .find(|r| r.kind == "skill")
+            .expect("skill record present");
+        assert_eq!(skill.name, "domain-cli");
+        assert_eq!(skill.path, ".koto/skills/domain-cli");
+        assert_eq!(skill.sha256, stack::sha256_hex(b"skill content"));
+        // Roles round-tripped with backend label normalised.
+        assert_eq!(manifest.roles[0].backend, "claude-cli");
+        assert_eq!(manifest.roles[0].seed_origin.as_deref(), Some(".koto/"));
+        // Steps include the per-step record verbatim and totals are summed.
+        assert_eq!(manifest.steps.len(), 1);
+        assert_eq!(manifest.steps[0].step_id, "design");
+        assert_eq!(manifest.total_tokens_in, 100);
+        assert_eq!(manifest.total_tokens_out, 50);
+        // Cost not tracked yet -- field present, value None for forward compat.
+        assert!(manifest.cost.is_none());
+        assert_eq!(manifest.duration_ms, 2000);
     }
 }

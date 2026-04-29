@@ -313,7 +313,7 @@ pub fn load_agent_file(
             },
         }],
     };
-    let (agent, _origin_seed) =
+    let (agent, _origin_seed, _sha) =
         load_agent_file_with_seeds(&seeds, agent_id, defaults, koto_config)?;
     Ok(agent)
 }
@@ -339,7 +339,7 @@ pub fn load_agent_file_with_seeds(
     agent_id: &str,
     defaults: &Defaults,
     koto_config: Option<&KotoConfig>,
-) -> Result<(Agent, usize), ConfigError> {
+) -> Result<(Agent, usize, String), ConfigError> {
     let rel = agent_rel_path(agent_id);
     let (seed_idx, path) = seeds
         .find(&rel)
@@ -347,6 +347,11 @@ pub fn load_agent_file_with_seeds(
         .ok_or_else(|| ConfigError::Validation(seeds.not_found_message("agent", agent_id)))?;
 
     let contents = std::fs::read_to_string(&path)?;
+    // Hash the bytes we just loaded -- not the file on disk later. If the
+    // user edits the agent file mid-run, the manifest must record the bytes
+    // the LLM actually saw, not whatever happens to be on disk when the
+    // manifest is written. See review on PR #158.
+    let source_sha256 = crate::stack::sha256_hex(contents.as_bytes());
     let raw: RawAgentFile = serde_yaml::from_str(&contents)?;
     warn_unknown_fields(&format!("agent file '{agent_id}'"), &raw.unknown);
 
@@ -365,6 +370,7 @@ pub fn load_agent_file_with_seeds(
             env: raw.env,
         },
         seed_idx,
+        source_sha256,
     ))
 }
 
@@ -411,16 +417,20 @@ fn resolve_agent_model(
 }
 
 /// Load all agents referenced by the flow steps, walking the configured seed
-/// list. Returns the loaded agents in step order plus a parallel map from
-/// agent ID to the seed index it came from -- the audit prints that map so the
-/// user can see overlay decisions at a glance.
+/// list. Returns the loaded agents in step order plus two parallel maps keyed
+/// by agent ID: the seed index each agent came from (used by the audit to
+/// show overlay decisions) and the SHA-256 of the bytes that were actually
+/// read from disk. The hash is captured here -- not at manifest-write time --
+/// so the manifest records what the LLM saw, not what's on disk later.
+#[allow(clippy::type_complexity)]
 pub fn load_agents_for_flow_with_seeds(
     seeds: &Seeds,
     config: &FlowConfig,
     koto_config: Option<&KotoConfig>,
-) -> Result<(Vec<Agent>, HashMap<String, usize>), ConfigError> {
+) -> Result<(Vec<Agent>, HashMap<String, usize>, HashMap<String, String>), ConfigError> {
     let mut agents: Vec<Agent> = Vec::new();
     let mut origins: HashMap<String, usize> = HashMap::new();
+    let mut hashes: HashMap<String, String> = HashMap::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for step in &config.steps {
@@ -430,14 +440,15 @@ pub fn load_agents_for_flow_with_seeds(
             continue;
         }
         if seen.insert(step.agent.clone()) {
-            let (agent, seed_idx) =
+            let (agent, seed_idx, sha) =
                 load_agent_file_with_seeds(seeds, &step.agent, &config.defaults, koto_config)?;
             origins.insert(agent.id.clone(), seed_idx);
+            hashes.insert(agent.id.clone(), sha);
             agents.push(agent);
         }
     }
 
-    Ok((agents, origins))
+    Ok((agents, origins, hashes))
 }
 
 fn warn_unknown_fields(context: &str, fields: &HashMap<String, serde_yaml::Value>) {
@@ -1565,7 +1576,8 @@ flow:
             model: "default-model".to_string(),
             backend: Backend::ClaudeCli,
         };
-        let (agent, idx) = load_agent_file_with_seeds(&seeds, "Sage", &defaults, None).unwrap();
+        let (agent, idx, _sha) =
+            load_agent_file_with_seeds(&seeds, "Sage", &defaults, None).unwrap();
 
         assert_eq!(idx, 0);
         assert_eq!(agent.name, "Sage-from-1");
@@ -1582,7 +1594,8 @@ flow:
             model: "default-model".to_string(),
             backend: Backend::ClaudeCli,
         };
-        let (agent, idx) = load_agent_file_with_seeds(&seeds, "Bella", &defaults, None).unwrap();
+        let (agent, idx, _sha) =
+            load_agent_file_with_seeds(&seeds, "Bella", &defaults, None).unwrap();
         assert_eq!(idx, 1);
         assert_eq!(agent.name, "Bella-from-2");
     }
@@ -1599,7 +1612,7 @@ flow:
             model: "default-model".to_string(),
             backend: Backend::ClaudeCli,
         };
-        let (agent, _) =
+        let (agent, _, _) =
             load_agent_file_with_seeds(&seeds, "coding/rust/Sage", &defaults, None).unwrap();
         assert_eq!(agent.name, "RustSage");
         // The agent ID retains the full nested form.
@@ -1654,11 +1667,50 @@ flow:
     agent: Beta
 "#;
         let flow = load_flow_from_str(flow_yaml).unwrap();
-        let (agents, origins) = load_agents_for_flow_with_seeds(&seeds, &flow, None).unwrap();
+        let (agents, origins, _hashes) =
+            load_agents_for_flow_with_seeds(&seeds, &flow, None).unwrap();
 
         assert_eq!(agents.len(), 2);
         assert_eq!(*origins.get("Alpha").unwrap(), 0);
         assert_eq!(*origins.get("Beta").unwrap(), 1);
+    }
+
+    #[test]
+    fn load_agents_hashes_bytes_loaded_not_disk_at_call_time() {
+        // Audit promise: the manifest must record the hash of the agent bytes
+        // the LLM saw, not whatever happens to be on disk later. Simulate a
+        // mid-run edit by overwriting the agent file after load and verify
+        // the captured hash still matches the original bytes.
+        let dir = tempfile::tempdir().unwrap();
+        write_agent(dir.path(), "Sage", "Sage-original");
+
+        let original_bytes = std::fs::read(dir.path().join("agents/Sage.yaml")).unwrap();
+        let original_hash = crate::stack::sha256_hex(&original_bytes);
+
+        let seeds = local_seeds(&[dir.path()]);
+        let flow_yaml = r#"
+version: "1"
+name: t
+flow:
+  s1:
+    agent: Sage
+"#;
+        let flow = load_flow_from_str(flow_yaml).unwrap();
+        let (_agents, _origins, hashes) =
+            load_agents_for_flow_with_seeds(&seeds, &flow, None).unwrap();
+
+        // Now stomp the file as if the user edited it mid-run.
+        std::fs::write(
+            dir.path().join("agents/Sage.yaml"),
+            "name: Sage-rewritten\nrole: r\n",
+        )
+        .unwrap();
+
+        let captured = hashes.get("Sage").expect("agent hash recorded");
+        assert_eq!(
+            captured, &original_hash,
+            "captured hash must reflect the bytes loaded into the runner, not the file on disk now"
+        );
     }
 
     #[test]
@@ -1687,7 +1739,8 @@ flow:
             model: "fallback".to_string(),
             backend: Backend::ClaudeCli,
         };
-        let (agent, idx) = load_agent_file_with_seeds(&seeds, "Sage", &defaults, None).unwrap();
+        let (agent, idx, _sha) =
+            load_agent_file_with_seeds(&seeds, "Sage", &defaults, None).unwrap();
         assert_eq!(idx, 0);
         assert_eq!(agent.model, "from-seed-1");
     }
@@ -1875,7 +1928,7 @@ flow:
                 },
             }],
         };
-        let (agents, _) = load_agents_for_flow_with_seeds(&seeds, &flow, None).unwrap();
+        let (agents, _, _) = load_agents_for_flow_with_seeds(&seeds, &flow, None).unwrap();
         assert_eq!(agents.len(), 1, "shell step must not produce an agent load");
         assert_eq!(agents[0].id, "Levi");
     }
