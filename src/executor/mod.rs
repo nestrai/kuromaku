@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use crate::config::Backend;
 
 pub mod local;
+pub mod stream_json;
 
 // --- Errors ---
 
@@ -22,6 +23,22 @@ pub enum ExecutorError {
 
 // --- Types ---
 
+/// How the executor should interpret the child's stdout.
+///
+/// Most callers want `Raw`: the executor copies bytes verbatim into the
+/// buffer and the artifact file. Claude CLI in `--output-format stream-json`
+/// mode emits structured NDJSON events; `ClaudeStreamJson` tells the
+/// executor to parse each line, write only the user-visible text to the
+/// artifact file (so `tail -f` shows readable output, not raw JSON), and
+/// return the canonical assistant text in [`ExecutionOutput::stdout`]
+/// (matching what `--output-format text` would have produced).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    #[default]
+    Raw,
+    ClaudeStreamJson,
+}
+
 /// Describes what to execute.
 ///
 /// `stdout_file`, when set, instructs the executor to stream the child's
@@ -29,11 +46,14 @@ pub enum ExecutorError {
 /// (`tail -f`) sees output as it is produced. The same content is also
 /// captured in memory and returned via [`ExecutionOutput::stdout`] when
 /// [`Executor::wait`] resolves.
+///
+/// `output_format` controls how stdout is interpreted -- see [`OutputFormat`].
 pub struct ExecutionTask {
     pub id: String,
     pub command: String,
     pub env: HashMap<String, String>,
     pub stdout_file: Option<PathBuf>,
+    pub output_format: OutputFormat,
 }
 
 /// Handle to a running execution, used to poll/wait/stop.
@@ -153,6 +173,13 @@ pub fn create_executor() -> Box<dyn ExecutorBoxed> {
 }
 
 /// Build the CLI command string for a claude-cli backend.
+///
+/// Uses `--output-format stream-json --verbose --include-partial-messages`
+/// so Claude emits NDJSON events (including token-level `content_block_delta`
+/// fragments) as content is generated. Without this, the CLI buffers all
+/// output internally and the artifact file would stay empty until process
+/// exit (issue #156). The executor parses these events back into plain text
+/// for the artifact file via [`OutputFormat::ClaudeStreamJson`].
 pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_prompt: &str) -> String {
     let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
 
@@ -161,7 +188,9 @@ pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_promp
     parts.push("--model".to_string());
     parts.push(shell_escape(model));
     parts.push("--output-format".to_string());
-    parts.push("text".to_string());
+    parts.push("stream-json".to_string());
+    parts.push("--verbose".to_string());
+    parts.push("--include-partial-messages".to_string());
     parts.push("--dangerously-skip-permissions".to_string());
 
     if let Some(system) = system_prompt {
@@ -247,6 +276,19 @@ mod tests {
         assert!(cmd.contains("--model"));
         assert!(cmd.contains("--print"));
         assert!(!cmd.contains("--system-prompt"));
+    }
+
+    #[test]
+    fn build_claude_command_uses_stream_json_for_live_streaming() {
+        // Issue #156: plain text mode buffers internally and only flushes on
+        // process exit, defeating live artifact tailing. Stream-json verbose
+        // mode emits NDJSON events as content is generated.
+        let cmd = build_claude_command("claude-sonnet-4-5", None, "do work");
+        assert!(cmd.contains("--output-format stream-json"));
+        assert!(cmd.contains("--verbose"));
+        assert!(cmd.contains("--include-partial-messages"));
+        // Old text format must be gone -- otherwise we keep the buffering bug.
+        assert!(!cmd.contains("--output-format text"));
     }
 
     #[test]
