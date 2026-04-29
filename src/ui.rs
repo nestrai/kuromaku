@@ -146,6 +146,62 @@ pub fn print_step_pills(steps: &[StepPill]) {
 ///      model claude-sonnet-4-5  backend claude-cli
 ///      task "Implement the feature"
 /// ```
+/// Print the step banner for a shell step (issue #23).
+///
+/// Mirrors [`print_step_banner`] but shows the rendered command instead of
+/// model/backend metadata. Long commands are truncated for the banner; the
+/// full text is still written to the stack via the `prompt` field.
+pub fn print_shell_step_banner(
+    n: usize,
+    total: usize,
+    step_id: &str,
+    command: &str,
+    input: &[String],
+) {
+    let t = &DARK;
+    let marker = style::style("▶").with(t.cyan).attribute(Attribute::Bold);
+    println!();
+    println!(
+        "  {}  {} Step {}/{}  {}  {}  {}",
+        style::style("──").with(t.muted),
+        marker,
+        n,
+        total,
+        style::style(step_id).with(t.fg).attribute(Attribute::Bold),
+        style::style("──").with(t.muted),
+        style::style("shell").with(t.magenta),
+    );
+
+    // Truncate the command to keep the banner readable; the full command is
+    // preserved in the saved StepOutput. Slice on a char boundary so commands
+    // containing multi-byte UTF-8 (emoji, non-ASCII paths) cannot panic the
+    // banner print on a misaligned byte index.
+    const MAX_LEN: usize = 80;
+    let display_cmd = if command.chars().count() > MAX_LEN {
+        let cut = command
+            .char_indices()
+            .nth(MAX_LEN)
+            .map(|(i, _)| i)
+            .unwrap_or(command.len());
+        format!("{}…", &command[..cut])
+    } else {
+        command.to_string()
+    };
+    let mut meta = format!(
+        "      {} {}",
+        style::style("$").with(t.dim),
+        style::style(display_cmd).with(t.yellow),
+    );
+    if !input.is_empty() {
+        meta.push_str(&format!(
+            "   {} [{}]",
+            style::style("input").with(t.dim),
+            input.join(", "),
+        ));
+    }
+    println!("{meta}");
+}
+
 pub fn print_step_banner(n: usize, total: usize, step: &StepInfo) {
     let t = &DARK;
     let (marker, color) = match step.state {

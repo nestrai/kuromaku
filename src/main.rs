@@ -386,6 +386,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
             agent: agent.id.clone(),
             role: None,
             task: None,
+            run: None,
             input,
             needs: vec![],
             model: None,
@@ -618,12 +619,22 @@ async fn run_up(
     // Substitute `{{vars.<key>}}` in the flow prompt, step task strings, and
     // the `-t` override before any further use. Bare `{{key}}` placeholders
     // are still handled downstream by `resolve_task` for CLI key=value args.
+    //
+    // Shell steps (`run:`, issue #23) get BOTH `{{vars.<key>}}` and bare
+    // `{{key}}` substitution applied to the command up front. The example in
+    // the issue uses bare placeholders (`gh pr diff {{pr}}`), so the bare
+    // form must work without forcing users to write `{{vars.pr}}` in
+    // shell-step commands.
     if let Some(ref mut prompt) = flow_config.prompt {
         *prompt = substitute_vars(prompt, &effective_vars)?;
     }
     for step in flow_config.steps.iter_mut() {
         if let Some(task_str) = step.task.as_mut() {
             *task_str = substitute_vars(task_str, &effective_vars)?;
+        }
+        if let Some(run_str) = step.run.as_mut() {
+            *run_str = substitute_vars(run_str, &effective_vars)?;
+            *run_str = substitute_placeholders(run_str, &effective_vars)?;
         }
     }
     let task_with_vars = task
@@ -1166,6 +1177,7 @@ mod tests {
             agent: agent.to_string(),
             role: role.map(String::from),
             task: None,
+            run: None,
             input: vec![],
             needs: vec![],
             model: None,

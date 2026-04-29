@@ -83,6 +83,7 @@ impl Executor for LocalExecutor {
 
         Ok(ExecutionOutput {
             stdout: stdout.trim().to_string(),
+            stderr: stderr.to_string(),
             exit_code: output.status.code().unwrap_or(0),
         })
     }

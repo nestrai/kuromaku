@@ -43,9 +43,14 @@ pub enum ExecutionStatus {
 }
 
 /// Output captured from a completed execution.
+///
+/// `stderr` is populated on success too -- shell-step execution surfaces it
+/// to the user even when the command succeeds (issue #23 acceptance criteria).
+/// LLM-backed callers can ignore it.
 #[derive(Debug)]
 pub struct ExecutionOutput {
     pub stdout: String,
+    pub stderr: String,
     pub exit_code: i32,
 }
 

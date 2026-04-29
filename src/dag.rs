@@ -186,6 +186,7 @@ flow:
                 agent: "dev".to_string(),
                 role: None,
                 task: None,
+                run: None,
                 input: vec![],
                 needs: vec!["nonexistent".to_string()],
                 model: None,
