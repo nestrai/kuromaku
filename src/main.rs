@@ -30,7 +30,7 @@ mod stack;
 #[allow(dead_code)]
 mod ui;
 
-use crate::koto_config::{KotoConfig, Seeds};
+use crate::koto_config::{KOTO_CONFIG_FILE, KotoConfig, Seeds};
 use crate::resolver::{
     ResolvedRole, RoleOverride, parse_role_override, print_audit, resolve_role,
     validate_role_overrides,
@@ -57,10 +57,10 @@ enum Command {
         #[arg(short = 't', long)]
         task: Option<String>,
 
-        /// Override koto.yaml vars (repeatable, e.g. --var owner=foo --var repo=bar)
+        /// Override project-config vars (repeatable, e.g. --var owner=foo --var repo=bar)
         ///
         /// Values fill `{{vars.<key>}}` placeholders in flow prompts and step
-        /// task strings. Overrides any value defined in koto.yaml.
+        /// task strings. Overrides any value defined in the project config.
         #[arg(long = "var", value_name = "KEY=VALUE")]
         vars: Vec<String>,
 
@@ -274,7 +274,8 @@ fn parse_key_value_args(args: &[String]) -> Result<std::collections::HashMap<Str
 }
 
 /// Replace `{{vars.<key>}}` placeholders. Used for project-level vars from
-/// koto.yaml + `--var` CLI flag. Returns an error listing every missing key.
+/// the project config + `--var` CLI flag. Returns an error listing every
+/// missing key.
 ///
 /// Bare `{{key}}` placeholders (CLI key=value args) are NOT touched here --
 /// see [`substitute_placeholders`].
@@ -300,7 +301,7 @@ fn substitute_vars(text: &str, vars: &std::collections::HashMap<String, String>)
 
     if !missing.is_empty() {
         return Err(eyre!(
-            "missing vars: {}\n\nhint: define them in koto.yaml or pass --var key=value",
+            "missing vars: {}\n\nhint: define them in {KOTO_CONFIG_FILE} or pass --var key=value",
             missing.join(", ")
         ));
     }
@@ -350,8 +351,8 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     let koto_dir = Path::new(KOTO_DIR);
 
     // Optional project-level config -- needed if any agent declares a tier
-    // and to source the seeds list. Without koto.yaml we fall back to the
-    // implicit `.koto/` seed.
+    // and to source the seeds list. Without the project config we fall back
+    // to the implicit `.koto/` seed.
     let koto_config = KotoConfig::load_optional(Path::new("."))?;
     let seeds = koto_config
         .as_ref()
@@ -505,8 +506,8 @@ async fn run_up(
 ) -> Result<()> {
     let flow_start = Instant::now();
 
-    // Load koto.yaml first -- the seeds list it produces feeds every later
-    // lookup (flow file, agents, rules, Guide).
+    // Load the project config first -- the seeds list it produces feeds
+    // every later lookup (flow file, agents, rules, Guide).
     let koto_config = KotoConfig::load_optional(Path::new("."))?;
     let seeds = koto_config
         .as_ref()
@@ -526,7 +527,7 @@ async fn run_up(
         .collect::<std::result::Result<_, _>>()
         .map_err(|e| eyre!("{e}"))?;
 
-    // Build effective vars: koto.yaml < CLI --var (CLI wins).
+    // Build effective vars: project config < CLI --var (CLI wins).
     let cli_vars_map = parse_key_value_args(var_args)?;
     let mut effective_vars = koto_config
         .as_ref()
@@ -601,8 +602,9 @@ async fn run_up(
     }
 
     // Load flow with legacy positional role overrides AND project-level role
-    // bindings from koto.yaml. Project roles act as inherited defaults so a
-    // flow can reference a role declared only in koto.yaml without redeclaring
+    // bindings from the project config. Project roles act as inherited
+    // defaults so a flow can reference a role declared only in the project
+    // config without redeclaring
     // it locally.
     let project_roles: std::collections::HashMap<String, String> = koto_config
         .as_ref()
@@ -809,7 +811,7 @@ async fn run_up(
 /// Apply the resolver-decided agent for every role in the flow. This walks
 /// the flow's role map and every role-bound step and writes back the agent ID
 /// returned by [`resolver::resolve_role_agent`] -- the single source of truth
-/// for the agent cascade (CLI > flow.role.default > koto.yaml roles[X].agent).
+/// for the agent cascade (CLI > flow.role.default > project-config roles[X].agent).
 ///
 /// Must run before `load_agents_for_flow` so the right agent files are loaded.
 /// This function does NOT compute the cascade itself; it only applies the
@@ -844,8 +846,8 @@ fn apply_role_agent_overrides(
 }
 
 /// Build the cascade-resolved binding for every role used in the flow. Returns
-/// one [`ResolvedRole`] per role -- both flow-declared roles and koto.yaml
-/// roles that the flow inherits.
+/// one [`ResolvedRole`] per role -- both flow-declared roles and project-
+/// config roles that the flow inherits.
 fn build_resolved_roles(
     flow_config: &config::FlowConfig,
     agents: &[config::Agent],
@@ -856,7 +858,7 @@ fn build_resolved_roles(
     let agents_by_id: std::collections::HashMap<&str, &config::Agent> =
         agents.iter().map(|a| (a.id.as_str(), a)).collect();
 
-    // Roles to report on: union of flow-declared and koto.yaml-declared roles
+    // Roles to report on: union of flow-declared and project-config-declared roles
     // referenced by any step. We only include roles actually used to keep the
     // audit output focused.
     let mut used_roles: HashSet<&str> = HashSet::new();

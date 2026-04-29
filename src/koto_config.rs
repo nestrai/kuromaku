@@ -1,10 +1,13 @@
-//! Project-level config (`koto.yaml`).
+//! Project-level config (`.koto/config.yaml`).
 //!
-//! Optional file in the working directory that defines capability tiers,
-//! project defaults and template variables. When the file is absent everything
-//! works as before -- callers receive `None` from [`KotoConfig::load_optional`].
+//! Optional file under `.koto/` that defines capability tiers, project
+//! defaults and template variables. When the file is absent everything works
+//! as before -- callers receive `None` from [`KotoConfig::load_optional`].
 //!
 //! Resolution cascade and roles are handled in #129; seeds in #130.
+//!
+//! For one migration cycle [`KotoConfig::load_optional`] also accepts the
+//! legacy `koto.yaml` location and emits a deprecation warning.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -13,19 +16,57 @@ use serde::Deserialize;
 
 use crate::config::Version;
 
-/// File name looked up in the working directory.
-pub const KOTO_CONFIG_FILE: &str = "koto.yaml";
+/// Canonical relative path to the project config file. Single source of
+/// truth -- runtime messages and lookups must use this constant rather than
+/// hard-coding the string.
+pub const KOTO_CONFIG_FILE: &str = ".koto/config.yaml";
 
-#[derive(Debug, thiserror::Error)]
+/// Legacy relative path used for one migration cycle. Loading from this path
+/// triggers a deprecation warning. Will be removed once users have migrated.
+pub const KOTO_CONFIG_FILE_LEGACY: &str = "koto.yaml";
+
+/// Errors surfaced when parsing or loading [`KotoConfig`].
+///
+/// `Display` is implemented manually so error messages reference
+/// [`KOTO_CONFIG_FILE`] rather than a hard-coded literal -- that way renaming
+/// the config file is a one-line change.
+#[derive(Debug)]
 pub enum KotoConfigError {
-    #[error("failed to read koto.yaml: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("failed to parse koto.yaml: {0}")]
-    Parse(#[from] serde_yaml::Error),
-
-    #[error("validation error: {0}")]
+    Io(std::io::Error),
+    Parse(serde_yaml::Error),
     Validation(String),
+}
+
+impl std::fmt::Display for KotoConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "failed to read {KOTO_CONFIG_FILE}: {e}"),
+            Self::Parse(e) => write!(f, "failed to parse {KOTO_CONFIG_FILE}: {e}"),
+            Self::Validation(msg) => write!(f, "validation error: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for KotoConfigError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            Self::Parse(e) => Some(e),
+            Self::Validation(_) => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for KotoConfigError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+impl From<serde_yaml::Error> for KotoConfigError {
+    fn from(e: serde_yaml::Error) -> Self {
+        Self::Parse(e)
+    }
 }
 
 impl KotoConfigError {
@@ -92,8 +133,9 @@ struct RawKotoConfig {
     unknown: HashMap<String, serde_yaml::Value>,
 }
 
-/// One seed entry as it appears in koto.yaml. Either `path:` (local) or
-/// `repo:` (remote). Validated at parse time -- exactly one must be set.
+/// One seed entry as it appears in the project config. Either `path:`
+/// (local) or `repo:` (remote). Validated at parse time -- exactly one must
+/// be set.
 #[derive(Debug, Deserialize)]
 struct RawSeed {
     #[serde(default)]
@@ -206,9 +248,9 @@ pub struct Seeds {
 }
 
 impl Seeds {
-    /// Implicit default when no `seeds:` section is present in koto.yaml (or
-    /// koto.yaml itself is absent). Matches v0 behavior: a single `.koto/`
-    /// seed with no eager existence check.
+    /// Implicit default when no `seeds:` section is present in the project
+    /// config (or the config file itself is absent). Matches v0 behavior: a
+    /// single `.koto/` seed with no eager existence check.
     pub fn default_local() -> Self {
         Self {
             seeds: vec![Seed {
@@ -220,7 +262,7 @@ impl Seeds {
         }
     }
 
-    /// Build from raw koto.yaml entries. Validates each entry has exactly one
+    /// Build from raw config entries. Validates each entry has exactly one
     /// of `path:` / `repo:`, and that local paths exist on disk.
     fn from_raw_entries(raw: &[RawSeed]) -> Result<Self, KotoConfigError> {
         if raw.is_empty() {
@@ -231,7 +273,7 @@ impl Seeds {
         let mut seeds = Vec::with_capacity(raw.len());
         for (idx, entry) in raw.iter().enumerate() {
             for key in entry.unknown.keys() {
-                eprintln!("warning: unknown field '{key}' in koto.yaml seed[{idx}]");
+                eprintln!("warning: unknown field '{key}' in {KOTO_CONFIG_FILE} seed[{idx}]");
             }
             let seed = match (entry.path.as_deref(), entry.repo.as_deref()) {
                 (Some(_), Some(_)) => {
@@ -344,27 +386,41 @@ fn expand_tilde(path: &str) -> PathBuf {
 }
 
 impl KotoConfig {
-    /// Load `koto.yaml` from `dir` if it exists. Returns `Ok(None)` when the
-    /// file is missing -- callers must treat that as the no-op case to keep
-    /// the no-koto.yaml workflow intact.
+    /// Load the project config from `dir` if it exists. Returns `Ok(None)`
+    /// when the file is missing -- callers must treat that as the no-op case
+    /// to keep the no-config workflow intact.
+    ///
+    /// For one migration cycle, `dir/koto.yaml` is also accepted as a
+    /// fallback when the canonical [`KOTO_CONFIG_FILE`] is missing. Loading
+    /// from the legacy path emits a deprecation warning on stderr.
     pub fn load_optional(dir: &Path) -> Result<Option<Self>, KotoConfigError> {
         let path = dir.join(KOTO_CONFIG_FILE);
-        if !path.exists() {
-            return Ok(None);
+        if path.exists() {
+            let contents = std::fs::read_to_string(&path)?;
+            return Ok(Some(Self::from_yaml_str(&contents)?));
         }
-        let contents = std::fs::read_to_string(&path)?;
-        Ok(Some(Self::from_yaml_str(&contents)?))
+        // Backward-compat: fall back to the legacy filename in the working
+        // directory. Removed once the migration window closes.
+        let legacy = dir.join(KOTO_CONFIG_FILE_LEGACY);
+        if legacy.exists() {
+            eprintln!(
+                "warning: {KOTO_CONFIG_FILE_LEGACY} is deprecated, rename to {KOTO_CONFIG_FILE}"
+            );
+            let contents = std::fs::read_to_string(&legacy)?;
+            return Ok(Some(Self::from_yaml_str(&contents)?));
+        }
+        Ok(None)
     }
 
     pub fn from_yaml_str(contents: &str) -> Result<Self, KotoConfigError> {
         let raw: RawKotoConfig = serde_yaml::from_str(contents)?;
 
         for key in raw.unknown.keys() {
-            eprintln!("warning: unknown field '{key}' in koto.yaml");
+            eprintln!("warning: unknown field '{key}' in {KOTO_CONFIG_FILE}");
         }
         if let Some(ref defaults) = raw.defaults {
             for key in defaults.unknown.keys() {
-                eprintln!("warning: unknown field '{key}' in koto.yaml defaults");
+                eprintln!("warning: unknown field '{key}' in {KOTO_CONFIG_FILE} defaults");
             }
         }
 
@@ -400,7 +456,9 @@ impl KotoConfig {
             }
             let raw_role = &raw.roles[role_name];
             for key in raw_role.unknown.keys() {
-                eprintln!("warning: unknown field '{key}' in koto.yaml role '{role_name}'");
+                eprintln!(
+                    "warning: unknown field '{key}' in {KOTO_CONFIG_FILE} role '{role_name}'"
+                );
             }
             if raw_role.agent.trim().is_empty() {
                 return Err(KotoConfigError::Validation(format!(
@@ -451,7 +509,7 @@ impl KotoConfig {
                 let mut available: Vec<&str> = self.tiers.keys().map(String::as_str).collect();
                 available.sort();
                 KotoConfigError::Validation(format!(
-                    "tier \"{tier_name}\" not defined in koto.yaml (available: {})",
+                    "tier \"{tier_name}\" not defined in {KOTO_CONFIG_FILE} (available: {})",
                     available.join(", ")
                 ))
             })
@@ -628,7 +686,46 @@ defaults:
     #[test]
     fn load_optional_present_file_returns_some() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(KOTO_CONFIG_FILE), FULL_KOTO_YAML).unwrap();
+        let path = dir.path().join(KOTO_CONFIG_FILE);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, FULL_KOTO_YAML).unwrap();
+        let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
+        assert_eq!(cfg.tiers.len(), 3);
+    }
+
+    #[test]
+    fn load_optional_legacy_path_loads_with_warning() {
+        // Backward-compat: until users migrate, the old `koto.yaml` filename
+        // still loads. The warning itself is on stderr and not asserted on
+        // here, but the file must parse and yield a populated config.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(KOTO_CONFIG_FILE_LEGACY), FULL_KOTO_YAML).unwrap();
+        let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
+        assert_eq!(cfg.tiers.len(), 3);
+    }
+
+    #[test]
+    fn load_optional_prefers_canonical_over_legacy() {
+        // When both files exist the canonical `.koto/config.yaml` wins so the
+        // migration is unambiguous.
+        let dir = tempfile::tempdir().unwrap();
+
+        let canonical = dir.path().join(KOTO_CONFIG_FILE);
+        if let Some(parent) = canonical.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&canonical, FULL_KOTO_YAML).unwrap();
+
+        // Legacy file with deliberately-broken YAML: if the loader picked it
+        // up we'd get a parse error instead of a populated config.
+        std::fs::write(
+            dir.path().join(KOTO_CONFIG_FILE_LEGACY),
+            "version: \"1\"\n: : :\n",
+        )
+        .unwrap();
+
         let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
         assert_eq!(cfg.tiers.len(), 3);
     }
@@ -803,8 +900,8 @@ roles:
 
     #[test]
     fn no_seeds_section_yields_default_local() {
-        // Backward-compat: koto.yaml without `seeds:` mirrors v0 behavior, a
-        // single implicit `.koto/` seed.
+        // Backward-compat: a project config without `seeds:` mirrors v0
+        // behavior, a single implicit `.koto/` seed.
         let cfg = KotoConfig::from_yaml_str(r#"version: "1""#).unwrap();
         assert_eq!(cfg.seeds.seeds.len(), 1);
         assert_eq!(cfg.seeds.seeds[0].display(), ".koto/");
@@ -989,7 +1086,7 @@ seeds: []
     fn seeds_find_succeeds_before_remote_when_local_has_file() {
         // Local-first lookups must succeed even if a remote seed is declared
         // later -- otherwise the user couldn't keep remote seeds in their
-        // koto.yaml until the implementation lands.
+        // project config until the implementation lands.
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("agents")).unwrap();
         std::fs::write(dir.path().join("agents/Sage.yaml"), "ok").unwrap();
@@ -1085,9 +1182,9 @@ seeds: []
 
     #[test]
     fn full_seeds_config_parses() {
-        // The full koto.yaml example from the issue: seeds + tiers + roles
-        // round-trips through the parser. We use real temp dirs so the eager
-        // existence check passes.
+        // The full project-config example from the issue: seeds + tiers +
+        // roles round-trips through the parser. We use real temp dirs so the
+        // eager existence check passes.
         let dir1 = tempfile::tempdir().unwrap();
         let dir2 = tempfile::tempdir().unwrap();
         let yaml = format!(
