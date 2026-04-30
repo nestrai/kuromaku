@@ -1,8 +1,8 @@
 version: "1"
 
 seeds:
-  - path: .koto/
-  - path: ~/code/charemma/nestrai/seeds/rust/
+  - path: .kuro/
+  - path: ~/code/nestrai/seeds/rust/
 
 tiers:
   reasoning: claude/opus-4-7
