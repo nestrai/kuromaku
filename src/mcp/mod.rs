@@ -47,6 +47,7 @@ pub mod execution;
 pub mod protocol;
 pub mod server;
 pub mod tools;
+pub mod workflow;
 
 // Re-exports used inside the module.
 pub(crate) use protocol::{Incoming, Request};
@@ -95,6 +96,11 @@ pub async fn run(verbose: bool) -> Result<()> {
     registry
         .register(Box::new(execution::ShowOutput))
         .map_err(|e| eyre!("register show_output: {:?}", e))?;
+    // Workflow tools (#196 split). `implement_issue` (#213) lands first;
+    // `review_pr` (#214) and `rework_pr` (#215) plug in alongside.
+    registry
+        .register(Box::new(workflow::ImplementIssue))
+        .map_err(|e| eyre!("register implement_issue: {:?}", e))?;
 
     // Take ownership of the stdout fd BEFORE the runner can write to it.
     // Tools that call into `runner::execute_flow` indirectly invoke `ui::*`

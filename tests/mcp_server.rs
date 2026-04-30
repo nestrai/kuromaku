@@ -95,6 +95,24 @@ fn mcp_subcommand_handshake_and_lists_discovery_tools() {
         names.contains(&"show_output"),
         "show_output missing: {names:?}"
     );
+    // Workflow tools (#196 split). `implement_issue` (#213) lands as the
+    // first wrapper around the implement-issue flow.
+    assert!(
+        names.contains(&"implement_issue"),
+        "implement_issue missing: {names:?}"
+    );
+    let implement_issue = tools
+        .iter()
+        .find(|t| t["name"] == "implement_issue")
+        .expect("implement_issue descriptor");
+    assert_eq!(
+        implement_issue["inputSchema"]["required"],
+        serde_json::json!(["issue"])
+    );
+    assert_eq!(
+        implement_issue["inputSchema"]["properties"]["issue"]["type"],
+        "integer"
+    );
     let run_flow = tools
         .iter()
         .find(|t| t["name"] == "run_flow")
@@ -369,6 +387,161 @@ fn mcp_show_output_unknown_run_returns_run_not_found() {
     assert_eq!(
         resp["error"]["data"]["details"]["run_id"],
         "ghost-20260501-000000"
+    );
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `implement_issue` rejects non-integer args at the wire boundary.
+/// Acceptance criterion (#213): "Returns MCP error for invalid issue
+/// number". This catches client mistakes before the runner spins up,
+/// keeping the failure fast and the error code stable (`invalid_params`).
+#[test]
+fn mcp_implement_issue_rejects_non_integer_argument() {
+    let project = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"implement_issue","arguments":{{"issue":"not-a-number"}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    // invalid_params is JSON-RPC -32602 -- the transport-level code, not
+    // the application catalog. The transport classifier is what we want
+    // here; the issue body's "invalid issue number" criterion is satisfied
+    // either way (reject before flow setup).
+    assert_eq!(err["code"], -32602);
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `implement_issue` against a project without the `implement-issue` flow
+/// surfaces `flow_missing` -- the same catalog entry `run_flow` uses for
+/// the equivalent setup error. Exercises the end-to-end response shape and
+/// the runner-error classifier wired through `classify_setup_error`.
+#[test]
+fn mcp_implement_issue_unknown_flow_returns_flow_missing() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    // Empty `.kuro/` -- no `flows/implement-issue.yaml` anywhere in the
+    // seed cascade. The runner must surface flow_missing rather than fall
+    // through to a generic internal_error.
+    std::fs::create_dir_all(project.path().join(".kuro/flows")).unwrap();
+    std::fs::write(project.path().join(".kuro/config.yaml"), "version: \"1\"\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"implement_issue","arguments":{{"issue":213}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    assert_eq!(err["code"], -32000);
+    assert_eq!(err["data"]["code"], "flow_missing");
+    assert_eq!(err["data"]["details"]["name"], "implement-issue");
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `implement_issue` against a flow that exists but lacks the step ids the
+/// tool keys off (`review`, `pr`) must surface a structured internal error
+/// at config-time -- *not* run end-to-end and silently produce
+/// `verdict: "unclear"` + `pr_url: null`. This is the fix for the silent
+/// step-name mismatch flagged in #213's team review.
+#[test]
+fn mcp_implement_issue_missing_required_step_ids_errors_at_config_time() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let kuro = project.path().join(".kuro");
+    std::fs::create_dir_all(kuro.join("flows")).unwrap();
+    std::fs::write(kuro.join("config.yaml"), "version: \"1\"\n").unwrap();
+    // Flow exists under the right name but the step ids do not match what
+    // implement_issue keys off. The tool must reject this before spawning
+    // the runner; otherwise the silent-failure mode returns.
+    let flow_yaml = "version: \"1\"\n\
+         name: implement-issue\n\
+         prompt: noop\n\
+         flow:\n  greet:\n    run: |\n      echo nope\n";
+    std::fs::write(kuro.join("flows/implement-issue.yaml"), flow_yaml).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"implement_issue","arguments":{{"issue":213}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    // JSON-RPC `InternalError` (transport-level): the numeric `-32603` code
+    // identifies it; the volatile reason string lives in `data.details`.
+    // No `data.code` field for transport-level errors.
+    assert_eq!(err["code"], -32603);
+    let reason = err["data"]["details"]["reason"]
+        .as_str()
+        .expect("reason string");
+    assert!(
+        reason.contains("review") && reason.contains("pr"),
+        "reason should name both missing step ids, got: {reason}"
     );
 
     let status = wait_with_timeout(&mut child, Duration::from_secs(5));
