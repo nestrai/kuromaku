@@ -95,8 +95,8 @@ fn mcp_subcommand_handshake_and_lists_discovery_tools() {
         names.contains(&"show_output"),
         "show_output missing: {names:?}"
     );
-    // Workflow tools (#196 split). `implement_issue` (#213) lands as the
-    // first wrapper around the implement-issue flow.
+    // Workflow tools (#196 split). `implement_issue` (#213) lands first;
+    // `review_pr` (#214) follows.
     assert!(
         names.contains(&"implement_issue"),
         "implement_issue missing: {names:?}"
@@ -111,6 +111,19 @@ fn mcp_subcommand_handshake_and_lists_discovery_tools() {
     );
     assert_eq!(
         implement_issue["inputSchema"]["properties"]["issue"]["type"],
+        "integer"
+    );
+    assert!(names.contains(&"review_pr"), "review_pr missing: {names:?}");
+    let review_pr = tools
+        .iter()
+        .find(|t| t["name"] == "review_pr")
+        .expect("review_pr descriptor");
+    assert_eq!(
+        review_pr["inputSchema"]["required"],
+        serde_json::json!(["pr"])
+    );
+    assert_eq!(
+        review_pr["inputSchema"]["properties"]["pr"]["type"],
         "integer"
     );
     let run_flow = tools
@@ -542,6 +555,155 @@ fn mcp_implement_issue_missing_required_step_ids_errors_at_config_time() {
     assert!(
         reason.contains("review") && reason.contains("pr"),
         "reason should name both missing step ids, got: {reason}"
+    );
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `review_pr` rejects non-integer args at the wire boundary.
+/// Acceptance criterion (#214): "Returns MCP error for invalid PR number".
+#[test]
+fn mcp_review_pr_rejects_non_integer_argument() {
+    let project = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"review_pr","arguments":{{"pr":"not-a-number"}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    // invalid_params is JSON-RPC -32602 -- the transport-level code, same
+    // as implement_issue's matching test. The "invalid PR number" criterion
+    // is satisfied either way (rejected before flow setup).
+    assert_eq!(err["code"], -32602);
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `review_pr` against a project without the `review-pr` flow surfaces
+/// `flow_missing` -- same catalog entry the rest of the workflow tools use.
+/// Acceptance criterion (#214): "Returns MCP error for ... flow failure".
+#[test]
+fn mcp_review_pr_unknown_flow_returns_flow_missing() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    // Empty `.kuro/` -- no `flows/review-pr.yaml` anywhere in the seed
+    // cascade. The runner must surface flow_missing rather than internal_error.
+    std::fs::create_dir_all(project.path().join(".kuro/flows")).unwrap();
+    std::fs::write(project.path().join(".kuro/config.yaml"), "version: \"1\"\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"review_pr","arguments":{{"pr":42}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    assert_eq!(err["code"], -32000);
+    assert_eq!(err["data"]["code"], "flow_missing");
+    assert_eq!(err["data"]["details"]["name"], "review-pr");
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `review_pr` against a flow that exists but lacks the step ids the tool
+/// keys off (`consensus`) must surface a structured internal error at
+/// config-time -- *not* run end-to-end and silently produce
+/// `verdict: "unclear"` + empty findings. Mirrors the silent-failure guard
+/// from #213's team review.
+#[test]
+fn mcp_review_pr_missing_required_step_ids_errors_at_config_time() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let kuro = project.path().join(".kuro");
+    std::fs::create_dir_all(kuro.join("flows")).unwrap();
+    std::fs::write(kuro.join("config.yaml"), "version: \"1\"\n").unwrap();
+    // Flow named `review-pr` but its only step is `greet` -- the `consensus`
+    // step the tool keys off is absent. The tool must reject this before
+    // spawning the runner.
+    let flow_yaml = "version: \"1\"\n\
+         name: review-pr\n\
+         prompt: noop\n\
+         flow:\n  greet:\n    run: |\n      echo nope\n";
+    std::fs::write(kuro.join("flows/review-pr.yaml"), flow_yaml).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"review_pr","arguments":{{"pr":42}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    // JSON-RPC InternalError (transport-level): `-32603` numeric code; the
+    // volatile reason string lives in `data.details.reason`.
+    assert_eq!(err["code"], -32603);
+    let reason = err["data"]["details"]["reason"]
+        .as_str()
+        .expect("reason string");
+    assert!(
+        reason.contains("consensus"),
+        "reason should name the missing step id, got: {reason}"
     );
 
     let status = wait_with_timeout(&mut child, Duration::from_secs(5));
