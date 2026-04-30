@@ -894,7 +894,11 @@ fn render_transcript(
         }
     }
 
-    out.push_str(&format!("---\nTermination: {termination:?}\n"));
+    // Display (not Debug) so the on-disk transcript carries the stable
+    // string form ("max_turns", "convergence", ...) rather than the variant
+    // identifier; renaming a TerminationReason variant in source code must
+    // not silently mutate historical audit text.
+    out.push_str(&format!("---\nTermination: {termination}\n"));
     out
 }
 
@@ -1794,8 +1798,17 @@ mod tests {
         assert!(out.contains("## Mika"), "missing Mika heading: {out}");
         assert!(out.contains("I propose option A."));
         assert!(out.contains("option B is safer."));
-        // Termination footer must be the last block.
-        assert!(out.contains("Termination:"), "missing termination: {out}");
+        // Termination footer uses the stable Display string, not the
+        // Debug variant identifier. Variant renames in source must not
+        // mutate historical transcript text.
+        assert!(
+            out.contains("Termination: max_turns"),
+            "expected stable Display string 'max_turns', got: {out}"
+        );
+        assert!(
+            !out.contains("MaxTurns"),
+            "transcript must not leak the Debug/variant name: {out}"
+        );
     }
 
     #[test]

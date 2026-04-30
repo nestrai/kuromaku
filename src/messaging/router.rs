@@ -178,6 +178,24 @@ pub enum TerminationReason {
     AllAgentsClosed,
 }
 
+/// Stable string form, distinct from `Debug`. Audit transcripts (#170) and
+/// any future user-facing surfaces render the reason via `Display` so
+/// renaming a variant in source does not silently mutate historical files
+/// on disk. Variant rename = compile-time touch here; the on-disk strings
+/// stay frozen.
+impl std::fmt::Display for TerminationReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            TerminationReason::MaxTurns => "max_turns",
+            TerminationReason::Convergence => "convergence",
+            TerminationReason::Timeout => "timeout",
+            TerminationReason::HumanClosed => "human_closed",
+            TerminationReason::AllAgentsClosed => "all_agents_closed",
+        };
+        f.write_str(s)
+    }
+}
+
 // --- Router ---
 
 /// Object-safe wrapper around [`Transport`].
@@ -519,6 +537,27 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
+
+    /// The audit transcript (#170) renders termination via Display, not
+    /// Debug. Lock the strings down so a future variant rename triggers a
+    /// failing test instead of silently mutating historical run files.
+    #[test]
+    fn termination_reason_display_is_stable() {
+        assert_eq!(format!("{}", TerminationReason::MaxTurns), "max_turns");
+        assert_eq!(
+            format!("{}", TerminationReason::Convergence),
+            "convergence"
+        );
+        assert_eq!(format!("{}", TerminationReason::Timeout), "timeout");
+        assert_eq!(
+            format!("{}", TerminationReason::HumanClosed),
+            "human_closed"
+        );
+        assert_eq!(
+            format!("{}", TerminationReason::AllAgentsClosed),
+            "all_agents_closed"
+        );
+    }
 
     /// Mock transport: send pushes onto an inspectable Vec, recv returns
     /// items the test pushed onto a channel ahead of time. Lets tests
