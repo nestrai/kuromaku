@@ -43,6 +43,8 @@
 //! audit trail to disk is #170 and is intentionally out of scope here.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -50,7 +52,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::executor::stream_json::Fragment;
-use crate::executor::transport::{Transport, TransportEvent};
+use crate::executor::transport::{Transport, TransportError, TransportEvent};
 
 /// Stable identifier for an agent participating in the conversation.
 ///
@@ -152,22 +154,61 @@ pub enum TerminationReason {
 
 // --- Router ---
 
-struct Agent<T> {
-    id: AgentId,
-    /// Arc so the per-agent reader task can hold a handle while the main
-    /// loop also reaches in to call `send`. Concurrent send/recv on the
-    /// same transport is part of the [`Transport`] contract.
-    transport: Arc<T>,
+/// Object-safe wrapper around [`Transport`].
+///
+/// The public [`Transport`] trait uses `impl Future` (return-position impl
+/// trait), which makes it dyn-incompatible. The router needs to hold a
+/// heterogeneous set of transports (mixed-backend flows: claude-cli alongside
+/// api alongside ollama, see #170 and koto's "backend-agnostic" principle in
+/// CLAUDE.md), so we type-erase here with a `Pin<Box<dyn Future>>` shim.
+///
+/// This is internal: callers still interact with the [`Transport`] trait. The
+/// blanket impl below makes any `T: Transport + Send + Sync + 'static` usable
+/// as `Arc<dyn DynTransport>` without touching transport.rs.
+trait DynTransport: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        message: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + 'a>>;
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<TransportEvent>, TransportError>> + Send + '_>>;
 }
 
-pub struct Router<T: Transport + 'static> {
-    agents: Vec<Agent<T>>,
+impl<T: Transport + Send + Sync + 'static> DynTransport for T {
+    fn send<'a>(
+        &'a self,
+        message: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), TransportError>> + Send + 'a>> {
+        Box::pin(<T as Transport>::send(self, message))
+    }
+
+    fn recv(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Option<TransportEvent>, TransportError>> + Send + '_>>
+    {
+        Box::pin(<T as Transport>::recv(self))
+    }
+}
+
+struct Agent {
+    id: AgentId,
+    /// Arc<dyn> so the per-agent reader task can hold a handle while the main
+    /// loop also reaches in to call `send`, and so the router can mix
+    /// transports from different backends in one conversation. Concurrent
+    /// send/recv on the same transport is part of the [`Transport`] contract.
+    transport: Arc<dyn DynTransport>,
+}
+
+pub struct Router {
+    agents: Vec<Agent>,
     human_input: Option<mpsc::Receiver<String>>,
     config: RouterConfig,
     logger: Logger,
 }
 
-impl<T: Transport + 'static> Router<T> {
+impl Router {
     pub fn new(config: RouterConfig, logger: Logger) -> Self {
         Self {
             agents: Vec::new(),
@@ -179,11 +220,15 @@ impl<T: Transport + 'static> Router<T> {
 
     /// Register an agent under `id`, taking ownership of its transport.
     ///
-    /// The router stores the transport behind `Arc<T>` internally so it can
-    /// be shared with the per-agent reader task. The caller surrenders
-    /// ownership; transports cannot be inspected from outside the router
-    /// afterwards.
-    pub fn add_agent(&mut self, id: impl Into<AgentId>, transport: T) {
+    /// The transport is type-erased internally so the router can hold agents
+    /// backed by different [`Transport`] implementations in the same run.
+    /// The caller surrenders ownership; transports cannot be inspected from
+    /// outside the router afterwards.
+    pub fn add_agent<T: Transport + Send + Sync + 'static>(
+        &mut self,
+        id: impl Into<AgentId>,
+        transport: T,
+    ) {
         self.agents.push(Agent {
             id: id.into(),
             transport: Arc::new(transport),
@@ -370,12 +415,7 @@ impl<T: Transport + 'static> Router<T> {
 /// Send `content` to every agent except `except` (when set), logging each
 /// delivery. Continues past send failures so one closed transport cannot
 /// abort the broadcast to the rest.
-async fn broadcast<T: Transport>(
-    agents: &[Agent<T>],
-    logger: &Logger,
-    content: &str,
-    except: Option<&str>,
-) {
+async fn broadcast(agents: &[Agent], logger: &Logger, content: &str, except: Option<&str>) {
     for agent in agents {
         if Some(agent.id.as_str()) == except {
             continue;
