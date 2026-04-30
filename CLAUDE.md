@@ -2,7 +2,7 @@
 
 ## What this is
 
-koto is a CLI tool for reproducible AI agent teams with persistent shared state. Define your team in a YAML file (`.koto/config.yaml`), run `koto up`.
+koto is a CLI tool for reproducible AI agent teams with persistent shared state. Define your team in a YAML file (`.koto/config.yaml`), run `koto run`.
 
 ## Language and tooling
 
@@ -23,7 +23,7 @@ just build    # cargo build
 just test     # cargo test
 just lint     # cargo clippy + cargo fmt --check
 just fmt      # cargo fmt
-just run up   # cargo run -- up
+just run run  # cargo run -- run
 ```
 
 ## Architecture

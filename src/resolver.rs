@@ -1,4 +1,4 @@
-//! Role resolution cascade for `koto up`.
+//! Role resolution cascade for `koto run`.
 //!
 //! Combines four override layers to produce a final agent, model and backend
 //! for each role used by a flow run:

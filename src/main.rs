@@ -49,39 +49,51 @@ struct Cli {
     command: Command,
 }
 
+/// Arguments shared by `run` and the deprecated `up` alias.
+///
+/// Kept in a dedicated [`clap::Args`] struct so the canonical verb and the
+/// deprecation alias cannot drift -- adding a flag in one place automatically
+/// applies to the other.
+#[derive(clap::Args)]
+struct RunArgs {
+    /// Flow name (looks in .koto/flows/<name>.yaml)
+    flow: Option<String>,
+
+    /// Task prompt or template arguments (key=value pairs fill {{key}} placeholders in the flow prompt)
+    #[arg(short = 't', long)]
+    task: Option<String>,
+
+    /// Override project-config vars (repeatable, e.g. --var owner=foo --var repo=bar)
+    ///
+    /// Values fill `{{vars.<key>}}` placeholders in flow prompts and step
+    /// task strings. Overrides any value defined in the project config.
+    #[arg(long = "var", value_name = "KEY=VALUE")]
+    vars: Vec<String>,
+
+    /// Override role bindings (repeatable). Two forms:
+    ///   --role developer=Kai             (rebind agent)
+    ///   --role reviewer:model=ollama/x   (override model)
+    ///   --role reviewer:backend=api      (override backend)
+    #[arg(long = "role", value_name = "NAME[:FIELD]=VALUE")]
+    role_overrides: Vec<String>,
+
+    /// Template arguments as key=value pairs (e.g. pr=67 branch=main)
+    #[arg(trailing_var_arg = true)]
+    args: Vec<String>,
+
+    /// Path to the flow config file (overrides flow name lookup)
+    #[arg(short, long)]
+    file: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum Command {
-    /// Start the agent team
-    Up {
-        /// Flow name (looks in .koto/flows/<name>.yaml)
-        flow: Option<String>,
-
-        /// Task prompt or template arguments (key=value pairs fill {{key}} placeholders in the flow prompt)
-        #[arg(short = 't', long)]
-        task: Option<String>,
-
-        /// Override project-config vars (repeatable, e.g. --var owner=foo --var repo=bar)
-        ///
-        /// Values fill `{{vars.<key>}}` placeholders in flow prompts and step
-        /// task strings. Overrides any value defined in the project config.
-        #[arg(long = "var", value_name = "KEY=VALUE")]
-        vars: Vec<String>,
-
-        /// Override role bindings (repeatable). Two forms:
-        ///   --role developer=Kai             (rebind agent)
-        ///   --role reviewer:model=ollama/x   (override model)
-        ///   --role reviewer:backend=api      (override backend)
-        #[arg(long = "role", value_name = "NAME[:FIELD]=VALUE")]
-        role_overrides: Vec<String>,
-
-        /// Template arguments as key=value pairs (e.g. pr=67 branch=main)
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
-
-        /// Path to the flow config file (overrides flow name lookup)
-        #[arg(short, long)]
-        file: Option<String>,
-    },
+    /// Run a flow
+    Run(RunArgs),
+    /// Deprecated alias for `run` -- emits a warning and dispatches to the same handler.
+    /// Will be removed in a future release.
+    #[command(hide = true)]
+    Up(RunArgs),
     /// Run an ad-hoc task with one or more agents (no flow needed)
     Task {
         /// Agent name(s) from .koto/agents/ (repeatable, executed in order)
@@ -95,6 +107,7 @@ enum Command {
     /// Fetch skills from remote sources pinned in .koto/skills.lock
     Pull,
     /// Stop the agent team
+    #[command(hide = true)]
     Down,
     /// Show running agents and stack
     Status,
@@ -106,23 +119,12 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Up {
-            flow,
-            task,
-            vars,
-            role_overrides,
-            args,
-            file,
-        } => {
-            run_up(
-                flow.as_deref(),
-                task.as_deref(),
-                &vars,
-                &role_overrides,
-                &args,
-                file.as_deref(),
-            )
-            .await?
+        Command::Run(args) => run_flow(&args).await?,
+        Command::Up(args) => {
+            eprintln!(
+                "warning: `koto up` is deprecated and will be removed in a future release; use `koto run` instead"
+            );
+            run_flow(&args).await?
         }
         Command::Task { agent, task } => run_task(&agent, &task).await?,
         Command::Pull => run_pull()?,
@@ -215,7 +217,7 @@ fn resolve_flow_path(flow: Option<&str>, file: Option<&str>, seeds: &Seeds) -> R
         .collect::<Vec<_>>()
         .join("\n");
     Err(eyre!(
-        "multiple flows found, specify one:\n\n{list}\n\nusage: koto up <flow-name> -t \"task\""
+        "multiple flows found, specify one:\n\n{list}\n\nusage: koto run <flow-name> -t \"task\""
     ))
 }
 
@@ -499,14 +501,14 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_up(
-    flow: Option<&str>,
-    task: Option<&str>,
-    var_args: &[String],
-    role_override_args: &[String],
-    args: &[String],
-    file: Option<&str>,
-) -> Result<()> {
+async fn run_flow(run_args: &RunArgs) -> Result<()> {
+    let flow = run_args.flow.as_deref();
+    let task = run_args.task.as_deref();
+    let var_args: &[String] = &run_args.vars;
+    let role_override_args: &[String] = &run_args.role_overrides;
+    let args: &[String] = &run_args.args;
+    let file = run_args.file.as_deref();
+
     let flow_start = Instant::now();
 
     // Load the project config first -- the seeds list it produces feeds
@@ -520,7 +522,7 @@ async fn run_up(
     let path = resolve_flow_path(flow, file, &seeds)?;
     let display_path = path.display().to_string();
 
-    ui::print_command(&format!("koto up {}", flow.unwrap_or(&display_path)));
+    ui::print_command(&format!("koto run {}", flow.unwrap_or(&display_path)));
 
     // Parse `--role` flags up front. Errors here surface bad syntax (unknown
     // field, bad model format, ...) before we touch any YAML.
@@ -1214,6 +1216,91 @@ fn format_elapsed(d: std::time::Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- CLI parsing for `run` (canonical) and `up` (deprecated alias) (issue #181) ---
+
+    use clap::Parser as _;
+
+    /// Helper: extract the `RunArgs` from whichever of the two variants
+    /// `Cli::try_parse_from` produced. Lets the assertions below stay focused
+    /// on argument values without re-doing the variant match each time.
+    fn parse_cli(argv: &[&str]) -> (Cli, &'static str) {
+        let cli = Cli::try_parse_from(argv).expect("CLI parse failed");
+        let kind = match &cli.command {
+            Command::Run(_) => "run",
+            Command::Up(_) => "up",
+            _ => "other",
+        };
+        (cli, kind)
+    }
+
+    #[test]
+    fn run_subcommand_parses_canonically() {
+        // `koto run <flow>` is the canonical verb -- it must parse to
+        // Command::Run, not the deprecated Up alias.
+        let (cli, kind) = parse_cli(&["koto", "run", "review-pr"]);
+        assert_eq!(kind, "run");
+        let Command::Run(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.flow.as_deref(), Some("review-pr"));
+    }
+
+    #[test]
+    fn up_subcommand_still_parses_for_deprecation() {
+        // `koto up <flow>` continues to work but parses to the hidden Up
+        // variant so the dispatcher can emit the deprecation warning. Removing
+        // this without a release cycle would break user scripts.
+        let (cli, kind) = parse_cli(&["koto", "up", "review-pr"]);
+        assert_eq!(kind, "up");
+        let Command::Up(args) = cli.command else {
+            unreachable!()
+        };
+        assert_eq!(args.flow.as_deref(), Some("review-pr"));
+    }
+
+    #[test]
+    fn run_and_up_share_argument_layout() {
+        // The two variants must accept identical flags -- they share a single
+        // RunArgs struct, so adding a flag in one place automatically applies
+        // to the other. Pin the contract here so a future refactor that
+        // splits them gets caught.
+        let argv_common = &[
+            "review-pr",
+            "-t",
+            "do the thing",
+            "--var",
+            "owner=nestrai",
+            "--role",
+            "developer=Sage",
+            "id=42",
+        ];
+
+        let (run_cli, _) = parse_cli(
+            &[&["koto", "run"][..], &argv_common[..]]
+                .concat::<&str>()
+                .as_slice(),
+        );
+        let (up_cli, _) = parse_cli(
+            &[&["koto", "up"][..], &argv_common[..]]
+                .concat::<&str>()
+                .as_slice(),
+        );
+
+        let Command::Run(run_args) = run_cli.command else {
+            unreachable!()
+        };
+        let Command::Up(up_args) = up_cli.command else {
+            unreachable!()
+        };
+
+        assert_eq!(run_args.flow, up_args.flow);
+        assert_eq!(run_args.task, up_args.task);
+        assert_eq!(run_args.vars, up_args.vars);
+        assert_eq!(run_args.role_overrides, up_args.role_overrides);
+        assert_eq!(run_args.args, up_args.args);
+        assert_eq!(run_args.file, up_args.file);
+    }
 
     #[test]
     fn parse_key_value_args_valid() {
