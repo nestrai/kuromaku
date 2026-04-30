@@ -6,6 +6,7 @@ use crate::config::Backend;
 
 pub mod local;
 pub mod stream_json;
+pub mod transport;
 
 // --- Errors ---
 
