@@ -1793,6 +1793,32 @@ mod flow_api {
         Ok(resolve_stack_path(&flow_config.stack.path))
     }
 
+    /// Verify that the named flow defines all `required` step ids and return
+    /// the list of those that are missing (empty when the flow is OK).
+    ///
+    /// Used by tool wrappers that key off specific step names to build
+    /// their result (`implement_issue` keys off `review`/`pr`). Without
+    /// this check, a renamed step would silently make `read_run` lookups
+    /// return `None` and the caller would report a successful run with an
+    /// empty/unclear payload -- the failure mode flagged in the team
+    /// review on #213. Resolves the flow through the seed cascade so the
+    /// check uses the same file the runner would execute.
+    pub(crate) fn verify_flow_step_ids(flow_name: &str, required: &[&str]) -> Result<Vec<String>> {
+        let koto_config = KotoConfig::load_optional(Path::new("."))?;
+        let seeds = koto_config
+            .as_ref()
+            .map(|c| c.seeds.clone())
+            .unwrap_or_else(Seeds::default_local);
+        let path = resolve_flow_path(&FlowSource::Name(flow_name.to_string()), &seeds)?;
+        let contents = std::fs::read_to_string(&path)?;
+        let flow_config = config::load_flow_from_str(&contents)?;
+        Ok(required
+            .iter()
+            .filter(|id| !flow_config.steps.iter().any(|s| s.id == **id))
+            .map(|s| s.to_string())
+            .collect())
+    }
+
     /// Apply the resolver-decided agent for every role in the flow.
     pub(crate) fn apply_role_agent_overrides(
         flow_config: &mut FlowConfig,
@@ -2461,6 +2487,7 @@ pub use flow_api::{
 pub(crate) use flow_api::{
     apply_resolved_roles_to_steps, apply_role_agent_overrides, build_manifest, resolve_stack_path,
     resolve_stack_path_for_flow_name, resolve_task, substitute_placeholders, substitute_vars,
+    verify_flow_step_ids,
 };
 
 #[cfg(test)]

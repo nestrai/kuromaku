@@ -189,7 +189,11 @@ async fn do_run_flow(name: String, bare_args: HashMap<String, String>) -> Result
 /// match on substrings. The matched markers (`config file '...' not found`,
 /// `flows/<name>.yaml`) are stable across the runner's history -- a rename
 /// would surface in the unit tests below.
-fn classify_setup_error(name: &str, err: color_eyre::Report) -> McpError {
+///
+/// Exposed `pub(super)` so sibling MCP tool modules (workflow.rs for
+/// `implement_issue` etc.) reuse the same classifier instead of growing
+/// their own drift-prone copies.
+pub(super) fn classify_setup_error(name: &str, err: color_eyre::Report) -> McpError {
     let msg = format!("{err:#}");
     let lower = msg.to_lowercase();
     if lower.contains("not found")
