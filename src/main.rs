@@ -1728,6 +1728,7 @@ mod tests {
                 exit_code: 0,
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
+                participants: Vec::new(),
             },
         }];
 

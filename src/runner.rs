@@ -568,6 +568,7 @@ async fn run_shell_step(
         exit_code: 0,
         input_steps: step.input.clone(),
         output_file: content_filename.clone(),
+        participants: Vec::new(),
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &stdout).map_err(|e| {
         RunError::Stack {
@@ -781,21 +782,36 @@ async fn run_conversation_step(
     let entries = log.lock().map(|v| v.clone()).unwrap_or_default();
     let transcript = render_transcript(&entries, &termination, &participant_names);
 
+    // Per-agent breakdown (#170 acceptance criterion). One row per
+    // participant in the order they were declared on the step. Tokens stay
+    // `None` until the transport surfaces per-message counts to the router.
+    let participants_stats: Vec<stack::ParticipantStat> = participants
+        .iter()
+        .map(|agent| stack::ParticipantStat {
+            agent: agent.id.clone(),
+            model: agent.model.clone(),
+            turns: count_agent_turns(&entries, &agent.id),
+            tokens_in: None,
+            tokens_out: None,
+        })
+        .collect();
+
     let started_at = step_started_at.to_rfc3339();
     let record = StepRecord {
         step_id: step.id.clone(),
         kind: "conversation".to_string(),
         // No single agent for a conversation; leave None so the audit
-        // schema reflects "many agents" via the transcript itself.
+        // schema reflects "many agents" via the participants list below.
         agent: None,
         model_requested: None,
         model_actual: None,
-        // The participants all run on claude-cli (enforced above), but the
-        // step itself is a Router-driven dialogue, not a single CLI
-        // invocation. Use a distinct label so audit consumers can tell
-        // these apart from regular agent steps without parsing the kind
-        // field.
-        backend: "conversation".to_string(),
+        // Step-type discrimination lives in `kind: "conversation"`. The
+        // backend label sticks to the documented vocabulary
+        // (api/claude-cli/codex/ollama/shell), so audit consumers don't
+        // see a value that's missing from the schema. Conversation steps
+        // are enforced to run on claude-cli upstream, so this is also
+        // factually accurate.
+        backend: "claude-cli".to_string(),
         tokens_in: None,
         tokens_out: None,
         duration_ms: duration.as_millis(),
@@ -803,6 +819,7 @@ async fn run_conversation_step(
         exit_code: 0,
         input_steps: step.input.clone(),
         output_file: content_filename.clone(),
+        participants: participants_stats,
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &transcript).map_err(|e| {
         RunError::Stack {
@@ -900,6 +917,28 @@ fn render_transcript(
     // not silently mutate historical audit text.
     out.push_str(&format!("---\nTermination: {termination}\n"));
     out
+}
+
+/// Count how many `Final` inbound messages `agent_id` emitted in the
+/// router log. Tool-use entries and streaming partials do not count -- a
+/// "turn" is a canonical result from the agent. Pure function so the
+/// `meta.yaml` `participants` breakdown is testable without spawning a
+/// router.
+fn count_agent_turns(entries: &[crate::messaging::router::LogEntry], agent_id: &str) -> usize {
+    use crate::messaging::router::{LogKind, MessageKind, Source};
+    entries
+        .iter()
+        .filter(|e| matches!(&e.from, Source::Agent(id) if id == agent_id))
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                LogKind::Inbound {
+                    message: MessageKind::Final,
+                    ..
+                }
+            )
+        })
+        .count()
 }
 
 /// Run steps sequentially in topological order.
@@ -1054,6 +1093,7 @@ pub async fn run_steps(
             exit_code: 0,
             input_steps: step.input.clone(),
             output_file: content_filename.clone(),
+            participants: Vec::new(),
         };
 
         // Write the canonical content file plus the meta.yaml. Executor
@@ -1241,6 +1281,7 @@ mod tests {
                 exit_code: 0,
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
+                participants: Vec::new(),
             },
         }];
         let summary = build_summary(&results);
@@ -1642,6 +1683,7 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: stack::step_content_filename(1, "fetch", "txt"),
+            participants: Vec::new(),
         };
         stack::write_run_step(&ctx.run_path, 1, &rec, "PR diff goes here").unwrap();
 
@@ -1855,6 +1897,145 @@ mod tests {
             "outbound deliveries must be skipped (they duplicate inbound text): {out}"
         );
         assert!(out.contains("Final answer."));
+    }
+
+    #[test]
+    fn count_agent_turns_only_counts_final_inbound() {
+        // Acceptance: per-agent `turns` in meta.yaml counts canonical
+        // results only. Tool-use, partials, outbound deliveries, send
+        // failures, and other agents' messages must not contribute.
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source};
+        let entries = vec![
+            // Final by Levi -> counts.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "first".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+            // Partial by Levi -> ignored.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "thinking".to_string(),
+                    message: MessageKind::Partial,
+                },
+            },
+            // Tool-use by Levi -> ignored (not a turn).
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: String::new(),
+                    message: MessageKind::ToolUse {
+                        name: "read_file".to_string(),
+                    },
+                },
+            },
+            // Final by Mika -> ignored when counting Levi.
+            LogEntry {
+                from: Source::Agent("Mika".to_string()),
+                kind: LogKind::Inbound {
+                    content: "rebut".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+            // Outbound delivery -> not an agent emission.
+            LogEntry {
+                from: Source::Router,
+                kind: LogKind::Outbound {
+                    to: "Levi".to_string(),
+                    content: "first".to_string(),
+                },
+            },
+            // Final by Levi #2 -> counts.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "second".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+        ];
+
+        assert_eq!(count_agent_turns(&entries, "Levi"), 2);
+        assert_eq!(count_agent_turns(&entries, "Mika"), 1);
+        assert_eq!(count_agent_turns(&entries, "Nobody"), 0);
+    }
+
+    #[test]
+    fn participant_stat_serializes_to_meta_yaml() {
+        // Acceptance: `meta.yaml` carries per-agent rows; non-conversation
+        // steps stay backward-compatible (no `participants:` key emitted).
+        let convo = stack::StepRecord {
+            step_id: "debate".to_string(),
+            kind: "conversation".to_string(),
+            agent: None,
+            model_requested: None,
+            model_actual: None,
+            backend: "claude-cli".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 1234,
+            started_at: "2026-04-30T16:00:00Z".to_string(),
+            exit_code: 0,
+            input_steps: vec![],
+            output_file: "01-debate.md".to_string(),
+            participants: vec![
+                stack::ParticipantStat {
+                    agent: "Levi".to_string(),
+                    model: "claude-sonnet-4-5".to_string(),
+                    turns: 3,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+                stack::ParticipantStat {
+                    agent: "Mika".to_string(),
+                    model: "claude-opus-4-5".to_string(),
+                    turns: 2,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+            ],
+        };
+        let yaml = serde_yaml::to_string(&convo).unwrap();
+        assert!(
+            yaml.contains("participants:"),
+            "conversation meta must include participants: {yaml}"
+        );
+        assert!(yaml.contains("agent: Levi"));
+        assert!(yaml.contains("turns: 3"));
+        assert!(yaml.contains("agent: Mika"));
+        assert!(yaml.contains("turns: 2"));
+
+        // Backend uses the stable schema vocabulary, not "conversation".
+        assert!(
+            yaml.contains("backend: claude-cli"),
+            "audit backend must stick to api/claude-cli/codex/ollama/shell: {yaml}"
+        );
+
+        // Non-conversation step has no participants key (skip_serializing_if).
+        let llm = stack::StepRecord {
+            step_id: "design".to_string(),
+            kind: "llm".to_string(),
+            agent: Some("Levi".to_string()),
+            model_requested: Some("claude-sonnet-4-5".to_string()),
+            model_actual: Some("claude-sonnet-4-5".to_string()),
+            backend: "claude-cli".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 100,
+            started_at: "2026-04-30T16:00:00Z".to_string(),
+            exit_code: 0,
+            input_steps: vec![],
+            output_file: "01-design.md".to_string(),
+            participants: vec![],
+        };
+        let yaml = serde_yaml::to_string(&llm).unwrap();
+        assert!(
+            !yaml.contains("participants"),
+            "non-conversation steps must omit participants for backward-compat: {yaml}"
+        );
     }
 
     #[test]

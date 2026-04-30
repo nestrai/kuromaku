@@ -127,6 +127,39 @@ pub struct StepRecord {
     /// (e.g. `01-fetch.md`). The `steps/` segment is mandated by the spec
     /// (issue #31) and added by readers/writers, not stored here.
     pub output_file: String,
+    /// Per-agent breakdown for `kind: conversation` steps (issue #170
+    /// acceptance criterion: "list of agents, turns taken, tokens per
+    /// agent"). Empty for non-conversation steps; `skip_serializing_if`
+    /// keeps `meta.yaml` for agent/shell steps unchanged so existing audit
+    /// consumers stay backward compatible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub participants: Vec<ParticipantStat>,
+}
+
+/// One row of conversation-step participant statistics.
+///
+/// Filled by the runner from the router's log entries (turns) plus the
+/// agent definition (model). Tokens are an `Option` because per-agent token
+/// accounting is not yet wired through the messaging Router; recording
+/// `None` is honest about that gap, recording `0` would lie.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParticipantStat {
+    /// Agent ID, matching the entry in the step's `agents:` list.
+    pub agent: String,
+    /// Model identifier as configured in the agent file. Mirrors
+    /// `StepRecord::model_requested` for agent steps but lives per-row here
+    /// since a conversation can mix models across participants.
+    pub model: String,
+    /// Number of `MessageKind::Final` results this agent emitted during the
+    /// conversation. Tool-use entries and streaming partials do not count.
+    pub turns: usize,
+    /// Per-agent input tokens. `None` until the executor/transport surfaces
+    /// per-message token counts to the router.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_in: Option<u32>,
+    /// Per-agent output tokens. Same caveat as `tokens_in`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens_out: Option<u32>,
 }
 
 /// Resource loaded from a seed (agent file, rules file, guide). Hashed so the
@@ -364,6 +397,7 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: step_content_filename(step_num, step_id, ext),
+            participants: Vec::new(),
         }
     }
 
