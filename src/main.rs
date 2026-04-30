@@ -40,7 +40,7 @@ use crate::resolver::{
 use crate::runner::{RunContext, StepRunResult};
 use crate::stack::{Manifest, ResourceRecord, RoleResolution, SeedRecord};
 
-const KOTO_DIR: &str = ".koto";
+const KOTO_DIR: &str = ".kuro";
 
 #[derive(Parser)]
 #[command(name = "kuro", about = "Reproducible AI agent teams", version)]
@@ -56,7 +56,7 @@ struct Cli {
 /// applies to the other.
 #[derive(clap::Args)]
 struct RunArgs {
-    /// Flow name (looks in .koto/flows/<name>.yaml)
+    /// Flow name (looks in .kuro/flows/<name>.yaml)
     flow: Option<String>,
 
     /// Task prompt or template arguments (key=value pairs fill {{key}} placeholders in the flow prompt)
@@ -96,7 +96,7 @@ enum Command {
     Up(RunArgs),
     /// Run an ad-hoc task with one or more agents (no flow needed)
     Task {
-        /// Agent name(s) from .koto/agents/ (repeatable, executed in order)
+        /// Agent name(s) from .kuro/agents/ (repeatable, executed in order)
         #[arg(short, long, required = true)]
         agent: Vec<String>,
 
@@ -104,7 +104,7 @@ enum Command {
         #[arg(short = 't', long, required = true)]
         task: String,
     },
-    /// Fetch skills from remote sources pinned in .koto/skills.lock
+    /// Fetch skills from remote sources pinned in .kuro/skills.lock
     Pull,
     /// Stop the agent team
     #[command(hide = true)]
@@ -357,7 +357,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
 
     // Optional project-level config -- needed if any agent declares a tier
     // and to source the seeds list. Without the project config we fall back
-    // to the implicit `.koto/` seed.
+    // to the implicit `.kuro/` seed.
     let koto_config = KotoConfig::load_optional(Path::new("."))?;
     let seeds = koto_config
         .as_ref()
@@ -952,7 +952,7 @@ fn build_manifest(
     // Skills: hash exactly what was injected into the prompt. Two runs that
     // differ only in skill content would otherwise produce identical hashes
     // here -- breaking the "same hash = same inputs" audit promise. Skills
-    // live at `.koto/skills/<name>/` (project-local, not in seeds), so the
+    // live at `.kuro/skills/<name>/` (project-local, not in seeds), so the
     // recorded path stays relative and machine-portable.
     let mut skill_names: Vec<&String> = ctx.skills_cache.keys().collect();
     skill_names.sort();
@@ -961,7 +961,7 @@ fn build_manifest(
         resources.push(ResourceRecord {
             kind: "skill".to_string(),
             name: name.clone(),
-            path: format!(".koto/skills/{name}"),
+            path: format!("{KOTO_DIR}/skills/{name}"),
             sha256: stack::sha256_hex(content.as_bytes()),
         });
     }
@@ -1184,13 +1184,13 @@ fn run_pull() -> Result<()> {
 
     if !lock_path.exists() {
         return Err(eyre!(
-            "no .koto/skills.lock found\n\nhint: create .koto/skills.lock with your skill sources"
+            "no .kuro/skills.lock found\n\nhint: create .kuro/skills.lock with your skill sources"
         ));
     }
 
     let lock = skills::load_skills_lock(&lock_path)?;
     if lock.skills.is_empty() {
-        println!("no skills defined in .koto/skills.lock");
+        println!("no skills defined in .kuro/skills.lock");
         return Ok(());
     }
 
@@ -1686,7 +1686,7 @@ mod tests {
             backend: config::Backend::ClaudeCli,
             model_source: "agent".to_string(),
             backend_source: "agent".to_string(),
-            seed_origin: Some(".koto/".to_string()),
+            seed_origin: Some(".kuro/".to_string()),
         }];
         let mut vars = std::collections::HashMap::new();
         vars.insert("owner".to_string(), "nestrai".to_string());
@@ -1747,7 +1747,7 @@ mod tests {
         for r in &manifest.resources {
             assert_eq!(r.sha256.len(), 64, "missing hash for {:?}", r);
         }
-        // Skill record uses a project-relative path (.koto/skills/<name>) and
+        // Skill record uses a project-relative path (.kuro/skills/<name>) and
         // its hash matches the cached content -- confirming runs that differ
         // only in skill content produce different manifest hashes.
         let skill = manifest
@@ -1756,11 +1756,11 @@ mod tests {
             .find(|r| r.kind == "skill")
             .expect("skill record present");
         assert_eq!(skill.name, "domain-cli");
-        assert_eq!(skill.path, ".koto/skills/domain-cli");
+        assert_eq!(skill.path, ".kuro/skills/domain-cli");
         assert_eq!(skill.sha256, stack::sha256_hex(b"skill content"));
         // Roles round-tripped with backend label normalised.
         assert_eq!(manifest.roles[0].backend, "claude-cli");
-        assert_eq!(manifest.roles[0].seed_origin.as_deref(), Some(".koto/"));
+        assert_eq!(manifest.roles[0].seed_origin.as_deref(), Some(".kuro/"));
         // Steps include the per-step record verbatim and totals are summed.
         assert_eq!(manifest.steps.len(), 1);
         assert_eq!(manifest.steps[0].step_id, "design");

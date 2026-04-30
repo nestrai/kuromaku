@@ -36,7 +36,7 @@ pub struct SkillEntry {
     pub integrity: Option<String>,
 }
 
-/// Load the skills lock file from `.koto/skills.lock`.
+/// Load the skills lock file from `.kuro/skills.lock`.
 pub fn load_skills_lock(path: &Path) -> Result<SkillsLock, SkillsError> {
     let contents = std::fs::read_to_string(path)?;
     let lock: SkillsLock = serde_yaml::from_str(&contents)?;

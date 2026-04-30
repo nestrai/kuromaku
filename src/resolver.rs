@@ -331,7 +331,7 @@ pub fn format_audit(
 ) -> String {
     let mut out = String::new();
     // Seeds line first -- the user sees the search order before any role-level
-    // detail. We always emit it (even with the implicit `.koto/` default) so
+    // detail. We always emit it (even with the implicit `.kuro/` default) so
     // the audit makes the resolution path explicit.
     out.push_str(&format!("[resolve] seeds: {}\n", seeds.audit_line()));
 

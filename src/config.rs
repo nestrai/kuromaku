@@ -88,7 +88,7 @@ pub struct RawRoleDefault {
     pub default: String,
 }
 
-/// Flow config file format (lives in .koto/flows/<name>.yaml).
+/// Flow config file format (lives in .kuro/flows/<name>.yaml).
 #[derive(Debug, Deserialize)]
 pub struct RawFlowConfig {
     pub version: Version,
@@ -139,7 +139,7 @@ pub struct RawStep {
     pub unknown: HashMap<String, serde_yaml::Value>,
 }
 
-/// Agent file format (lives in .koto/agents/<id>.yaml).
+/// Agent file format (lives in .kuro/agents/<id>.yaml).
 #[derive(Debug, Deserialize)]
 pub struct RawAgentFile {
     pub name: String,
@@ -294,7 +294,7 @@ pub fn parse_role_names(contents: &str) -> Result<HashSet<String>, ConfigError> 
     Ok(raw.roles.keys().cloned().collect())
 }
 
-/// Load a single agent file from a single `.koto/` directory. Test-only
+/// Load a single agent file from a single `.kuro/` directory. Test-only
 /// convenience wrapper -- internally builds a single-seed list and delegates
 /// to [`load_agent_file_with_seeds`]. Production callers should construct a
 /// [`Seeds`] up front (run_up/run_task already do).
