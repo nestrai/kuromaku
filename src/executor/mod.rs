@@ -228,6 +228,13 @@ pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_promp
 /// just like in print mode; per-agent personas survive the switch to
 /// interactive transport.
 ///
+/// `kill_on_drop(true)` is set so a partial spawn (one of N participants
+/// fails to come up, an early error in `run_conversation_step`, an
+/// unwound future) tears down the already-running children rather than
+/// leaking detached `claude` processes. The transport has no `Drop` impl
+/// of its own and `close()` is not always reached on the error path; the
+/// kill flag is the backstop.
+///
 /// (issue #170)
 pub fn build_claude_interactive_command(
     model: &str,
@@ -244,6 +251,7 @@ pub fn build_claude_interactive_command(
     if let Some(system) = system_prompt {
         cmd.arg("--system-prompt").arg(system);
     }
+    cmd.kill_on_drop(true);
     cmd
 }
 
