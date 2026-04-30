@@ -1807,9 +1807,7 @@ mod tests {
 
     #[test]
     fn render_transcript_includes_participants_and_finals() {
-        use crate::messaging::router::{
-            LogEntry, LogKind, MessageKind, Source, TerminationReason,
-        };
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source, TerminationReason};
 
         let entries = vec![
             LogEntry {
@@ -1855,9 +1853,7 @@ mod tests {
 
     #[test]
     fn render_transcript_skips_partials_and_outbound() {
-        use crate::messaging::router::{
-            LogEntry, LogKind, MessageKind, Source, TerminationReason,
-        };
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source, TerminationReason};
 
         let entries = vec![
             // Streaming partial -- must not appear in transcript.
@@ -2040,9 +2036,7 @@ mod tests {
 
     #[test]
     fn render_transcript_renders_tool_use_and_send_failures() {
-        use crate::messaging::router::{
-            LogEntry, LogKind, MessageKind, Source, TerminationReason,
-        };
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source, TerminationReason};
 
         let entries = vec![
             LogEntry {

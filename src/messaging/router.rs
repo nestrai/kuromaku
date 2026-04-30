@@ -544,10 +544,7 @@ mod tests {
     #[test]
     fn termination_reason_display_is_stable() {
         assert_eq!(format!("{}", TerminationReason::MaxTurns), "max_turns");
-        assert_eq!(
-            format!("{}", TerminationReason::Convergence),
-            "convergence"
-        );
+        assert_eq!(format!("{}", TerminationReason::Convergence), "convergence");
         assert_eq!(format!("{}", TerminationReason::Timeout), "timeout");
         assert_eq!(
             format!("{}", TerminationReason::HumanClosed),
