@@ -134,6 +134,28 @@ pub struct StepRecord {
     /// consumers stay backward compatible.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub participants: Vec<ParticipantStat>,
+    /// Total agent turns for `kind: conversation` steps (issue #172
+    /// manifest summary: matches the sum of `participants[].turns`). Kept
+    /// as a separate field so audit consumers do not have to re-aggregate
+    /// the participants vector for the headline number. `None` for
+    /// non-conversation steps so existing meta.yaml output stays
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u32>,
+    /// Total messages written to the audit log for `kind: conversation`
+    /// steps (issue #172). The count comes from the
+    /// [`MessageLogWriter`](crate::messaging::audit::MessageLogWriter), so
+    /// it reflects what was actually flushed to disk -- a write failure
+    /// would not inflate it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub messages: Option<u32>,
+    /// Termination reason for `kind: conversation` steps, rendered via
+    /// [`TerminationReason::Display`](crate::messaging::router::TerminationReason)
+    /// so the on-disk string stays frozen across variant renames
+    /// (`max_turns`, `convergence`, `timeout`, `human_closed`,
+    /// `all_agents_closed`). `None` for non-conversation steps.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminated_by: Option<String>,
 }
 
 /// One row of conversation-step participant statistics.
@@ -398,6 +420,9 @@ mod tests {
             input_steps: vec![],
             output_file: step_content_filename(step_num, step_id, ext),
             participants: Vec::new(),
+            turns: None,
+            messages: None,
+            terminated_by: None,
         }
     }
 
