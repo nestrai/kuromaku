@@ -112,4 +112,4 @@ This produces the `kuro` binary.
 
 ## Status
 
-Early development. The core flow engine works: sequential step execution, context injection between steps, template variables, persistent stack output. See the [issues](https://github.com/nestrai/koto/issues) for the roadmap.
+Early development. The core flow engine works: sequential step execution, context injection between steps, template variables, persistent stack output. See the [issues](https://github.com/nestrai/kuromaku/issues) for the roadmap.
