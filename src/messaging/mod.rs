@@ -8,4 +8,5 @@
 //! termination detection, and audit logging are conversation concerns, not
 //! process-management concerns.
 
+pub mod audit;
 pub mod router;

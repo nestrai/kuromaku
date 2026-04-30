@@ -1729,6 +1729,9 @@ mod tests {
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
                 participants: Vec::new(),
+                turns: None,
+                messages: None,
+                terminated_by: None,
             },
         }];
 

@@ -569,6 +569,9 @@ async fn run_shell_step(
         input_steps: step.input.clone(),
         output_file: content_filename.clone(),
         participants: Vec::new(),
+        turns: None,
+        messages: None,
+        terminated_by: None,
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &stdout).map_err(|e| {
         RunError::Stack {
@@ -723,6 +726,7 @@ async fn run_conversation_step(
 ) -> Result<StepRunResult, RunError> {
     use std::sync::{Arc, Mutex};
 
+    use crate::messaging::audit::{MessageLogWriter, message_log_path};
     use crate::messaging::router::{LogEntry, Router, RouterConfig};
 
     // Resolve all participant agents up front -- a missing agent must fail
@@ -798,12 +802,48 @@ async fn run_conversation_step(
         router_cfg.turn_timeout = std::time::Duration::from_secs(secs);
     }
 
-    // Logger collects entries into a Vec we own. Arc<Mutex<...>> rather than
-    // an mpsc because we only need the entries after the router has
-    // terminated -- no streaming consumer.
+    // Open the NDJSON audit log alongside the run before the conversation
+    // starts (#172). Writing happens inside the logger callback so a
+    // `tail -f messages/<step>.ndjson` reader sees lines appear in real
+    // time. Failures here are surfaced eagerly: we will not start a
+    // conversation we cannot audit.
+    let messages_path = message_log_path(&ctx.run_path, &step.id);
+    let writer =
+        Arc::new(
+            MessageLogWriter::create(&messages_path).map_err(|e| RunError::Stack {
+                step: step.id.clone(),
+                source: stack::StackError::Write(e),
+            })?,
+        );
+    eprintln!(
+        "      messages: {}",
+        messages_path
+            .canonicalize()
+            .unwrap_or(messages_path.clone())
+            .display()
+    );
+
+    // The logger has two jobs now:
+    // 1. Stream every relevant entry to the NDJSON audit file (#172).
+    // 2. Buffer every entry in memory so the post-run transcript renderer
+    //    and per-agent turn counter still see the full sequence.
+    //
+    // Arc<Mutex<Vec<LogEntry>>> rather than mpsc because we only need the
+    // entries once the router has terminated. The audit writer carries
+    // its own internal locking, so the closure does not need to hold any
+    // additional state.
     let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
     let log_clone = Arc::clone(&log);
+    let writer_for_logger = Arc::clone(&writer);
     let logger = Arc::new(move |entry: LogEntry| {
+        // Audit-write first so a panic in the buffering branch (e.g. mutex
+        // poisoning) cannot drop messages from the persistent log. An I/O
+        // failure on the audit file is logged and the conversation
+        // continues -- aborting mid-conversation would lose more
+        // information than a partial audit trail.
+        if let Err(e) = writer_for_logger.record(&entry) {
+            eprintln!("warning: failed to append audit message: {e}");
+        }
         if let Ok(mut v) = log_clone.lock() {
             v.push(entry);
         }
@@ -864,6 +904,16 @@ async fn run_conversation_step(
         })
         .collect();
 
+    // Conversation summary fields for the manifest (#172). `turns` is the
+    // sum of agent finals, matching the per-agent rows so the audit
+    // numbers reconcile. `messages` comes from the writer's count -- a
+    // failed flush would not inflate it. `terminated_by` uses the
+    // [`TerminationReason`] Display impl so the on-disk string stays
+    // frozen against future variant renames.
+    let total_turns: u32 = participants_stats.iter().map(|p| p.turns as u32).sum();
+    let total_messages: u32 = writer.message_count();
+    let terminated_by = termination.to_string();
+
     let started_at = step_started_at.to_rfc3339();
     let record = StepRecord {
         step_id: step.id.clone(),
@@ -888,6 +938,9 @@ async fn run_conversation_step(
         input_steps: step.input.clone(),
         output_file: content_filename.clone(),
         participants: participants_stats,
+        turns: Some(total_turns),
+        messages: Some(total_messages),
+        terminated_by: Some(terminated_by),
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &transcript).map_err(|e| {
         RunError::Stack {
@@ -1162,6 +1215,9 @@ pub async fn run_steps(
             input_steps: step.input.clone(),
             output_file: content_filename.clone(),
             participants: Vec::new(),
+            turns: None,
+            messages: None,
+            terminated_by: None,
         };
 
         // Write the canonical content file plus the meta.yaml. Executor
@@ -1350,6 +1406,9 @@ mod tests {
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
                 participants: Vec::new(),
+                turns: None,
+                messages: None,
+                terminated_by: None,
             },
         }];
         let summary = build_summary(&results);
@@ -1752,6 +1811,9 @@ mod tests {
             input_steps: vec![],
             output_file: stack::step_content_filename(1, "fetch", "txt"),
             participants: Vec::new(),
+            turns: None,
+            messages: None,
+            terminated_by: None,
         };
         stack::write_run_step(&ctx.run_path, 1, &rec, "PR diff goes here").unwrap();
 
@@ -2061,6 +2123,11 @@ mod tests {
                     tokens_out: None,
                 },
             ],
+            // Conversation summary fields (#172): aggregate turns, total
+            // messages logged, termination reason. Asserted below.
+            turns: Some(5),
+            messages: Some(7),
+            terminated_by: Some("convergence".to_string()),
         };
         let yaml = serde_yaml::to_string(&convo).unwrap();
         assert!(
@@ -2071,6 +2138,15 @@ mod tests {
         assert!(yaml.contains("turns: 3"));
         assert!(yaml.contains("agent: Mika"));
         assert!(yaml.contains("turns: 2"));
+        // #172 manifest summary surfaces alongside participants.
+        assert!(
+            yaml.contains("messages: 7"),
+            "conversation meta must carry total messages: {yaml}"
+        );
+        assert!(
+            yaml.contains("terminated_by: convergence"),
+            "conversation meta must carry termination reason: {yaml}"
+        );
 
         // Backend uses the stable schema vocabulary, not "conversation".
         assert!(
@@ -2094,11 +2170,25 @@ mod tests {
             input_steps: vec![],
             output_file: "01-design.md".to_string(),
             participants: vec![],
+            turns: None,
+            messages: None,
+            terminated_by: None,
         };
         let yaml = serde_yaml::to_string(&llm).unwrap();
         assert!(
             !yaml.contains("participants"),
             "non-conversation steps must omit participants for backward-compat: {yaml}"
+        );
+        // #172: the new conversation summary fields must also stay out of
+        // non-conversation meta.yaml so existing audit consumers see no
+        // schema drift.
+        assert!(
+            !yaml.contains("terminated_by"),
+            "non-conversation steps must omit terminated_by: {yaml}"
+        );
+        assert!(
+            !yaml.contains("messages:"),
+            "non-conversation steps must omit messages summary: {yaml}"
         );
     }
 
