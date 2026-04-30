@@ -27,7 +27,7 @@ pub enum StackError {
 // --- Legacy flat-file layout (kept for backward compat with pre-#31 stacks).
 //
 // The runner no longer writes these files; new runs use the run-directory
-// layout below. The legacy reader stays so future `koto show` (#92) can
+// layout below. The legacy reader stays so future `kuro show` (#92) can
 // surface old stacks without rewriting them.
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,7 +174,7 @@ pub struct Manifest {
     pub duration_ms: u128,
     pub total_tokens_in: u32,
     pub total_tokens_out: u32,
-    /// Cost is intentionally `null` -- koto does not currently price runs.
+    /// Cost is intentionally `null` -- kuromaku does not currently price runs.
     /// Reserved so future audits can populate it without a schema bump.
     pub cost: Option<f64>,
     #[serde(default)]
@@ -533,7 +533,7 @@ mod tests {
     fn resolution_audit_written_to_file() {
         let dir = tempfile::tempdir().unwrap();
         let run_path = dir.path().join("run");
-        write_resolution_audit(&run_path, "[resolve] seeds: .koto\n").unwrap();
+        write_resolution_audit(&run_path, "[resolve] seeds: .kuro\n").unwrap();
         let txt = std::fs::read_to_string(run_path.join("resolution-audit.txt")).unwrap();
         assert!(txt.starts_with("[resolve] seeds:"));
     }

@@ -62,7 +62,7 @@ impl RunContext {
         let started_at_utc = chrono::Utc::now();
         let local = started_at_utc.with_timezone(&chrono::Local);
         let ts = local.format("%Y%m%d-%H%M%S").to_string();
-        // Two `koto run` calls in the same wall-clock second would otherwise
+        // Two `kuro run` calls in the same wall-clock second would otherwise
         // share a run_id and clobber each other's outputs. Bump a numeric
         // suffix until we find a free directory so the timestamp stays
         // human-readable in the common case and only collisions get `-2`,
@@ -92,7 +92,7 @@ impl RunContext {
 /// each other -- which defeats the per-run audit promise behind issue #31.
 ///
 /// There is a TOCTOU window between the `exists()` check and the directory
-/// being created later in the run, but `koto run` invocations are user-driven
+/// being created later in the run, but `kuro run` invocations are user-driven
 /// (not a service loop), so the race is bounded by how fast a human can press
 /// Enter twice. The overwrite bug, by contrast, hits any back-to-back run.
 fn unique_run_path(stack_path: &Path, base: &str) -> (String, PathBuf) {
@@ -340,13 +340,13 @@ async fn run_step_via_executor(
     backend: Backend,
     output_path: &Path,
 ) -> Result<(String, Option<llm::Usage>), RunError> {
-    // Build unique session name: koto-<project>-<flow>-<step>-<short-id>
+    // Build unique session name: kuro-<project>-<flow>-<step>-<short-id>
     let project = std::env::current_dir()
         .ok()
         .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
     let short_id = &chrono::Utc::now().timestamp_millis().to_string()[8..];
-    let task_id = format!("koto-{project}-{flow_name}-{}-{short_id}", step.id);
+    let task_id = format!("kuro-{project}-{flow_name}-{}-{short_id}", step.id);
 
     let command = match backend {
         Backend::ClaudeCli => {
@@ -482,7 +482,7 @@ async fn run_shell_step(
         .unwrap_or_else(|| "unknown".to_string());
     let short_id = &chrono::Utc::now().timestamp_millis().to_string()[8..];
     let task_id = format!(
-        "koto-{project}-{}-{}-{short_id}-shell",
+        "kuro-{project}-{}-{}-{short_id}-shell",
         ctx.flow_name, step.id
     );
 
@@ -1169,7 +1169,7 @@ mod tests {
 
     #[test]
     fn unique_run_path_bumps_suffix_when_directory_exists() {
-        // Two `koto run` calls in the same wall-clock second must not collide.
+        // Two `kuro run` calls in the same wall-clock second must not collide.
         // The first creates `<base>`, the second falls back to `<base>-2`,
         // and so on. Without this, the second run silently overwrites the
         // first run's outputs and the audit trail is destroyed.
@@ -1373,7 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_steps_writes_per_step_files_and_meta_in_run_dir() {
-        // Acceptance: every koto run creates a run directory with NN-<step>.md
+        // Acceptance: every kuro run creates a run directory with NN-<step>.md
         // (or .txt) and NN-<step>.meta.yaml per step. Two shell steps are
         // enough to exercise the numbering and the input-handoff.
         let dir = tempfile::tempdir().unwrap();

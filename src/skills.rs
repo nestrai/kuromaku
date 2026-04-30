@@ -11,7 +11,7 @@ pub enum SkillsError {
     #[error("failed to parse skills lock: {0}")]
     Parse(#[from] serde_yaml::Error),
 
-    #[error("skill '{name}' directory not found at {path} (hint: run `koto pull` to fetch skills)")]
+    #[error("skill '{name}' directory not found at {path} (hint: run `kuro pull` to fetch skills)")]
     SkillNotFound { name: String, path: String },
 
     #[error("no .md files found in skill directory '{0}'")]
@@ -251,7 +251,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = resolve_skill("nonexistent", dir.path()).unwrap_err();
         assert!(err.to_string().contains("not found"));
-        assert!(err.to_string().contains("koto pull"));
+        assert!(err.to_string().contains("kuro pull"));
     }
 
     #[test]
