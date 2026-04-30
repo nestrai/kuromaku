@@ -41,6 +41,7 @@ use color_eyre::eyre::eyre;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+pub mod discovery;
 pub mod error;
 pub mod protocol;
 pub mod server;
@@ -73,7 +74,19 @@ pub async fn run(verbose: bool) -> Result<()> {
         Err(e) => warn!(error = %e, "project config invalid; continuing without it"),
     }
 
-    let registry = tools::ToolRegistry::new();
+    let mut registry = tools::ToolRegistry::new();
+    // Discovery tools (#197). `register` only fails on programmer error
+    // (invalid name, duplicate, empty description); surface as eyre so a
+    // broken build is loud, not silent.
+    registry
+        .register(Box::new(discovery::ListAgents))
+        .map_err(|e| eyre!("register list_agents: {:?}", e))?;
+    registry
+        .register(Box::new(discovery::ListFlows))
+        .map_err(|e| eyre!("register list_flows: {:?}", e))?;
+    registry
+        .register(Box::new(discovery::LoadAgent))
+        .map_err(|e| eyre!("register load_agent: {:?}", e))?;
 
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
