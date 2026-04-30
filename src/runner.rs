@@ -280,7 +280,7 @@ pub fn load_rules_for_agents_with_seeds(
 }
 
 /// Build the full system prompt: Guide > Rules > Skills > Role.
-fn build_system_prompt(
+pub(crate) fn build_system_prompt(
     agent: &Agent,
     guide: &Option<String>,
     rules_cache: &HashMap<String, String>,

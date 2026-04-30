@@ -16,7 +16,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 #[test]
-fn mcp_subcommand_handshake_and_lists_empty_tools() {
+fn mcp_subcommand_handshake_and_lists_discovery_tools() {
     let bin = env!("CARGO_BIN_EXE_kuro");
     let mut child = Command::new(bin)
         .arg("mcp")
@@ -63,10 +63,40 @@ fn mcp_subcommand_handshake_and_lists_empty_tools() {
         false
     );
 
-    // tools/list: empty registry on a fresh scaffold.
+    // tools/list: discovery tools registered (#197). Order is deterministic
+    // (registry is a BTreeMap) -- assert names plus required-fields shape so
+    // future tools landing alongside don't churn this test.
     assert_eq!(resp2["jsonrpc"], "2.0");
     assert_eq!(resp2["id"], 2);
-    assert_eq!(resp2["result"]["tools"], serde_json::json!([]));
+    let tools = resp2["result"]["tools"]
+        .as_array()
+        .expect("tools is an array");
+    let names: Vec<&str> = tools
+        .iter()
+        .map(|t| t["name"].as_str().expect("tool name is string"))
+        .collect();
+    assert!(
+        names.contains(&"list_agents"),
+        "list_agents missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"list_flows"),
+        "list_flows missing: {names:?}"
+    );
+    assert!(
+        names.contains(&"load_agent"),
+        "load_agent missing: {names:?}"
+    );
+    let load_agent = tools
+        .iter()
+        .find(|t| t["name"] == "load_agent")
+        .expect("load_agent descriptor");
+    // load_agent must declare `name` as required so clients can validate
+    // before sending.
+    assert_eq!(
+        load_agent["inputSchema"]["required"],
+        serde_json::json!(["name"])
+    );
 
     // Server must exit cleanly after stdin EOF -- no SIGTERM in the
     // scaffold (per team review #195 comments).
