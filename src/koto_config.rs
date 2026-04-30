@@ -1,13 +1,15 @@
-//! Project-level config (`.koto/config.yaml`).
+//! Project-level config (`.kuro/config.yaml`).
 //!
-//! Optional file under `.koto/` that defines capability tiers, project
+//! Optional file under `.kuro/` that defines capability tiers, project
 //! defaults and template variables. When the file is absent everything works
 //! as before -- callers receive `None` from [`KotoConfig::load_optional`].
 //!
 //! Resolution cascade and roles are handled in #129; seeds in #130.
 //!
-//! For one migration cycle [`KotoConfig::load_optional`] also accepts the
-//! legacy `koto.yaml` location and emits a deprecation warning.
+//! For one migration cycle [`KotoConfig::load_optional`] also accepts two
+//! legacy locations and emits a deprecation warning when it falls back:
+//!   1. `.koto/config.yaml` -- former canonical path before the `.kuro/` rename
+//!   2. `koto.yaml` in the repo root -- pre-`.koto/` layout from earlier still
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,11 +21,17 @@ use crate::config::Version;
 /// Canonical relative path to the project config file. Single source of
 /// truth -- runtime messages and lookups must use this constant rather than
 /// hard-coding the string.
-pub const KOTO_CONFIG_FILE: &str = ".koto/config.yaml";
+pub const KOTO_CONFIG_FILE: &str = ".kuro/config.yaml";
 
-/// Legacy relative path used for one migration cycle. Loading from this path
-/// triggers a deprecation warning. Will be removed once users have migrated.
-pub const KOTO_CONFIG_FILE_LEGACY: &str = "koto.yaml";
+/// Legacy path: former canonical config location before the `.koto/` -> `.kuro/`
+/// rename. Loading from this path triggers a deprecation warning suggesting
+/// `mv .koto .kuro`. Removed once the migration window closes.
+pub const KOTO_CONFIG_FILE_LEGACY_KOTO: &str = ".koto/config.yaml";
+
+/// Legacy path: pre-`.koto/` layout where the config sat in the repo root.
+/// Still loaded for one extra migration cycle and triggers its own deprecation
+/// warning pointing at [`KOTO_CONFIG_FILE`].
+pub const KOTO_CONFIG_FILE_LEGACY_ROOT: &str = "koto.yaml";
 
 /// Errors surfaced when parsing or loading [`KotoConfig`].
 ///
@@ -249,9 +257,26 @@ pub struct Seeds {
 
 impl Seeds {
     /// Implicit default when no `seeds:` section is present in the project
-    /// config (or the config file itself is absent). Matches v0 behavior: a
-    /// single `.koto/` seed with no eager existence check.
+    /// config (or the config file itself is absent). Single `.kuro/` seed,
+    /// no eager existence check -- matches the pre-rename `.koto/` behavior
+    /// against the new directory name.
     pub fn default_local() -> Self {
+        Self {
+            seeds: vec![Seed {
+                source: SeedSource::Local {
+                    display: ".kuro/".to_string(),
+                    path: PathBuf::from(".kuro"),
+                },
+            }],
+        }
+    }
+
+    /// Legacy default seed used when the project config was loaded from a
+    /// pre-rename location (`.koto/config.yaml` or root `koto.yaml`) AND has
+    /// no explicit `seeds:` section. Without this, projects on the legacy
+    /// layout would silently start looking for agents/rules under `.kuro/`
+    /// after upgrading. Removed once the migration window closes.
+    pub fn legacy_koto_local() -> Self {
         Self {
             seeds: vec![Seed {
                 source: SeedSource::Local {
@@ -390,24 +415,43 @@ impl KotoConfig {
     /// when the file is missing -- callers must treat that as the no-op case
     /// to keep the no-config workflow intact.
     ///
-    /// For one migration cycle, `dir/koto.yaml` is also accepted as a
-    /// fallback when the canonical [`KOTO_CONFIG_FILE`] is missing. Loading
-    /// from the legacy path emits a deprecation warning on stderr.
+    /// Resolution order (first match wins):
+    ///   1. `.kuro/config.yaml` -- canonical, silent
+    ///   2. `.koto/config.yaml` -- legacy from the pre-`.kuro/` rename, warns
+    ///      and suggests `mv .koto .kuro`
+    ///   3. `koto.yaml` in the repo root -- earlier legacy, warns and points
+    ///      at the canonical path
+    ///
+    /// For both legacy paths, when the loaded config has no explicit `seeds:`
+    /// section the implicit seed is rewritten to [`Seeds::legacy_koto_local`]
+    /// so projects on the old layout keep finding their agents/rules under
+    /// `.koto/` after upgrading.
     pub fn load_optional(dir: &Path) -> Result<Option<Self>, KotoConfigError> {
         let path = dir.join(KOTO_CONFIG_FILE);
         if path.exists() {
             let contents = std::fs::read_to_string(&path)?;
             return Ok(Some(Self::from_yaml_str(&contents)?));
         }
-        // Backward-compat: fall back to the legacy filename in the working
-        // directory. Removed once the migration window closes.
-        let legacy = dir.join(KOTO_CONFIG_FILE_LEGACY);
-        if legacy.exists() {
+        // Legacy 1: `.koto/config.yaml` -- former canonical path before the
+        // `.kuro/` rename. Falls back transparently for one migration cycle.
+        let legacy_koto = dir.join(KOTO_CONFIG_FILE_LEGACY_KOTO);
+        if legacy_koto.exists() {
+            eprintln!("warning: {KOTO_CONFIG_FILE_LEGACY_KOTO} is deprecated, run: mv .koto .kuro");
+            let contents = std::fs::read_to_string(&legacy_koto)?;
+            let cfg = Self::from_yaml_str(&contents)?;
+            return Ok(Some(rebase_default_seeds_for_legacy(cfg)));
+        }
+        // Legacy 2: pre-`.koto/` layout -- config in the repo root. Kept
+        // separately because the deprecation message and the seeds default it
+        // implies are different from the `.koto/` case.
+        let legacy_root = dir.join(KOTO_CONFIG_FILE_LEGACY_ROOT);
+        if legacy_root.exists() {
             eprintln!(
-                "warning: {KOTO_CONFIG_FILE_LEGACY} is deprecated, rename to {KOTO_CONFIG_FILE}"
+                "warning: {KOTO_CONFIG_FILE_LEGACY_ROOT} is deprecated, move config to {KOTO_CONFIG_FILE}"
             );
-            let contents = std::fs::read_to_string(&legacy)?;
-            return Ok(Some(Self::from_yaml_str(&contents)?));
+            let contents = std::fs::read_to_string(&legacy_root)?;
+            let cfg = Self::from_yaml_str(&contents)?;
+            return Ok(Some(rebase_default_seeds_for_legacy(cfg)));
         }
         Ok(None)
     }
@@ -514,6 +558,22 @@ impl KotoConfig {
                 ))
             })
     }
+}
+
+/// When a config was loaded from a legacy path (`.koto/config.yaml` or
+/// `koto.yaml`), the implicit-seed default produced by [`Seeds::default_local`]
+/// points at `.kuro/` -- which is wrong for projects still on the old layout.
+/// Detect that exact case (a single seed equal to the new default) and swap
+/// it to [`Seeds::legacy_koto_local`] so agents/rules/flows continue to
+/// resolve out of `.koto/`.
+///
+/// Configs that explicitly declared `seeds:` are left untouched -- the user
+/// asked for a specific layout and we honor it verbatim.
+fn rebase_default_seeds_for_legacy(mut cfg: KotoConfig) -> KotoConfig {
+    if cfg.seeds == Seeds::default_local() {
+        cfg.seeds = Seeds::legacy_koto_local();
+    }
+    cfg
 }
 
 fn validate_model_format(model: &str) -> Result<(), KotoConfigError> {
@@ -696,38 +756,103 @@ defaults:
     }
 
     #[test]
-    fn load_optional_legacy_path_loads_with_warning() {
-        // Backward-compat: until users migrate, the old `koto.yaml` filename
-        // still loads. The warning itself is on stderr and not asserted on
-        // here, but the file must parse and yield a populated config.
+    fn load_optional_legacy_root_yaml_loads_with_warning() {
+        // Backward-compat: until users migrate, the pre-`.koto/` root
+        // `koto.yaml` filename still loads. The warning itself is on stderr
+        // and not asserted on here, but the file must parse and yield a
+        // populated config.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(KOTO_CONFIG_FILE_LEGACY), FULL_KOTO_YAML).unwrap();
+        std::fs::write(
+            dir.path().join(KOTO_CONFIG_FILE_LEGACY_ROOT),
+            FULL_KOTO_YAML,
+        )
+        .unwrap();
         let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
         assert_eq!(cfg.tiers.len(), 3);
+        // No explicit seeds in FULL_KOTO_YAML -- legacy path must rebase the
+        // implicit seed to `.koto/` so projects on the old layout keep
+        // resolving agents/rules where they actually live.
+        assert_eq!(cfg.seeds, Seeds::legacy_koto_local());
     }
 
     #[test]
-    fn load_optional_prefers_canonical_over_legacy() {
-        // When both files exist the canonical `.koto/config.yaml` wins so the
-        // migration is unambiguous.
+    fn load_optional_legacy_koto_config_loads_with_warning() {
+        // The `.koto/config.yaml` legacy path -- the immediate predecessor of
+        // `.kuro/config.yaml`. Same rebase rule applies as for the root
+        // `koto.yaml` legacy path.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join(KOTO_CONFIG_FILE_LEGACY_KOTO);
+        std::fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        std::fs::write(&legacy_path, FULL_KOTO_YAML).unwrap();
+        let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
+        assert_eq!(cfg.tiers.len(), 3);
+        assert_eq!(cfg.seeds, Seeds::legacy_koto_local());
+    }
+
+    #[test]
+    fn load_optional_prefers_canonical_over_legacy_koto() {
+        // When `.kuro/config.yaml` and `.koto/config.yaml` both exist, the
+        // canonical path wins so the migration is unambiguous. We arrange a
+        // deliberately-broken legacy file: if the loader picked it up we'd
+        // get a parse error instead of a populated config.
         let dir = tempfile::tempdir().unwrap();
 
         let canonical = dir.path().join(KOTO_CONFIG_FILE);
-        if let Some(parent) = canonical.parent() {
-            std::fs::create_dir_all(parent).unwrap();
-        }
+        std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
         std::fs::write(&canonical, FULL_KOTO_YAML).unwrap();
 
-        // Legacy file with deliberately-broken YAML: if the loader picked it
-        // up we'd get a parse error instead of a populated config.
+        let legacy = dir.path().join(KOTO_CONFIG_FILE_LEGACY_KOTO);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "version: \"1\"\n: : :\n").unwrap();
+
+        let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
+        assert_eq!(cfg.tiers.len(), 3);
+        // Canonical config has no explicit seeds, so the implicit seed must
+        // be the new default `.kuro/` -- not rebased to `.koto/`.
+        assert_eq!(cfg.seeds, Seeds::default_local());
+    }
+
+    #[test]
+    fn load_optional_prefers_legacy_koto_over_root_yaml() {
+        // The `.koto/config.yaml` legacy path takes priority over the older
+        // root `koto.yaml`. Same broken-file trick: if the loader picked the
+        // root file we'd see a parse error.
+        let dir = tempfile::tempdir().unwrap();
+
+        let legacy = dir.path().join(KOTO_CONFIG_FILE_LEGACY_KOTO);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, FULL_KOTO_YAML).unwrap();
+
         std::fs::write(
-            dir.path().join(KOTO_CONFIG_FILE_LEGACY),
+            dir.path().join(KOTO_CONFIG_FILE_LEGACY_ROOT),
             "version: \"1\"\n: : :\n",
         )
         .unwrap();
 
         let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
         assert_eq!(cfg.tiers.len(), 3);
+    }
+
+    #[test]
+    fn load_optional_legacy_preserves_explicit_seeds() {
+        // Legacy paths only rebase the implicit-seed default. When the legacy
+        // config explicitly declares `seeds:`, the user's choice wins -- we
+        // do not silently rewrite it to `.koto/`.
+        let dir = tempfile::tempdir().unwrap();
+        let custom_seed = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            "version: \"1\"\nseeds:\n  - path: {}\n",
+            custom_seed.path().display()
+        );
+
+        let legacy = dir.path().join(KOTO_CONFIG_FILE_LEGACY_KOTO);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, yaml).unwrap();
+
+        let cfg = KotoConfig::load_optional(dir.path()).unwrap().unwrap();
+        assert_eq!(cfg.seeds.seeds.len(), 1);
+        assert_ne!(cfg.seeds, Seeds::legacy_koto_local());
+        assert_ne!(cfg.seeds, Seeds::default_local());
     }
 
     #[test]
@@ -900,11 +1025,13 @@ roles:
 
     #[test]
     fn no_seeds_section_yields_default_local() {
-        // Backward-compat: a project config without `seeds:` mirrors v0
-        // behavior, a single implicit `.koto/` seed.
+        // A canonical project config without `seeds:` defaults to a single
+        // implicit `.kuro/` seed. Configs loaded from legacy paths get
+        // rebased separately via [`rebase_default_seeds_for_legacy`] -- this
+        // test pins the default for the canonical-path case only.
         let cfg = KotoConfig::from_yaml_str(r#"version: "1""#).unwrap();
         assert_eq!(cfg.seeds.seeds.len(), 1);
-        assert_eq!(cfg.seeds.seeds[0].display(), ".koto/");
+        assert_eq!(cfg.seeds.seeds[0].display(), ".kuro/");
         assert_eq!(cfg.seeds.seeds[0].kind_label(), "local");
     }
 
@@ -1120,7 +1247,7 @@ seeds: []
             seeds: vec![
                 Seed {
                     source: SeedSource::Local {
-                        display: ".koto/".to_string(),
+                        display: ".kuro/".to_string(),
                         path: dir.path().to_path_buf(),
                     },
                 },
@@ -1133,7 +1260,7 @@ seeds: []
             ],
         };
         let line = seeds.audit_line();
-        assert_eq!(line, ".koto/ (local), nestrai/seeds@v0.1 (remote)");
+        assert_eq!(line, ".kuro/ (local), nestrai/seeds@v0.1 (remote)");
     }
 
     #[test]
@@ -1143,7 +1270,7 @@ seeds: []
             seeds: vec![
                 Seed {
                     source: SeedSource::Local {
-                        display: ".koto/".to_string(),
+                        display: ".kuro/".to_string(),
                         path: dir.path().to_path_buf(),
                     },
                 },
@@ -1160,7 +1287,7 @@ seeds: []
             msg.contains("agent \"coding/rust/Sage\" not found"),
             "got: {msg}"
         );
-        assert!(msg.contains(".koto/"), "got: {msg}");
+        assert!(msg.contains(".kuro/"), "got: {msg}");
         assert!(msg.contains("~/other-seed/"), "got: {msg}");
     }
 

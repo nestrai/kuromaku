@@ -487,7 +487,7 @@ mod tests {
             version: 1,
             run_id: "dev-20260429-100000".to_string(),
             flow_name: "dev".to_string(),
-            flow_path: ".koto/flows/dev.yaml".to_string(),
+            flow_path: ".kuro/flows/dev.yaml".to_string(),
             flow_sha256: sha256_hex(b"contents"),
             started_at: "2026-04-29T10:00:00Z".to_string(),
             finished_at: "2026-04-29T10:05:00Z".to_string(),
@@ -497,15 +497,15 @@ mod tests {
             cost: None,
             vars: indexmap::IndexMap::from([("owner".to_string(), "nestrai".to_string())]),
             seeds: vec![SeedRecord {
-                display: ".koto".to_string(),
-                path: Some(".koto".to_string()),
+                display: ".kuro".to_string(),
+                path: Some(".kuro".to_string()),
                 git_sha: None,
                 dirty: false,
             }],
             resources: vec![ResourceRecord {
                 kind: "agent".to_string(),
                 name: "Levi".to_string(),
-                path: ".koto/agents/Levi.yaml".to_string(),
+                path: ".kuro/agents/Levi.yaml".to_string(),
                 sha256: sha256_hex(b"agent"),
             }],
             roles: vec![RoleResolution {
@@ -515,7 +515,7 @@ mod tests {
                 backend: "claude-cli".to_string(),
                 model_source: "agent".to_string(),
                 backend_source: "agent".to_string(),
-                seed_origin: Some(".koto".to_string()),
+                seed_origin: Some(".kuro".to_string()),
             }],
             steps: vec![record(1, "design", "md")],
         };

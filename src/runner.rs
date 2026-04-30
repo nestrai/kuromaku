@@ -178,8 +178,8 @@ fn llm_output_filename(step_num: usize, step_id: &str) -> String {
     stack::step_content_filename(step_num, step_id, "md")
 }
 
-/// Load `.koto/Guide.md` if it exists. Test-only single-dir variant; the
-/// production loader is [`load_guide_from_seeds`].
+/// Load `Guide.md` from a single project config directory. Test-only
+/// single-dir variant; the production loader is [`load_guide_from_seeds`].
 #[cfg(test)]
 pub fn load_guide(koto_dir: &Path) -> Option<String> {
     let guide_path = koto_dir.join("Guide.md");
