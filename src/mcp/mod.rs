@@ -43,6 +43,7 @@ use tracing_subscriber::EnvFilter;
 
 pub mod discovery;
 pub mod error;
+pub mod execution;
 pub mod protocol;
 pub mod server;
 pub mod tools;
@@ -87,14 +88,73 @@ pub async fn run(verbose: bool) -> Result<()> {
     registry
         .register(Box::new(discovery::LoadAgent))
         .map_err(|e| eyre!("register load_agent: {:?}", e))?;
+    // Flow execution tools (#198). Same loud-on-broken-build policy.
+    registry
+        .register(Box::new(execution::RunFlow))
+        .map_err(|e| eyre!("register run_flow: {:?}", e))?;
+    registry
+        .register(Box::new(execution::ShowOutput))
+        .map_err(|e| eyre!("register show_output: {:?}", e))?;
 
+    // Take ownership of the stdout fd BEFORE the runner can write to it.
+    // Tools that call into `runner::execute_flow` indirectly invoke `ui::*`
+    // which uses `println!` (process-wide stdout). Without this redirect
+    // every UI line corrupts the JSON-RPC framing -- a real-world break for
+    // Claude Code, Cursor and Codex. After redirect, `println!` lands on
+    // stderr and the saved fd carries our protocol responses.
     let stdin = tokio::io::stdin();
-    let stdout = tokio::io::stdout();
-    server::run(stdin, stdout, registry)
+    let protocol_writer = isolate_protocol_stdout()?;
+    server::run(stdin, protocol_writer, registry)
         .await
         .map_err(|e| eyre!("mcp server io error: {e}"))?;
 
     Ok(())
+}
+
+/// Detach the protocol channel from the process-wide stdout. After this
+/// runs, `println!`/`print!` (anywhere in the binary, including the runner)
+/// goes to stderr; the returned writer points at the original stdout fd
+/// the operating system handed us at exec time.
+///
+/// Implementation: dup fd 1, dup2 fd 2 onto fd 1, wrap the saved fd in a
+/// `tokio::fs::File`. The writer is async because `server::run` expects an
+/// `AsyncWrite`. On non-Unix platforms this is a no-op pass-through that
+/// keeps the existing behaviour -- the redirect dance is Unix-specific
+/// (Windows would need a different syscall and is not a kuro mcp target
+/// today).
+#[cfg(unix)]
+fn isolate_protocol_stdout() -> Result<tokio::fs::File> {
+    use std::os::unix::io::FromRawFd;
+
+    // SAFETY: dup/dup2 are async-signal-safe and operate on POSIX fds we
+    // know are open at process start (1 = stdout, 2 = stderr). We claim
+    // the dup'd fd as an OwnedFd via from_raw_fd so it closes on drop.
+    let saved_fd = unsafe { libc::dup(libc::STDOUT_FILENO) };
+    if saved_fd < 0 {
+        return Err(eyre!(
+            "dup(stdout) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let dup2_rc = unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) };
+    if dup2_rc < 0 {
+        // Best-effort cleanup of the saved fd before bubbling up.
+        unsafe { libc::close(saved_fd) };
+        return Err(eyre!(
+            "dup2(stderr -> stdout) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: saved_fd is exclusively ours, opened just above.
+    let file = unsafe { std::fs::File::from_raw_fd(saved_fd) };
+    Ok(tokio::fs::File::from_std(file))
+}
+
+#[cfg(not(unix))]
+fn isolate_protocol_stdout() -> Result<tokio::io::Stdout> {
+    // Non-Unix: keep the legacy behaviour. The MCP server is Unix-targeted
+    // for the foreseeable future; revisit when Windows support lands.
+    Ok(tokio::io::stdout())
 }
 
 fn init_tracing(verbose: bool) -> Result<()> {

@@ -324,6 +324,169 @@ pub fn read_run_step_content(run_path: &Path, step_id: &str) -> Result<String, S
     Err(StackError::StepNotFound(step_id.to_string()))
 }
 
+// --- Read API for external consumers (MCP `show_output`, `kuro show`).
+//
+// The team review on issue #198 forbids path parsing in `src/mcp/`. Anything
+// that wants to read a finished or in-flight run goes through these helpers
+// so the on-disk layout stays a single-source-of-truth concern owned by
+// `stack`.
+
+/// Lifecycle of a run as observable from disk.
+///
+/// `Done`: a `manifest.yaml` exists at the run root -- the run finished
+/// cleanly and every step that was supposed to write content did.
+///
+/// `Running`: the run directory exists but the manifest does not. We treat
+/// this as "still in flight". A run that crashed mid-flight (process killed,
+/// panic) sits in this state forever today; an explicit failure marker is
+/// follow-up work tracked alongside #198.
+///
+/// `Failed`: reserved for the future explicit failure marker. Returned today
+/// only by callers that surface the variant via API contract -- `read_run`
+/// itself never produces it.
+///
+/// `NotFound`: no run directory at the expected path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunStatus {
+    Running,
+    Done,
+    /// Reserved for the future explicit failure marker. The variant is
+    /// public so the API surface stays stable when the marker lands; today
+    /// no code path constructs it.
+    #[allow(dead_code)]
+    Failed,
+    NotFound,
+}
+
+impl RunStatus {
+    /// Stable wire string. Used by MCP `show_output` and any other consumer
+    /// that needs to surface the status as a JSON value.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::NotFound => "not_found",
+        }
+    }
+}
+
+/// One step's content as exposed by [`read_run`]. `content` is `None` for
+/// steps that have a meta file but no readable output file yet (the meta is
+/// written first; in-progress conversation steps live in this state for a
+/// while).
+#[derive(Debug, Clone)]
+pub struct RunStepOutput {
+    pub step_id: String,
+    pub content: Option<String>,
+}
+
+/// Aggregated read of a run directory. `status` is always set; `steps` is
+/// empty for `NotFound` and may be partial for `Running`.
+#[derive(Debug, Clone)]
+pub struct RunOutputs {
+    pub run_id: String,
+    pub status: RunStatus,
+    pub steps: Vec<RunStepOutput>,
+}
+
+/// Read a run directory by id, optionally filtering to a single step.
+///
+/// `stack_path` is the project's stack root (`~/.koto/stacks/<project>/`).
+/// The function joins `run_id` and walks the steps subdirectory. It never
+/// surfaces the run's filesystem path to callers -- that is the team review
+/// rule for #198.
+///
+/// Errors only on truly broken on-disk state (corrupt meta YAML, unreadable
+/// content file). Missing run dir is `NotFound`, missing manifest is
+/// `Running` -- both return `Ok`.
+pub fn read_run(
+    stack_path: &Path,
+    run_id: &str,
+    step: Option<&str>,
+) -> Result<RunOutputs, StackError> {
+    let run_path = stack_path.join(run_id);
+    if !run_path.is_dir() {
+        return Ok(RunOutputs {
+            run_id: run_id.to_string(),
+            status: RunStatus::NotFound,
+            steps: Vec::new(),
+        });
+    }
+    let status = if run_path.join("manifest.yaml").is_file() {
+        RunStatus::Done
+    } else {
+        RunStatus::Running
+    };
+    let steps = collect_run_steps(&run_path, step)?;
+    Ok(RunOutputs {
+        run_id: run_id.to_string(),
+        status,
+        steps,
+    })
+}
+
+/// Collect step outputs from `<run_path>/steps/`, ordered by the `NN-`
+/// numeric prefix (i.e. topological execution order). When `filter` is
+/// `Some`, only the matching step id is returned -- callers get an empty
+/// vector if the requested step has not been recorded yet (the caller can
+/// distinguish "step missing" from "run missing" via the run-level status).
+fn collect_run_steps(
+    run_path: &Path,
+    filter: Option<&str>,
+) -> Result<Vec<RunStepOutput>, StackError> {
+    let steps_dir = run_path.join(STEPS_SUBDIR);
+    if !steps_dir.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut metas: Vec<(u32, StepRecord)> = Vec::new();
+    for entry in std::fs::read_dir(&steps_dir)
+        .map_err(StackError::Read)?
+        .flatten()
+    {
+        let name = entry.file_name();
+        let s = name.to_string_lossy();
+        // Same `NN-<id>.meta.yaml` shape as `read_run_step_content`. Steps
+        // without a numeric prefix are not part of the topological run
+        // record and are skipped.
+        let after_digits = s.trim_start_matches(|c: char| c.is_ascii_digit());
+        let digits_len = s.len() - after_digits.len();
+        if digits_len == 0 {
+            continue;
+        }
+        let Some(rest) = after_digits.strip_prefix('-') else {
+            continue;
+        };
+        let Some(step_id) = rest.strip_suffix(".meta.yaml") else {
+            continue;
+        };
+        if let Some(want) = filter
+            && want != step_id
+        {
+            continue;
+        }
+        let order: u32 = s[..digits_len].parse().unwrap_or(u32::MAX);
+        let yaml = std::fs::read_to_string(entry.path()).map_err(StackError::Read)?;
+        let rec: StepRecord = serde_yaml::from_str(&yaml)?;
+        metas.push((order, rec));
+    }
+    metas.sort_by_key(|(order, _)| *order);
+    let mut out: Vec<RunStepOutput> = Vec::with_capacity(metas.len());
+    for (_order, rec) in metas {
+        let content_path = steps_dir.join(&rec.output_file);
+        let content = match std::fs::read_to_string(&content_path) {
+            Ok(c) => Some(c),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(StackError::Read(e)),
+        };
+        out.push(RunStepOutput {
+            step_id: rec.step_id,
+            content,
+        });
+    }
+    Ok(out)
+}
+
 /// Write the run manifest at `<run_path>/manifest.yaml`. Called once at the
 /// end of a successful run.
 pub fn write_manifest(run_path: &Path, manifest: &Manifest) -> Result<(), StackError> {
@@ -586,6 +749,145 @@ mod tests {
         assert_eq!(parsed.flow_sha256.len(), 64);
         assert_eq!(parsed.steps.len(), 1);
         assert_eq!(parsed.roles[0].agent, "Sage");
+    }
+
+    // --- read_run ---
+
+    fn write_minimal_manifest(run_path: &Path) {
+        // Smallest manifest YAML that satisfies serde -- enough so that
+        // `read_run` flips the status to Done. The on-disk shape is not
+        // parsed by `read_run`; presence is the signal.
+        std::fs::write(run_path.join("manifest.yaml"), "version: 1\n").unwrap();
+    }
+
+    #[test]
+    fn read_run_not_found_for_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = read_run(dir.path(), "ghost-20260501-000000", None).unwrap();
+        assert_eq!(out.status, RunStatus::NotFound);
+        assert!(out.steps.is_empty());
+        assert_eq!(out.run_id, "ghost-20260501-000000");
+    }
+
+    #[test]
+    fn read_run_running_when_manifest_missing() {
+        // A run dir with one step written but no manifest -- the typical
+        // mid-flight shape. `read_run` reports `running` and returns the
+        // partial step output so a caller can render progress.
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = "dev-20260501-100000";
+        let run_path = dir.path().join(run_id);
+        write_run_step(&run_path, 1, &record(1, "design", "md"), "BODY-1").unwrap();
+
+        let out = read_run(dir.path(), run_id, None).unwrap();
+        assert_eq!(out.status, RunStatus::Running);
+        assert_eq!(out.steps.len(), 1);
+        assert_eq!(out.steps[0].step_id, "design");
+        assert_eq!(out.steps[0].content.as_deref(), Some("BODY-1"));
+    }
+
+    #[test]
+    fn read_run_done_when_manifest_present_returns_steps_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = "dev-20260501-100100";
+        let run_path = dir.path().join(run_id);
+        // Write steps out of order to prove the reader sorts by NN- prefix.
+        write_run_step(&run_path, 2, &record(2, "build", "md"), "BUILD-OUT").unwrap();
+        write_run_step(&run_path, 1, &record(1, "design", "md"), "DESIGN-OUT").unwrap();
+        write_minimal_manifest(&run_path);
+
+        let out = read_run(dir.path(), run_id, None).unwrap();
+        assert_eq!(out.status, RunStatus::Done);
+        let ids: Vec<&str> = out.steps.iter().map(|s| s.step_id.as_str()).collect();
+        assert_eq!(ids, vec!["design", "build"]);
+        assert_eq!(out.steps[0].content.as_deref(), Some("DESIGN-OUT"));
+        assert_eq!(out.steps[1].content.as_deref(), Some("BUILD-OUT"));
+    }
+
+    #[test]
+    fn read_run_step_filter_returns_only_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = "dev-20260501-100200";
+        let run_path = dir.path().join(run_id);
+        write_run_step(&run_path, 1, &record(1, "design", "md"), "D").unwrap();
+        write_run_step(&run_path, 2, &record(2, "build", "md"), "B").unwrap();
+        write_minimal_manifest(&run_path);
+
+        let out = read_run(dir.path(), run_id, Some("build")).unwrap();
+        assert_eq!(out.status, RunStatus::Done);
+        assert_eq!(out.steps.len(), 1);
+        assert_eq!(out.steps[0].step_id, "build");
+        assert_eq!(out.steps[0].content.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn read_run_step_filter_unknown_step_is_empty_not_error() {
+        // The team review wants `show_output` to distinguish run-level vs
+        // step-level "missing": the run is Done, the step just is not in
+        // the recorded set. Returning Ok with empty steps lets the MCP
+        // tool surface that distinction without inventing a new error.
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = "dev-20260501-100300";
+        let run_path = dir.path().join(run_id);
+        write_run_step(&run_path, 1, &record(1, "design", "md"), "D").unwrap();
+        write_minimal_manifest(&run_path);
+
+        let out = read_run(dir.path(), run_id, Some("missing-step")).unwrap();
+        assert_eq!(out.status, RunStatus::Done);
+        assert!(out.steps.is_empty());
+    }
+
+    #[test]
+    fn read_run_step_filter_disambiguates_id_suffix() {
+        // Two steps with shared substring must not collide. Mirrors the
+        // existing `read_run_step_content` test.
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = "dev-20260501-100400";
+        let run_path = dir.path().join(run_id);
+        write_run_step(&run_path, 1, &record(1, "pre-fetch", "md"), "ALPHA").unwrap();
+        write_run_step(&run_path, 2, &record(2, "fetch", "md"), "BETA").unwrap();
+        write_minimal_manifest(&run_path);
+
+        let only_fetch = read_run(dir.path(), run_id, Some("fetch")).unwrap();
+        assert_eq!(only_fetch.steps.len(), 1);
+        assert_eq!(only_fetch.steps[0].step_id, "fetch");
+        assert_eq!(only_fetch.steps[0].content.as_deref(), Some("BETA"));
+    }
+
+    #[test]
+    fn read_run_running_step_with_no_content_yet() {
+        // A meta file exists (the runner writes meta then content) but the
+        // content file has not landed. `content` is None so the caller can
+        // surface `running` without making up output.
+        let dir = tempfile::tempdir().unwrap();
+        let run_id = "dev-20260501-100500";
+        let run_path = dir.path().join(run_id);
+        ensure_dir(&run_path.join(STEPS_SUBDIR)).unwrap();
+        let rec = record(1, "design", "md");
+        // Write only the meta -- no content file.
+        std::fs::write(
+            run_path
+                .join(STEPS_SUBDIR)
+                .join(step_meta_filename(1, &rec.step_id)),
+            serde_yaml::to_string(&rec).unwrap(),
+        )
+        .unwrap();
+
+        let out = read_run(dir.path(), run_id, None).unwrap();
+        assert_eq!(out.status, RunStatus::Running);
+        assert_eq!(out.steps.len(), 1);
+        assert!(out.steps[0].content.is_none());
+    }
+
+    #[test]
+    fn run_status_wire_strings_are_stable() {
+        // The MCP `show_output` JSON contract pins these spellings. Any
+        // rename here is a wire break and must show up in this test before
+        // shipping.
+        assert_eq!(RunStatus::Running.as_str(), "running");
+        assert_eq!(RunStatus::Done.as_str(), "done");
+        assert_eq!(RunStatus::Failed.as_str(), "failed");
+        assert_eq!(RunStatus::NotFound.as_str(), "not_found");
     }
 
     #[test]

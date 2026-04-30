@@ -1776,6 +1776,23 @@ mod flow_api {
             .join(project)
     }
 
+    /// Resolve the stack directory for a named flow, honoring the flow's
+    /// own `stack.path` override. Walks the seed cascade exactly like
+    /// `execute_flow` so a run started by `run_flow` and a status query via
+    /// `show_output` agree on where the artifacts live. Falls back to the
+    /// default when the flow file declares no `stack.path`.
+    pub(crate) fn resolve_stack_path_for_flow_name(name: &str) -> Result<PathBuf> {
+        let koto_config = KotoConfig::load_optional(Path::new("."))?;
+        let seeds = koto_config
+            .as_ref()
+            .map(|c| c.seeds.clone())
+            .unwrap_or_else(Seeds::default_local);
+        let path = resolve_flow_path(&FlowSource::Name(name.to_string()), &seeds)?;
+        let contents = std::fs::read_to_string(&path)?;
+        let flow_config = config::load_flow_from_str(&contents)?;
+        Ok(resolve_stack_path(&flow_config.stack.path))
+    }
+
     /// Apply the resolver-decided agent for every role in the flow.
     pub(crate) fn apply_role_agent_overrides(
         flow_config: &mut FlowConfig,
@@ -2443,7 +2460,7 @@ pub use flow_api::{
 #[allow(unused_imports)]
 pub(crate) use flow_api::{
     apply_resolved_roles_to_steps, apply_role_agent_overrides, build_manifest, resolve_stack_path,
-    resolve_task, substitute_placeholders, substitute_vars,
+    resolve_stack_path_for_flow_name, resolve_task, substitute_placeholders, substitute_vars,
 };
 
 #[cfg(test)]

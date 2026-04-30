@@ -987,6 +987,7 @@ dependencies = [
  "crossterm 0.28.1",
  "dirs",
  "indexmap",
+ "libc",
  "predicates",
  "regex-lite",
  "reqwest",
