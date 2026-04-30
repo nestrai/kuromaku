@@ -13,6 +13,8 @@ mod koto_config;
 #[allow(dead_code)]
 mod llm;
 #[allow(dead_code)]
+mod mcp;
+#[allow(dead_code)]
 mod messaging;
 mod notify;
 mod resolver;
@@ -95,6 +97,16 @@ enum Command {
     Down,
     /// Show running agents and stack
     Status,
+    /// Run as a Model Context Protocol server over stdio (#195).
+    ///
+    /// External agents (Codex, Cursor, Claude Code) spawn this command and
+    /// exchange newline-delimited JSON-RPC 2.0 frames on stdin/stdout to
+    /// invoke kuro tools. Stops on stdin EOF. Diagnostics route to stderr.
+    Mcp {
+        /// Bump tracing level to DEBUG (overridden by `RUST_LOG`).
+        #[arg(long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -118,6 +130,7 @@ async fn main() -> Result<()> {
         Command::Status => {
             println!("kuro status: not yet implemented");
         }
+        Command::Mcp { verbose } => mcp::run(verbose).await?,
     }
 
     Ok(())
