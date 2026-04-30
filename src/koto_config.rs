@@ -18,6 +18,12 @@ use serde::Deserialize;
 
 use crate::config::Version;
 
+/// Canonical project directory inside the repository. Houses agents, flows,
+/// rules, skills, and the project config. Exported so non-CLI callers (the
+/// runner library API, tests) can locate the directory without hard-coding
+/// the string in multiple places.
+pub const KOTO_DIR: &str = ".kuro";
+
 /// Canonical relative path to the project config file. Single source of
 /// truth -- runtime messages and lookups must use this constant rather than
 /// hard-coding the string.

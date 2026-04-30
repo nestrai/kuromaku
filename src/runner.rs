@@ -1344,6 +1344,1108 @@ pub fn build_summary(results: &[StepRunResult]) -> Vec<ui::StepResult> {
         .collect()
 }
 
+// =====================================================================
+// Library API: execute_flow / RunHandle (issue #209)
+// =====================================================================
+//
+// `execute_flow` is the clap-free orchestration entry point. `kuro run` is a
+// thin wrapper around it; the MCP server (#194/#199) drives the same path
+// without shelling out. The setup half (config load, role resolution, agent
+// loading, audit, run-context construction) runs synchronously on the caller
+// so configuration errors surface before a `RunHandle` exists. Step execution
+// + manifest writing + summary printing run on a spawned tokio task that the
+// returned handle awaits.
+
+mod flow_api {
+    //! Implementation of [`execute_flow`] and the supporting types. The module
+    //! is public-in-private so the items can be re-exported from `runner` while
+    //! their internals stay scoped to one file's worth of orchestration code.
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::LazyLock;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    use color_eyre::Result;
+    use color_eyre::eyre::eyre;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
+
+    use crate::config::{self, Backend, FlowConfig};
+    use crate::dag;
+    use crate::koto_config::{KOTO_CONFIG_FILE, KOTO_DIR, KotoConfig, Seeds};
+    use crate::resolver::{
+        self, ResolvedRole, RoleOverride, format_audit, print_audit, resolve_role,
+        validate_role_overrides,
+    };
+    use crate::skills;
+    use crate::stack::{self, Manifest, ResourceRecord, RoleResolution, SeedRecord};
+    use crate::ui;
+
+    use super::{RunContext, StepRunResult, run_steps};
+
+    /// Where to read the flow YAML from. The CLI partitions its `--file`
+    /// flag into the explicit `File` arm; `Name` triggers a seed walk;
+    /// `Auto` is the no-arg case that auto-selects when exactly one flow
+    /// exists across all seeds.
+    pub enum FlowSource {
+        Auto,
+        Name(String),
+        File(PathBuf),
+    }
+
+    /// All inputs needed to run a flow. Independent of clap so non-CLI
+    /// callers (MCP, tests) can build it from any source. Field semantics
+    /// match the historical `kuro run` cascade (project config < CLI <
+    /// per-step) -- callers do not pre-merge.
+    ///
+    /// Path resolution operates on the process current working directory:
+    /// `.kuro/config.yaml`, the seeds it declares, agent files, rules,
+    /// skills, and the manifest's resource paths are all looked up
+    /// relative to CWD. Callers that need to run a flow against a
+    /// different project directory must `chdir` before calling
+    /// [`execute_flow`]. Threading a project root through every loader is
+    /// tracked separately -- see #199.
+    pub struct ExecuteFlowSpec {
+        /// Where to look for the flow definition.
+        pub flow: FlowSource,
+        /// Task prompt override. `None` falls back to the flow's `prompt:`.
+        pub task: Option<String>,
+        /// CLI-style `--var key=value` overrides. Project-config vars are
+        /// merged in by `execute_flow`; this map carries only what the
+        /// caller passed.
+        pub vars: HashMap<String, String>,
+        /// Pre-parsed `--role` overrides. Use [`crate::resolver::parse_role_override`]
+        /// in the CLI; library callers can construct values directly.
+        pub role_overrides: Vec<RoleOverride>,
+        /// Bare `key=value` arguments. After the flow YAML is read,
+        /// `execute_flow` partitions these into legacy role rebinds and
+        /// template-var fills, mirroring the historical CLI behavior. Pass
+        /// an empty map if the caller does not want the legacy partition.
+        pub bare_args: HashMap<String, String>,
+        /// When true, suppress the `kuro run <flow>` banner that the CLI
+        /// prints up front. MCP and other quiet callers set this to true.
+        pub suppress_command_banner: bool,
+    }
+
+    impl Default for ExecuteFlowSpec {
+        fn default() -> Self {
+            Self {
+                flow: FlowSource::Auto,
+                task: None,
+                vars: HashMap::new(),
+                role_overrides: Vec::new(),
+                bare_args: HashMap::new(),
+                suppress_command_banner: false,
+            }
+        }
+    }
+
+    /// Outcome of a completed flow run.
+    ///
+    /// The CLI wrapper currently consumes only `step_results` and
+    /// `stack_path`; the remaining fields are part of the public surface
+    /// for the MCP server (#199) and other in-process callers (#196,
+    /// #198). Allowing dead code here keeps the API stable without
+    /// forcing every consumer to read every field.
+    #[allow(dead_code)]
+    pub struct FlowResult {
+        pub run_id: String,
+        pub run_path: PathBuf,
+        pub stack_path: PathBuf,
+        pub flow_name: String,
+        pub manifest: Manifest,
+        pub step_results: Vec<StepRunResult>,
+        pub total_elapsed: Duration,
+    }
+
+    /// Shared mutable state held jointly by the `RunHandle` and the
+    /// spawned execution task. The handle reads `active_router` and writes
+    /// `cancel`; the task does the inverse.
+    #[derive(Default)]
+    pub(super) struct RunState {
+        cancel: AtomicBool,
+        active_router: Mutex<Option<RouterAccessor>>,
+    }
+
+    impl RunState {
+        pub(super) fn is_cancelled(&self) -> bool {
+            self.cancel.load(Ordering::Relaxed)
+        }
+
+        /// Conversation steps call this on entry; the matching
+        /// [`Self::clear_router`] runs when the router stops. The slot is
+        /// `None` between conversations so an external accessor reflects
+        /// "no live conversation" honestly.
+        #[allow(dead_code)]
+        pub(super) fn set_router(&self, accessor: RouterAccessor) {
+            if let Ok(mut guard) = self.active_router.lock() {
+                *guard = Some(accessor);
+            }
+        }
+
+        #[allow(dead_code)]
+        pub(super) fn clear_router(&self) {
+            if let Ok(mut guard) = self.active_router.lock() {
+                *guard = None;
+            }
+        }
+
+        #[allow(dead_code)]
+        fn snapshot_router(&self) -> Option<RouterAccessor> {
+            self.active_router.lock().ok()?.clone()
+        }
+    }
+
+    /// Live accessor for the router that is currently driving a
+    /// conversation step. Use [`RouterAccessor::inject_human_message`] to
+    /// broadcast a message to every participant; it surfaces inside the
+    /// router exactly like a stdin-typed line, complete with audit log
+    /// entry.
+    ///
+    /// The accessor is a thin wrapper around an mpsc sender so it can be
+    /// cloned and held across tasks. Cloning produces another sender to
+    /// the same channel.
+    #[derive(Clone)]
+    pub struct RouterAccessor {
+        #[allow(dead_code)]
+        sender: mpsc::Sender<String>,
+    }
+
+    impl RouterAccessor {
+        /// Build an accessor + receiver pair. The receiver is wired into
+        /// `Router::set_human_input`; the accessor is published on the
+        /// shared run state so external callers (MCP `send_message`) can
+        /// inject messages while the conversation runs.
+        #[allow(dead_code)]
+        pub(super) fn new() -> (Self, mpsc::Receiver<String>) {
+            let (tx, rx) = mpsc::channel(16);
+            (Self { sender: tx }, rx)
+        }
+
+        /// Inject a human-style message into the live conversation.
+        /// Returns an error if the router has already terminated (channel
+        /// closed) so the caller can distinguish "no live conversation"
+        /// from "delivery failed".
+        #[allow(dead_code)]
+        pub async fn inject_human_message(
+            &self,
+            text: impl Into<String>,
+        ) -> std::result::Result<(), RouterAccessorError> {
+            self.sender
+                .send(text.into())
+                .await
+                .map_err(|_| RouterAccessorError::Closed)
+        }
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[allow(dead_code)]
+    pub enum RouterAccessorError {
+        #[error("router channel closed -- conversation has terminated")]
+        Closed,
+    }
+
+    /// Handle returned by [`execute_flow`]. Holds the join handle for the
+    /// background execution task plus a shared-state slot the running task
+    /// uses to publish a [`RouterAccessor`] for the active conversation
+    /// step (if any). The handle does not auto-cancel on drop -- callers
+    /// must call [`RunHandle::cancel`] explicitly if they want to abort.
+    #[allow(dead_code)]
+    pub struct RunHandle {
+        pub run_id: String,
+        pub run_path: PathBuf,
+        pub stack_path: PathBuf,
+        pub flow_name: String,
+        state: Arc<RunState>,
+        join: JoinHandle<Result<FlowResult>>,
+    }
+
+    impl RunHandle {
+        /// Run id of the spawned flow. Same value as `FlowResult::run_id`
+        /// after completion; available immediately so callers can show it
+        /// before awaiting.
+        #[allow(dead_code)]
+        pub fn run_id(&self) -> &str {
+            &self.run_id
+        }
+
+        /// Snapshot of the live router accessor, if a conversation step is
+        /// currently driving the run. `None` between conversations or
+        /// before any have started. The returned accessor is owned (not a
+        /// borrow) so the caller can hold it across awaits without
+        /// blocking the runner.
+        #[allow(dead_code)]
+        pub fn router(&self) -> Option<RouterAccessor> {
+            self.state.snapshot_router()
+        }
+
+        /// Request cancellation. Best-effort: the flag is currently only
+        /// checked once, before the first step starts. Mid-run cancellation
+        /// (between steps, or interrupting an in-flight step) is not yet
+        /// wired -- see the comment in `run_to_completion` and the
+        /// follow-up tracked alongside #199.
+        #[allow(dead_code)]
+        pub fn cancel(&self) {
+            self.state.cancel.store(true, Ordering::Relaxed);
+        }
+
+        /// Await the spawned execution task and return the flow result.
+        /// Consumes the handle, so double-await is a compile-time error and
+        /// no runtime guard is needed. Returns an error if the spawned task
+        /// itself panicked.
+        pub async fn await_completion(self) -> Result<FlowResult> {
+            match self.join.await {
+                Ok(res) => res,
+                Err(e) => Err(eyre!("flow execution task panicked: {e}")),
+            }
+        }
+    }
+
+    static VARS_RE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"\{\{vars\.([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap()
+    });
+
+    static PLACEHOLDER_RE: LazyLock<regex_lite::Regex> =
+        LazyLock::new(|| regex_lite::Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap());
+
+    /// Replace `{{vars.<key>}}` placeholders. Mirrors the helper that lived
+    /// in `main.rs` -- moved here so callers without the CLI binary can
+    /// reuse it. Errors list every missing key in one message.
+    pub(crate) fn substitute_vars(text: &str, vars: &HashMap<String, String>) -> Result<String> {
+        let mut missing: Vec<String> = Vec::new();
+        let result = VARS_RE.replace_all(text, |caps: &regex_lite::Captures<'_>| {
+            let key = &caps[1];
+            match vars.get(key) {
+                Some(value) => value.clone(),
+                None => {
+                    if !missing.iter().any(|k| k == key) {
+                        missing.push(key.to_string());
+                    }
+                    caps[0].to_string()
+                }
+            }
+        });
+        if !missing.is_empty() {
+            return Err(eyre!(
+                "missing vars: {}\n\nhint: define them in {KOTO_CONFIG_FILE} or pass --var key=value",
+                missing.join(", ")
+            ));
+        }
+        Ok(result.into_owned())
+    }
+
+    /// Replace bare `{{key}}` placeholders. Counterpart to
+    /// [`substitute_vars`] for the CLI key=value namespace.
+    pub(crate) fn substitute_placeholders(
+        prompt: &str,
+        vars: &HashMap<String, String>,
+    ) -> Result<String> {
+        let mut result = prompt.to_string();
+        let mut missing: Vec<String> = Vec::new();
+        for cap in PLACEHOLDER_RE.captures_iter(prompt) {
+            let key = &cap[1];
+            match vars.get(key) {
+                Some(value) => {
+                    result = result.replace(&format!("{{{{{key}}}}}"), value);
+                }
+                None => {
+                    if !missing.contains(&key.to_string()) {
+                        missing.push(key.to_string());
+                    }
+                }
+            }
+        }
+        if !missing.is_empty() {
+            return Err(eyre!(
+                "missing template arguments: {}\n\nhint: pass them as key=value, e.g. {}",
+                missing.join(", "),
+                missing
+                    .iter()
+                    .map(|k| format!("{k}=<value>"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Resolve the task prompt: explicit override > flow default with bare
+    /// placeholder fills.
+    pub(crate) fn resolve_task(
+        task_flag: Option<&str>,
+        flow_prompt: &Option<String>,
+        template_vars: &HashMap<String, String>,
+    ) -> Result<String> {
+        if let Some(task) = task_flag {
+            return Ok(task.to_string());
+        }
+        if let Some(prompt) = flow_prompt {
+            return substitute_placeholders(prompt, template_vars);
+        }
+        Err(eyre!(
+            "no task specified\n\nhint: use -t \"task\" or define a prompt in the flow YAML"
+        ))
+    }
+
+    /// Resolve the on-disk flow YAML path according to the cascade.
+    pub(crate) fn resolve_flow_path(source: &FlowSource, seeds: &Seeds) -> Result<PathBuf> {
+        match source {
+            FlowSource::File(p) => {
+                if !p.exists() {
+                    return Err(eyre!("config file '{}' not found", p.display()));
+                }
+                Ok(p.clone())
+            }
+            FlowSource::Name(name) => {
+                let rel = std::path::Path::new("flows").join(format!("{name}.yaml"));
+                match seeds.find(&rel).map_err(|e| eyre!("{}", e.message()))? {
+                    Some((_, path)) => Ok(path),
+                    None => Err(eyre!(
+                        "{}\n\nhint: create flows/{name}.yaml in one of the seeds, or use --file <path>",
+                        seeds.not_found_message("flow", name)
+                    )),
+                }
+            }
+            FlowSource::Auto => {
+                let mut by_name: std::collections::BTreeMap<String, PathBuf> =
+                    std::collections::BTreeMap::new();
+                for seed in &seeds.seeds {
+                    let Some(seed_path) = seed.local_path() else {
+                        continue;
+                    };
+                    let flows_dir = seed_path.join("flows");
+                    let Ok(entries) = std::fs::read_dir(&flows_dir) else {
+                        continue;
+                    };
+                    for entry in entries.flatten() {
+                        let file_name = entry.file_name();
+                        let name_str = file_name.to_string_lossy();
+                        if !(name_str.ends_with(".yaml") || name_str.ends_with(".yml")) {
+                            continue;
+                        }
+                        let bare = name_str
+                            .trim_end_matches(".yaml")
+                            .trim_end_matches(".yml")
+                            .to_string();
+                        by_name
+                            .entry(bare)
+                            .or_insert_with(|| flows_dir.join(name_str.as_ref()));
+                    }
+                }
+                if by_name.is_empty() {
+                    return Err(eyre!(
+                        "no flows found in seeds: {}\n\nhint: create flows/<name>.yaml in one of the seed directories",
+                        seeds.audit_line()
+                    ));
+                }
+                if by_name.len() == 1 {
+                    let (_n, path) = by_name.into_iter().next().expect("len == 1");
+                    return Ok(path);
+                }
+                let list = by_name
+                    .keys()
+                    .map(|f| format!("  - {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                Err(eyre!(
+                    "multiple flows found, specify one:\n\n{list}\n\nusage: kuro run <flow-name> -t \"task\""
+                ))
+            }
+        }
+    }
+
+    /// Resolve the project's stack directory. Explicit config > default of
+    /// `~/.koto/stacks/<project>/`. The `.koto/` home root is intentional
+    /// (see comment trail in #176): a rename here would orphan existing
+    /// users' run history without a migration path.
+    pub(crate) fn resolve_stack_path(config_path: &str) -> PathBuf {
+        if !config_path.is_empty() {
+            return PathBuf::from(config_path);
+        }
+        let project = std::env::current_dir()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_else(|| "default".to_string());
+        dirs::home_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".koto")
+            .join("stacks")
+            .join(project)
+    }
+
+    /// Apply the resolver-decided agent for every role in the flow.
+    pub(crate) fn apply_role_agent_overrides(
+        flow_config: &mut FlowConfig,
+        koto_config: Option<&KotoConfig>,
+        overrides: &[RoleOverride],
+    ) {
+        let mut decided: HashMap<String, String> = HashMap::new();
+        for role_name in flow_config.roles.keys() {
+            let flow_agent = flow_config.roles.get(role_name).map(String::as_str);
+            let project_role = koto_config.and_then(|c| c.roles.get(role_name));
+            if let Some(agent) =
+                resolver::resolve_role_agent(role_name, flow_agent, project_role, overrides)
+            {
+                decided.insert(role_name.clone(), agent);
+            }
+        }
+        for (role_name, agent_id) in flow_config.roles.iter_mut() {
+            if let Some(new_agent) = decided.get(role_name) {
+                *agent_id = new_agent.clone();
+            }
+        }
+        for step in flow_config.steps.iter_mut() {
+            if let Some(role) = step.role.as_deref()
+                && let Some(new_agent) = decided.get(role)
+            {
+                step.agent = new_agent.clone();
+            }
+        }
+    }
+
+    /// Build the cascade-resolved binding for every role used in the flow.
+    pub(crate) fn build_resolved_roles(
+        flow_config: &FlowConfig,
+        agents: &[config::Agent],
+        koto_config: Option<&KotoConfig>,
+        cli_overrides: &[RoleOverride],
+    ) -> std::result::Result<Vec<ResolvedRole>, resolver::ResolverError> {
+        let agents_by_id: HashMap<&str, &config::Agent> =
+            agents.iter().map(|a| (a.id.as_str(), a)).collect();
+
+        let mut used_roles: HashSet<&str> = HashSet::new();
+        for step in &flow_config.steps {
+            if let Some(role) = step.role.as_deref() {
+                used_roles.insert(role);
+            }
+        }
+
+        let mut out = Vec::new();
+        for role_name in used_roles {
+            let flow_agent = flow_config.roles.get(role_name).map(String::as_str);
+            let project_role = koto_config.and_then(|c| c.roles.get(role_name));
+
+            let agent_for_lookup = flow_agent
+                .or_else(|| project_role.map(|r| r.agent.as_str()))
+                .unwrap_or("");
+            let agent = agents_by_id.get(agent_for_lookup).copied();
+
+            let agent_model = agent.map(|a| a.model.as_str()).unwrap_or("");
+            let agent_backend = agent.map(|a| a.backend).unwrap_or(Backend::ClaudeCli);
+            let agent_tier = agent.and_then(|a| read_agent_tier(a.id.as_str()));
+
+            let input = resolver::RoleResolveInput {
+                role_name,
+                agent_model,
+                agent_tier: agent_tier.as_deref(),
+                agent_backend,
+                flow_default_model: flow_config.defaults.model.as_str(),
+            };
+
+            let resolved = resolve_role(
+                &input,
+                flow_agent,
+                project_role,
+                cli_overrides,
+                koto_config.and_then(|c| c.default_backend),
+            )
+            .ok_or_else(|| resolver::ResolverError::UnknownRole {
+                name: role_name.to_string(),
+            })?;
+            out.push(resolved);
+        }
+        Ok(out)
+    }
+
+    fn read_agent_tier(agent_id: &str) -> Option<String> {
+        let path = Path::new(KOTO_DIR)
+            .join("agents")
+            .join(format!("{agent_id}.yaml"));
+        let contents = std::fs::read_to_string(&path).ok()?;
+        #[derive(serde::Deserialize)]
+        struct TierOnly {
+            tier: Option<String>,
+        }
+        let parsed: TierOnly = serde_yaml::from_str(&contents).ok()?;
+        parsed.tier
+    }
+
+    pub(crate) fn apply_resolved_roles_to_steps(
+        flow_config: &mut FlowConfig,
+        resolved: &[ResolvedRole],
+    ) {
+        let by_role: HashMap<&str, &ResolvedRole> =
+            resolved.iter().map(|r| (r.name.as_str(), r)).collect();
+        for step in flow_config.steps.iter_mut() {
+            let Some(role_name) = step.role.as_deref() else {
+                continue;
+            };
+            let Some(rr) = by_role.get(role_name) else {
+                continue;
+            };
+            if step.model.is_none() {
+                step.model = Some(rr.model.clone());
+            }
+            if step.backend.is_none() {
+                step.backend = Some(rr.backend);
+            }
+        }
+    }
+
+    fn backend_label(b: Backend) -> &'static str {
+        match b {
+            Backend::Api => "api",
+            Backend::ClaudeCli => "claude-cli",
+            Backend::Codex => "codex",
+            Backend::Ollama => "ollama",
+        }
+    }
+
+    /// Build the run manifest. Pure -- no I/O happens here; the caller is
+    /// expected to write the result to `<run_path>/manifest.yaml`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn build_manifest(
+        ctx: &RunContext,
+        flow_name: &str,
+        flow_path: &Path,
+        flow_contents: &str,
+        seeds: &Seeds,
+        agents: &[config::Agent],
+        agent_origins: &HashMap<String, usize>,
+        agent_hashes: &HashMap<String, String>,
+        roles: &[ResolvedRole],
+        vars: &HashMap<String, String>,
+        results: &[StepRunResult],
+        total_elapsed: Duration,
+    ) -> Manifest {
+        let finished_at = chrono::Utc::now();
+
+        let seed_records: Vec<SeedRecord> = seeds
+            .seeds
+            .iter()
+            .map(|s| SeedRecord {
+                display: s.display(),
+                path: s.local_path().map(|p| p.display().to_string()),
+                git_sha: None,
+                dirty: false,
+            })
+            .collect();
+
+        let mut resources: Vec<ResourceRecord> = Vec::new();
+        resources.push(ResourceRecord {
+            kind: "flow".to_string(),
+            name: flow_name.to_string(),
+            path: flow_path.display().to_string(),
+            sha256: stack::sha256_hex(flow_contents.as_bytes()),
+        });
+        for agent in agents {
+            let rel = std::path::Path::new("agents").join(format!("{}.yaml", agent.id));
+            let path_str = match seeds.find(&rel) {
+                Ok(Some((_, p))) => p.display().to_string(),
+                _ => agent_origins
+                    .get(&agent.id)
+                    .and_then(|idx| seeds.seeds.get(*idx))
+                    .map(|s| s.display())
+                    .unwrap_or_default(),
+            };
+            let sha = agent_hashes.get(&agent.id).cloned().unwrap_or_default();
+            resources.push(ResourceRecord {
+                kind: "agent".to_string(),
+                name: agent.id.clone(),
+                path: path_str,
+                sha256: sha,
+            });
+        }
+        let mut rule_names: Vec<&String> = ctx.rules_cache.keys().collect();
+        rule_names.sort();
+        for name in rule_names {
+            let rel = std::path::Path::new("rules").join(format!("{name}.md"));
+            let path_str = match seeds.find(&rel) {
+                Ok(Some((_, p))) => p.display().to_string(),
+                _ => String::new(),
+            };
+            let content = ctx.rules_cache.get(name).map(String::as_str).unwrap_or("");
+            resources.push(ResourceRecord {
+                kind: "rules".to_string(),
+                name: name.clone(),
+                path: path_str,
+                sha256: stack::sha256_hex(content.as_bytes()),
+            });
+        }
+        let mut skill_names: Vec<&String> = ctx.skills_cache.keys().collect();
+        skill_names.sort();
+        for name in skill_names {
+            let content = ctx.skills_cache.get(name).map(String::as_str).unwrap_or("");
+            resources.push(ResourceRecord {
+                kind: "skill".to_string(),
+                name: name.clone(),
+                path: format!("{KOTO_DIR}/skills/{name}"),
+                sha256: stack::sha256_hex(content.as_bytes()),
+            });
+        }
+        if let Some(guide) = ctx.guide.as_deref() {
+            let path_str = seeds
+                .find(std::path::Path::new("Guide.md"))
+                .ok()
+                .flatten()
+                .map(|(_, p)| p.display().to_string())
+                .unwrap_or_default();
+            resources.push(ResourceRecord {
+                kind: "guide".to_string(),
+                name: "Guide".to_string(),
+                path: path_str,
+                sha256: stack::sha256_hex(guide.as_bytes()),
+            });
+        }
+
+        let role_records: Vec<RoleResolution> = roles
+            .iter()
+            .map(|r| RoleResolution {
+                role: r.name.clone(),
+                agent: r.agent.clone(),
+                model: r.model.clone(),
+                backend: backend_label(r.backend).to_string(),
+                model_source: r.model_source.clone(),
+                backend_source: r.backend_source.clone(),
+                seed_origin: r.seed_origin.clone(),
+            })
+            .collect();
+
+        let mut keys: Vec<&String> = vars.keys().collect();
+        keys.sort();
+        let var_map: indexmap::IndexMap<String, String> = keys
+            .into_iter()
+            .map(|k| (k.clone(), vars[k].clone()))
+            .collect();
+
+        let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
+        let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
+
+        Manifest {
+            version: 1,
+            run_id: ctx.run_id.clone(),
+            flow_name: flow_name.to_string(),
+            flow_path: flow_path.display().to_string(),
+            flow_sha256: stack::sha256_hex(flow_contents.as_bytes()),
+            started_at: ctx.started_at.to_rfc3339(),
+            finished_at: finished_at.to_rfc3339(),
+            duration_ms: total_elapsed.as_millis(),
+            total_tokens_in: total_in,
+            total_tokens_out: total_out,
+            cost: None,
+            vars: var_map,
+            seeds: seed_records,
+            resources,
+            roles: role_records,
+            steps: results.iter().map(|r| r.record.clone()).collect(),
+        }
+    }
+
+    /// Library entry point. Loads project config, parses the flow YAML,
+    /// resolves the role + agent + skill cascade, builds a [`RunContext`],
+    /// and spawns step execution on a tokio task. Returns immediately with
+    /// a [`RunHandle`] that the caller awaits via `await_completion`.
+    ///
+    /// Setup-side errors (config parse, missing flow, unknown role,
+    /// missing skill, ...) are returned synchronously so the CLI fails
+    /// fast and a `RunHandle` is never produced for an unrunnable flow.
+    pub async fn execute_flow(spec: ExecuteFlowSpec) -> Result<RunHandle> {
+        let flow_start = Instant::now();
+
+        // ---- 1. Project config + seed resolution -----------------------
+        // CWD-relative: see ExecuteFlowSpec docs. Seeds, KOTO_DIR lookups
+        // and skills_dir below all resolve against the process CWD too,
+        // so this loader must use the same anchor for consistency.
+        let koto_config = KotoConfig::load_optional(Path::new("."))?;
+        let seeds = koto_config
+            .as_ref()
+            .map(|c| c.seeds.clone())
+            .unwrap_or_else(Seeds::default_local);
+
+        let path = resolve_flow_path(&spec.flow, &seeds)?;
+        let display_path = path.display().to_string();
+
+        if !spec.suppress_command_banner {
+            let banner = match &spec.flow {
+                FlowSource::Name(n) => n.clone(),
+                _ => display_path.clone(),
+            };
+            ui::print_command(&format!("kuro run {banner}"));
+        }
+
+        // ---- 2. Var/role merge -----------------------------------------
+        let mut effective_vars = koto_config
+            .as_ref()
+            .map(|c| c.vars.clone())
+            .unwrap_or_default();
+        for (k, v) in &spec.vars {
+            effective_vars.insert(k.clone(), v.clone());
+        }
+
+        // Read flow YAML once -- needed for role-name partitioning and for
+        // the manifest's `flow_sha256`.
+        let contents = std::fs::read_to_string(&path)?;
+        let role_names = config::parse_role_names(&contents)?;
+
+        // Bare key=value args partition by role-name membership.
+        let (legacy_role_overrides, template_vars): (
+            HashMap<String, String>,
+            HashMap<String, String>,
+        ) = spec
+            .bare_args
+            .into_iter()
+            .partition(|(k, _)| role_names.contains(k));
+
+        if !template_vars.is_empty() {
+            let mut keys: Vec<&String> = template_vars.keys().collect();
+            keys.sort();
+            eprintln!(
+                "warning: bare key=value args are deprecated, use --var: {}",
+                keys.iter()
+                    .map(|k| format!("--var {k}={}", template_vars[*k]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+            for (k, v) in &template_vars {
+                effective_vars.entry(k.clone()).or_insert_with(|| v.clone());
+            }
+
+            let flow_config_temp = config::load_flow_from_str(&contents)?;
+            let placeholders = flow_config_temp
+                .prompt
+                .as_ref()
+                .map(|p| config::extract_placeholders(p))
+                .unwrap_or_default();
+            for key in template_vars.keys() {
+                if !placeholders.contains(key) {
+                    eprintln!(
+                        "warning: '{}' is not a declared role or template placeholder",
+                        key
+                    );
+                }
+            }
+        }
+
+        if !legacy_role_overrides.is_empty() {
+            let mut keys: Vec<&String> = legacy_role_overrides.keys().collect();
+            keys.sort();
+            eprintln!(
+                "warning: bare key=value role rebinds are deprecated, use --role: {}",
+                keys.iter()
+                    .map(|k| format!("--role {k}={}", legacy_role_overrides[*k]))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
+
+        // ---- 3. Load flow with project + legacy role bindings ----------
+        let project_roles: HashMap<String, String> = koto_config
+            .as_ref()
+            .map(|c| {
+                c.roles
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.agent.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut flow_config = config::load_flow_from_str_with_project(
+            &contents,
+            &legacy_role_overrides,
+            &project_roles,
+        )?;
+
+        // ---- 4. Var substitution in flow + per-step task/run -----------
+        if let Some(ref mut prompt) = flow_config.prompt {
+            *prompt = substitute_vars(prompt, &effective_vars)?;
+        }
+        for step in flow_config.steps.iter_mut() {
+            if let Some(task_str) = step.task.as_mut() {
+                *task_str = substitute_vars(task_str, &effective_vars)?;
+            }
+            if let Some(run_str) = step.run.as_mut() {
+                *run_str = substitute_vars(run_str, &effective_vars)?;
+                *run_str = substitute_placeholders(run_str, &effective_vars)?;
+            }
+        }
+        let task_with_vars = spec
+            .task
+            .as_deref()
+            .map(|t| substitute_vars(t, &effective_vars))
+            .transpose()?;
+        let resolved_task = resolve_task(
+            task_with_vars.as_deref(),
+            &flow_config.prompt,
+            &template_vars,
+        )?;
+
+        let flow_name = match &spec.flow {
+            FlowSource::Name(n) => n.clone(),
+            _ => flow_config.name.clone(),
+        };
+
+        // ---- 5. Validate role overrides + apply agent cascade ----------
+        let koto_dir = Path::new(KOTO_DIR);
+        validate_role_overrides(&spec.role_overrides, &flow_config, koto_config.as_ref())
+            .map_err(|e| eyre!("{e}"))?;
+        apply_role_agent_overrides(&mut flow_config, koto_config.as_ref(), &spec.role_overrides);
+
+        // ---- 6. Load agents and resolve roles --------------------------
+        let (agents, agent_origins, agent_hashes) =
+            config::load_agents_for_flow_with_seeds(&seeds, &flow_config, koto_config.as_ref())?;
+        let mut resolved_roles = build_resolved_roles(
+            &flow_config,
+            &agents,
+            koto_config.as_ref(),
+            &spec.role_overrides,
+        )
+        .map_err(|e| eyre!("{e}"))?;
+        for r in resolved_roles.iter_mut() {
+            if let Some(idx) = agent_origins.get(&r.agent)
+                && let Some(seed) = seeds.seeds.get(*idx)
+            {
+                r.seed_origin = Some(seed.display());
+            }
+        }
+
+        // ---- 7. Audit output ------------------------------------------
+        let cli_vars_for_audit = spec.vars.clone();
+        let audit_text = format_audit(&seeds, &resolved_roles, &cli_vars_for_audit);
+        print_audit(&seeds, &resolved_roles, &cli_vars_for_audit);
+
+        apply_resolved_roles_to_steps(&mut flow_config, &resolved_roles);
+
+        ui::print_flow_start(
+            &flow_config.name,
+            &display_path,
+            flow_config.steps.len(),
+            agents.len(),
+        );
+
+        // ---- 8. DAG validation + backend list -------------------------
+        let topo = dag::validate_dag(&flow_config)?;
+        // Topological order produces references into `flow_config.steps`;
+        // we'll need an owned copy on the spawned task, so collect step
+        // ids in topo order and re-resolve once `flow_config` lives there.
+        let topo_ids: Vec<String> = topo.iter().map(|s| s.id.clone()).collect();
+
+        let mut seen_backends = HashSet::new();
+        let mut backend_list: Vec<(&str, &str)> = Vec::new();
+        for agent in &agents {
+            let name = match agent.backend {
+                Backend::Api => "api",
+                Backend::ClaudeCli => "claude-cli",
+                Backend::Codex => "codex",
+                Backend::Ollama => "ollama",
+            };
+            if seen_backends.insert(name) {
+                backend_list.push((name, ""));
+            }
+        }
+        ui::print_backends_ok(&backend_list);
+
+        // ---- 9. Guide / rules / skills --------------------------------
+        let guide = super::load_guide_from_seeds(&seeds).map_err(|e| eyre!("{e}"))?;
+        let rules_cache =
+            super::load_rules_for_agents_with_seeds(&agents, &seeds).map_err(|e| eyre!("{e}"))?;
+        let skills_dir = koto_dir.join("skills");
+        let skill_names = skills::collect_skill_names(&agents);
+        let skills_cache = if skill_names.is_empty() {
+            HashMap::new()
+        } else {
+            let missing = skills::check_skills_available(&skill_names, &skills_dir);
+            if !missing.is_empty() {
+                return Err(eyre!(
+                    "missing skills: {}\n\nhint: run `kuro pull` to fetch skills",
+                    missing.join(", ")
+                ));
+            }
+            skills::load_skills_for_agents(&skill_names, &skills_dir)?
+        };
+
+        // ---- 10. RunContext + on-disk run layout ----------------------
+        let stack_path = resolve_stack_path(&flow_config.stack.path);
+        let ctx = RunContext::new(
+            flow_name.clone(),
+            resolved_task,
+            stack_path.clone(),
+            guide,
+            rules_cache,
+            skills_cache,
+            effective_vars.clone(),
+        );
+
+        stack::init_run_layout(&ctx.run_path)
+            .map_err(|e| eyre!("failed to create run dir: {e}"))?;
+        if let Err(e) = stack::write_resolution_audit(&ctx.run_path, &audit_text) {
+            eprintln!("warning: failed to write resolution-audit.txt: {e}");
+        }
+
+        // ---- 11. Spawn the execution task -----------------------------
+        let state = Arc::new(RunState::default());
+        let run_id = ctx.run_id.clone();
+        let run_path = ctx.run_path.clone();
+        let stack_path_for_handle = ctx.stack_path.clone();
+        let flow_name_for_handle = flow_name.clone();
+
+        // Move owned data into the task. The borrowed `topo` slice can't
+        // cross the spawn boundary, so we pass the topo step ids and let
+        // the task re-borrow into the owned `flow_config` it now holds.
+        let task_state = Arc::clone(&state);
+        let join: JoinHandle<Result<FlowResult>> = tokio::spawn(async move {
+            run_to_completion(
+                ctx,
+                flow_config,
+                topo_ids,
+                agents,
+                agent_origins,
+                agent_hashes,
+                resolved_roles,
+                effective_vars,
+                seeds,
+                path,
+                contents,
+                flow_name,
+                flow_start,
+                task_state,
+            )
+            .await
+        });
+
+        Ok(RunHandle {
+            run_id,
+            run_path,
+            stack_path: stack_path_for_handle,
+            flow_name: flow_name_for_handle,
+            state,
+            join,
+        })
+    }
+
+    /// Body of the spawned execution task. Kept separate from
+    /// `execute_flow` so the synchronous setup half stays readable and
+    /// the task can be tested in isolation if needed.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_to_completion(
+        ctx: RunContext,
+        flow_config: FlowConfig,
+        topo_ids: Vec<String>,
+        agents: Vec<config::Agent>,
+        agent_origins: HashMap<String, usize>,
+        agent_hashes: HashMap<String, String>,
+        resolved_roles: Vec<ResolvedRole>,
+        effective_vars: HashMap<String, String>,
+        seeds: Seeds,
+        flow_path: PathBuf,
+        flow_contents: String,
+        flow_name: String,
+        flow_start: Instant,
+        state: Arc<RunState>,
+    ) -> Result<FlowResult> {
+        // Cooperative cancellation check: if a caller flipped the cancel
+        // flag between `execute_flow` returning the handle and this task
+        // beginning, we abort before running the first step. This is the
+        // only check today -- mid-run cancellation (between steps, or
+        // interrupting an in-flight step) requires threading `state` into
+        // `run_steps`, which is tracked alongside the MCP work in #199.
+        if state.is_cancelled() {
+            return Err(eyre!("run cancelled before steps started"));
+        }
+
+        // Re-borrow steps in topo order from the owned flow_config.
+        let by_id: HashMap<&str, &config::Step> = flow_config
+            .steps
+            .iter()
+            .map(|s| (s.id.as_str(), s))
+            .collect();
+        let steps: Vec<&config::Step> = topo_ids
+            .iter()
+            .map(|id| {
+                *by_id
+                    .get(id.as_str())
+                    .expect("topo step id missing from flow_config")
+            })
+            .collect();
+
+        let results = run_steps(&steps, &agents, &ctx).await?;
+
+        let total_elapsed = flow_start.elapsed();
+
+        let manifest = build_manifest(
+            &ctx,
+            &flow_name,
+            &flow_path,
+            &flow_contents,
+            &seeds,
+            &agents,
+            &agent_origins,
+            &agent_hashes,
+            &resolved_roles,
+            &effective_vars,
+            &results,
+            total_elapsed,
+        );
+        stack::write_manifest(&ctx.run_path, &manifest)
+            .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
+
+        // Summary -- printed here so CLI behavior stays byte-equivalent.
+        let summary = super::build_summary(&results);
+        let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
+        let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
+        ui::print_flow_complete(
+            &summary,
+            &format_elapsed(total_elapsed),
+            &total_in.to_string(),
+            &total_out.to_string(),
+            "—",
+            &ctx.stack_path.display().to_string(),
+        );
+
+        Ok(FlowResult {
+            run_id: ctx.run_id.clone(),
+            run_path: ctx.run_path.clone(),
+            stack_path: ctx.stack_path.clone(),
+            flow_name,
+            manifest,
+            step_results: results,
+            total_elapsed,
+        })
+    }
+
+    fn format_elapsed(d: Duration) -> String {
+        let secs = d.as_secs();
+        if secs >= 60 {
+            format!("{}m{:02}s", secs / 60, secs % 60)
+        } else {
+            format!("{}.{:01}s", secs, d.subsec_millis() / 100)
+        }
+    }
+}
+
+// Public library API entry points. Several of these (FlowResult, RunHandle,
+// RouterAccessor, RouterAccessorError) are forward-looking API for the MCP
+// server work tracked in #199 -- the current CLI wrapper does not name them
+// directly, so the unused-import lint fires. Allow it: dropping them would
+// shrink the surface promised by #209.
+#[allow(unused_imports)]
+pub use flow_api::{
+    ExecuteFlowSpec, FlowResult, FlowSource, RouterAccessor, RouterAccessorError, RunHandle,
+    execute_flow,
+};
+
+// Crate-internal re-exports so the CLI tests (and any other in-tree caller)
+// can reach the orchestration helpers without poking through a private
+// module path. Kept separate from the public `pub use` above so the public
+// surface stays focused on the library entry point. The bin build does not
+// reach for these directly (only the test build does) -- silence the lint.
+#[allow(unused_imports)]
+pub(crate) use flow_api::{
+    apply_resolved_roles_to_steps, apply_role_agent_overrides, build_manifest, resolve_stack_path,
+    resolve_task, substitute_placeholders, substitute_vars,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
