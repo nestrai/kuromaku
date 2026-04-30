@@ -126,6 +126,22 @@ fn mcp_subcommand_handshake_and_lists_discovery_tools() {
         review_pr["inputSchema"]["properties"]["pr"]["type"],
         "integer"
     );
+    // rework_pr (#215) -- same wire shape as review_pr (single `pr` integer).
+    // Asserting the descriptor here keeps the capability advertisement honest
+    // and catches schema drift before clients hit it.
+    assert!(names.contains(&"rework_pr"), "rework_pr missing: {names:?}");
+    let rework_pr = tools
+        .iter()
+        .find(|t| t["name"] == "rework_pr")
+        .expect("rework_pr descriptor");
+    assert_eq!(
+        rework_pr["inputSchema"]["required"],
+        serde_json::json!(["pr"])
+    );
+    assert_eq!(
+        rework_pr["inputSchema"]["properties"]["pr"]["type"],
+        "integer"
+    );
     let run_flow = tools
         .iter()
         .find(|t| t["name"] == "run_flow")
@@ -704,6 +720,154 @@ fn mcp_review_pr_missing_required_step_ids_errors_at_config_time() {
     assert!(
         reason.contains("consensus"),
         "reason should name the missing step id, got: {reason}"
+    );
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `rework_pr` rejects non-integer args at the wire boundary.
+/// Acceptance criterion (#215): "Returns MCP error for invalid PR number".
+#[test]
+fn mcp_rework_pr_rejects_non_integer_argument() {
+    let project = tempfile::tempdir().expect("tempdir");
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"rework_pr","arguments":{{"pr":"not-a-number"}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    // invalid_params is JSON-RPC -32602 -- transport-level code, same as the
+    // sibling tools' matching tests.
+    assert_eq!(err["code"], -32602);
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `rework_pr` against a project without the `rework-pr` flow surfaces
+/// `flow_missing` -- same catalog entry the rest of the workflow tools use.
+/// Acceptance criterion (#215): "Returns MCP error for ... flow failure".
+#[test]
+fn mcp_rework_pr_unknown_flow_returns_flow_missing() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    // Empty `.kuro/` -- no `flows/rework-pr.yaml` anywhere in the seed
+    // cascade. The runner must surface flow_missing rather than internal_error.
+    std::fs::create_dir_all(project.path().join(".kuro/flows")).unwrap();
+    std::fs::write(project.path().join(".kuro/config.yaml"), "version: \"1\"\n").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"rework_pr","arguments":{{"pr":42}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    assert_eq!(err["code"], -32000);
+    assert_eq!(err["data"]["code"], "flow_missing");
+    assert_eq!(err["data"]["details"]["name"], "rework-pr");
+
+    let status = wait_with_timeout(&mut child, Duration::from_secs(5));
+    assert!(status.success());
+}
+
+/// `rework_pr` against a flow that exists but lacks the step ids the tool
+/// keys off (`fix`, `verify`) must surface a structured internal error at
+/// config-time -- *not* run end-to-end and silently produce empty fixup
+/// commits and zero counts. Mirrors the silent-failure guard the sibling
+/// tools enforce.
+#[test]
+fn mcp_rework_pr_missing_required_step_ids_errors_at_config_time() {
+    let project = tempfile::tempdir().expect("project tempdir");
+    let kuro = project.path().join(".kuro");
+    std::fs::create_dir_all(kuro.join("flows")).unwrap();
+    std::fs::write(kuro.join("config.yaml"), "version: \"1\"\n").unwrap();
+    // Flow named `rework-pr` but its only step is `greet` -- the `fix` and
+    // `verify` steps the tool keys off are absent. The tool must reject
+    // this before spawning the runner.
+    let flow_yaml = "version: \"1\"\n\
+         name: rework-pr\n\
+         prompt: noop\n\
+         flow:\n  greet:\n    run: |\n      echo nope\n";
+    std::fs::write(kuro.join("flows/rework-pr.yaml"), flow_yaml).unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .current_dir(project.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn");
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{{"name":"rework_pr","arguments":{{"pr":42}}}}}}"#
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+
+    let stdout = child.stdout.take().unwrap();
+    let mut reader = BufReader::new(stdout);
+    let mut line = String::new();
+    reader.read_line(&mut line).expect("read response");
+    let resp: Value = serde_json::from_str(line.trim()).expect("JSON");
+    assert_eq!(resp["id"], 1);
+    let err = &resp["error"];
+    // JSON-RPC InternalError (transport-level): `-32603` numeric code; the
+    // volatile reason string lives in `data.details.reason`.
+    assert_eq!(err["code"], -32603);
+    let reason = err["data"]["details"]["reason"]
+        .as_str()
+        .expect("reason string");
+    assert!(
+        reason.contains("fix") && reason.contains("verify"),
+        "reason should name both missing step ids, got: {reason}"
     );
 
     let status = wait_with_timeout(&mut child, Duration::from_secs(5));

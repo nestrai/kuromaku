@@ -1,8 +1,10 @@
-//! Workflow tools (#196 split): `implement_issue` (#213), `review_pr` (#214).
+//! Workflow tools (#196 split): `implement_issue` (#213), `review_pr` (#214),
+//! `rework_pr` (#215).
 //!
-//! `rework_pr` (#215) is tracked as a follow-up and will land alongside so
-//! all three workflow wrappers share the flow-runner glue and the verdict /
-//! url / findings parsing helpers.
+//! All three wrappers share the same skeleton: parse args, pre-flight
+//! required step ids, run the flow via `runner::execute_flow`, then parse the
+//! step outputs into a structured result. Per-flow specifics (verdict tokens,
+//! findings sections, fixup SHAs) live in tool-local helpers below.
 //!
 //! ## Design notes
 //!
@@ -596,6 +598,274 @@ fn push_trimmed(findings: &mut Vec<String>, buf: String) {
     }
 }
 
+// --- rework_pr ---
+
+/// Flow name resolved through the seed cascade. Same rationale as the sibling
+/// tools: pin the seed-file name to a single edit point so a rename surfaces
+/// here as a compile-line bump rather than as a silent flow_missing.
+const REWORK_PR_FLOW: &str = "rework-pr";
+
+/// Step ids `rework_pr` keys off when extracting the structured result.
+/// `fix` carries the per-comment classification (fixup SHAs, deferred
+/// suggestions count); `verify` carries the verdict and resolved count.
+/// `fetch` and `push` exist in the canonical flow but the tool does not key
+/// off their content -- they live in the run transcript and are reachable
+/// via `show_output`. Listing them here would couple the tool to flow shape
+/// it does not depend on.
+const REWORK_PR_REQUIRED_STEP_IDS: &[&str] = &["fix", "verify"];
+
+#[derive(Deserialize)]
+struct ReworkPrArgs {
+    pr: i64,
+}
+
+/// `rework_pr` -- run the canonical rework-pr flow against a GitHub PR
+/// number and return the structured outcome (fixup SHAs and counts).
+pub struct ReworkPr;
+
+#[async_trait]
+impl Tool for ReworkPr {
+    fn name(&self) -> &'static str {
+        "rework_pr"
+    }
+    fn description(&self) -> &'static str {
+        "Apply review feedback on a GitHub PR as fixup commits: runs the `rework-pr` flow which \
+         fetches review comments (inline + general), classifies each as Blocking / Suggestion / \
+         Nit, fixes the Blocking ones as `git commit --fixup=<sha>` commits, verifies the fixups \
+         actually resolve the concerns, and pushes when the verdict is DONE. Returns \
+         { run_id, verdict, fixup_commits, resolved_count, deferred_count } where verdict is \
+         \"DONE\" | \"INCOMPLETE\" | \"unclear\". `fixup_commits` is the array of short SHAs the \
+         fix step recorded (empty when there were no review comments). Use show_output with the \
+         returned run_id for the per-step transcript. Requires `rework-pr.yaml` in the seed \
+         cascade and a `gh` CLI authenticated for the repo. Example: \
+         rework_pr {\"pr\": 220}."
+    }
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "pr": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Pull request number (positive integer)."
+                }
+            },
+            "required": ["pr"]
+        })
+    }
+    async fn call(&self, arguments: Value) -> Result<Value, McpError> {
+        let parsed: ReworkPrArgs = serde_json::from_value(arguments)
+            .map_err(|e| invalid_params(format!("arguments: {e}")))?;
+        if parsed.pr < 1 {
+            return Err(invalid_params(format!(
+                "pr must be a positive integer, got {}",
+                parsed.pr
+            )));
+        }
+        let pr = parsed.pr as u64;
+        let result = run_rework_pr(pr).await?;
+        Ok(serde_json::to_value(&result).map_err(|e| internal(format!("serialize: {e}")))?)
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ReworkPrResult {
+    run_id: String,
+    /// `"DONE"`, `"INCOMPLETE"` or `"unclear"`. Mirrors the `FINAL_VERDICT:`
+    /// token the verify step emits. `unclear` is reserved for outputs that
+    /// did not match a known verdict -- the call still succeeds so the caller
+    /// can inspect the run via `show_output`.
+    verdict: String,
+    /// Short SHAs of fixup commits the `fix` step created, in the order they
+    /// appear in the step output. Excludes the literal `n/a` placeholder the
+    /// flow emits for Deferred / Skipped comments. Empty when there were no
+    /// review comments to address (the `NO_REVIEW_COMMENTS` early-exit) or
+    /// when no Blocking comments were classified.
+    fixup_commits: Vec<String>,
+    /// Number of Blocking comments the verify step confirmed as resolved.
+    /// Read from `- Resolved: N` in the verify Summary. `0` when the section
+    /// is absent or unparseable.
+    resolved_count: u32,
+    /// Number of Suggestion comments the fix step deferred with reasoning.
+    /// Read from `- Deferred suggestions: N` in the fix Summary. `0` when
+    /// the section is absent or unparseable. (Skipped nits are tracked
+    /// separately by the flow but intentionally not surfaced here -- they
+    /// live in the run transcript.)
+    deferred_count: u32,
+}
+
+async fn run_rework_pr(pr: u64) -> Result<ReworkPrResult, McpError> {
+    // Pre-flight: verify the resolved flow defines the step ids `build_rework_result`
+    // keys off. Same silent-failure guard the sibling tools use -- without
+    // this, a renamed `fix` or `verify` step would yield empty results on a
+    // successful run.
+    let missing = runner::verify_flow_step_ids(REWORK_PR_FLOW, REWORK_PR_REQUIRED_STEP_IDS)
+        .map_err(|e| classify_setup_error(REWORK_PR_FLOW, e))?;
+    if !missing.is_empty() {
+        return Err(internal(format!(
+            "flow '{REWORK_PR_FLOW}' is missing required step ids [{}]; \
+             rework_pr keys off these step ids to extract the verdict, \
+             fixup SHAs and counts. Rename the steps in the flow or update \
+             the tool's REWORK_PR_REQUIRED_STEP_IDS to match.",
+            missing.join(", ")
+        )));
+    }
+
+    let mut bare_args = HashMap::new();
+    bare_args.insert("id".to_string(), pr.to_string());
+
+    let spec = ExecuteFlowSpec {
+        flow: FlowSource::Name(REWORK_PR_FLOW.to_string()),
+        bare_args,
+        // MCP transports treat stdout as the JSON-RPC channel -- mirrors the
+        // sibling tools. Without this, runner banner output corrupts framing.
+        suppress_command_banner: true,
+        ..ExecuteFlowSpec::default()
+    };
+
+    let handle = runner::execute_flow(spec)
+        .await
+        .map_err(|e| classify_setup_error(REWORK_PR_FLOW, e))?;
+    let run_id = handle.run_id.clone();
+    let stack_path = handle.stack_path.clone();
+
+    let flow_result = handle.await_completion().await.map_err(|e| {
+        // Partial run: we still have a run_id the caller can show_output on.
+        // Surface internal_error with both reason and run_id so the caller
+        // can route by code and inspect the run. Same shape as siblings.
+        McpError::with_details(
+            McpErrorCode::InternalError,
+            json!({
+                "reason": format!("flow execution failed: {e}"),
+                "run_id": run_id,
+                "flow": REWORK_PR_FLOW,
+            }),
+        )
+    })?;
+
+    Ok(build_rework_result(run_id, &stack_path, &flow_result))
+}
+
+fn build_rework_result(
+    run_id: String,
+    stack_path: &Path,
+    _flow_result: &FlowResult,
+) -> ReworkPrResult {
+    let outputs = match stack::read_run(stack_path, &run_id, None) {
+        Ok(o) => o,
+        Err(e) => {
+            // Mirrors siblings: flow finished but manifest is unreadable.
+            // Degrade to empty/unclear rather than failing -- the run_id
+            // stays useful for `show_output`.
+            warn!(error = %e, run_id = %run_id, "failed to read run outputs");
+            return ReworkPrResult {
+                run_id,
+                verdict: REWORK_VERDICT_UNCLEAR.to_string(),
+                fixup_commits: Vec::new(),
+                resolved_count: 0,
+                deferred_count: 0,
+            };
+        }
+    };
+
+    let fix_output = output_for(&outputs, "fix").unwrap_or_default();
+    let verify_output = output_for(&outputs, "verify").unwrap_or_default();
+
+    let verdict = parse_rework_verdict(&verify_output);
+    let fixup_commits = parse_fixup_shas(&fix_output);
+    let resolved_count = parse_summary_count(&verify_output, "Resolved");
+    let deferred_count = parse_summary_count(&fix_output, "Deferred suggestions");
+
+    ReworkPrResult {
+        run_id,
+        verdict: verdict.to_string(),
+        fixup_commits,
+        resolved_count,
+        deferred_count,
+    }
+}
+
+const REWORK_VERDICT_DONE: &str = "DONE";
+const REWORK_VERDICT_INCOMPLETE: &str = "INCOMPLETE";
+const REWORK_VERDICT_UNCLEAR: &str = "unclear";
+
+static REWORK_VERDICT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Match `FINAL_VERDICT:` at the start of a line, optionally preceded by
+    // a markdown bullet -- mirrors the implement_issue verdict regex's
+    // tolerance for `- FINAL_VERDICT: DONE` vs a bare line. The verify
+    // prompt prescribes one bullet form ("- FINAL_VERDICT: DONE") inside
+    // the Summary section, but agent drift sometimes emits a bare line.
+    //
+    // First match wins so a stray duplicate cannot flip the result. The
+    // verify prompt forbids duplicates anyway.
+    //
+    // `[ \t]` rather than `\s` for indentation -- `\s` would slurp newlines
+    // and pull the regex into the next line.
+    Regex::new(r"(?m)^[ \t]*[-*]?[ \t]*FINAL_VERDICT:[ \t]*(DONE|INCOMPLETE)\b")
+        .expect("rework verdict regex compiles")
+});
+
+fn parse_rework_verdict(verify_output: &str) -> &'static str {
+    match REWORK_VERDICT_RE
+        .captures(verify_output)
+        .and_then(|c| c.get(1))
+        .map(|m| m.as_str())
+    {
+        Some("DONE") => REWORK_VERDICT_DONE,
+        Some("INCOMPLETE") => REWORK_VERDICT_INCOMPLETE,
+        _ => REWORK_VERDICT_UNCLEAR,
+    }
+}
+
+static FIXUP_SHA_RE: LazyLock<Regex> = LazyLock::new(|| {
+    // Match `- Fixup SHA: <value>` at the start of a line. The fix prompt
+    // emits this line for every classified comment with the value `n/a`
+    // when nothing was committed (Deferred / Skipped). We capture the value
+    // and filter `n/a` post-match rather than encoding the negation in the
+    // regex -- keeps the pattern readable.
+    //
+    // The captured value goes up to the first whitespace so a trailing
+    // comment or punctuation does not leak into the SHA.
+    Regex::new(r"(?m)^[ \t]*-[ \t]*Fixup SHA:[ \t]*(\S+)").expect("fixup sha regex compiles")
+});
+
+fn parse_fixup_shas(fix_output: &str) -> Vec<String> {
+    FIXUP_SHA_RE
+        .captures_iter(fix_output)
+        .filter_map(|c| c.get(1).map(|m| m.as_str().to_string()))
+        // Strip trailing punctuation defensively (markdown bold markers,
+        // backticks, periods). The fix prompt does not wrap the value but
+        // agent drift sometimes emits `- Fixup SHA: a1b2c3d.`.
+        .map(|s| s.trim_matches(|c: char| !c.is_alphanumeric()).to_string())
+        .filter(|s| {
+            !s.is_empty() && !s.eq_ignore_ascii_case("n/a") && !s.eq_ignore_ascii_case("na")
+        })
+        .collect()
+}
+
+/// Parse a `- <Label>: <number>` line out of a Summary section. Returns
+/// `0` when the line is absent or the value is not a u32 -- the call still
+/// succeeds with a useful run_id, the caller can fall back to `show_output`.
+///
+/// We anchor to the bullet form because the rework-pr flow prescribes it
+/// for both Summary blocks; a free-floating "Resolved: 5" elsewhere in the
+/// transcript should not be promoted to the count.
+fn parse_summary_count(output: &str, label: &str) -> u32 {
+    // Build the pattern lazily from the label -- the call sites use two
+    // different labels and there are only a handful of them per call. The
+    // regex is line-anchored and tolerant of leading whitespace.
+    let escaped = regex_lite::escape(label);
+    let pattern = format!(r"(?m)^[ \t]*-[ \t]*{escaped}:[ \t]*(\d+)\b");
+    let re = match Regex::new(&pattern) {
+        Ok(r) => r,
+        Err(_) => return 0, // unreachable: label is a static literal at all call sites.
+    };
+    re.captures(output)
+        .and_then(|c| c.get(1))
+        .and_then(|m| m.as_str().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
 // --- Tests ---
 
 #[cfg(test)]
@@ -935,6 +1205,225 @@ mod tests {
         assert_eq!(descs.len(), 1);
         let desc = &descs[0];
         assert_eq!(desc.name, "review_pr");
+        assert_eq!(desc.input_schema["required"], json!(["pr"]));
+        assert_eq!(desc.input_schema["properties"]["pr"]["type"], "integer");
+    }
+
+    // ---- parse_rework_verdict ----
+
+    #[test]
+    fn parse_rework_verdict_recognises_done() {
+        let s = "### Summary\n- Resolved: 2\n- FINAL_VERDICT: DONE\n";
+        assert_eq!(parse_rework_verdict(s), "DONE");
+    }
+
+    #[test]
+    fn parse_rework_verdict_recognises_incomplete() {
+        let s = "### Summary\n- Resolved: 1\n- FINAL_VERDICT: INCOMPLETE\n";
+        assert_eq!(parse_rework_verdict(s), "INCOMPLETE");
+    }
+
+    #[test]
+    fn parse_rework_verdict_unclear_when_token_missing() {
+        // Verify step output without the prescribed verdict line. Tool must
+        // still produce a structured result, not error -- caller can fall
+        // back to show_output.
+        let s = "Some verify prose without a verdict line.";
+        assert_eq!(parse_rework_verdict(s), "unclear");
+    }
+
+    #[test]
+    fn parse_rework_verdict_unclear_when_token_unknown() {
+        // Token present but value outside {DONE, INCOMPLETE}. Do not promote
+        // unknown values silently -- a typo'd verdict must not be accepted.
+        let s = "FINAL_VERDICT: MAYBE\n";
+        assert_eq!(parse_rework_verdict(s), "unclear");
+    }
+
+    #[test]
+    fn parse_rework_verdict_takes_first_match() {
+        // First match wins so a stray duplicate cannot flip the result. The
+        // verify prompt forbids duplicates anyway, but this is the same
+        // invariant the sibling tools enforce.
+        let s = "- FINAL_VERDICT: DONE\n\nLater:\n- FINAL_VERDICT: INCOMPLETE\n";
+        assert_eq!(parse_rework_verdict(s), "DONE");
+    }
+
+    #[test]
+    fn parse_rework_verdict_ignores_inline_substrings() {
+        // Token must start a line. Embedded mention like "the FINAL_VERDICT:
+        // DONE token" should not match -- avoids false positives in agents
+        // that quote the rule back at us.
+        let s = "the verify rule says emit FINAL_VERDICT: DONE once.\n";
+        assert_eq!(parse_rework_verdict(s), "unclear");
+    }
+
+    #[test]
+    fn parse_rework_verdict_tolerates_bare_line() {
+        // The verify prompt prescribes `- FINAL_VERDICT: DONE` as a bullet
+        // inside the Summary, but agent drift sometimes emits a bare line.
+        // Mirrors the sibling regexes' tolerance.
+        let s = "FINAL_VERDICT: DONE\n";
+        assert_eq!(parse_rework_verdict(s), "DONE");
+    }
+
+    // ---- parse_fixup_shas ----
+
+    #[test]
+    fn parse_fixup_shas_collects_all_shas() {
+        // Three Blocking comments, all fixed -- three SHAs in order.
+        let s = "### Comment by @a on src/x.rs:1 (inline)\n\
+                 - Severity: Blocking\n\
+                 - Action: Fixed\n\
+                 - Fixup SHA: a1b2c3d\n\
+                 - Reasoning: foo\n\n\
+                 ### Comment by @b on src/y.rs:2 (inline)\n\
+                 - Severity: Blocking\n\
+                 - Action: Fixed\n\
+                 - Fixup SHA: e4f5g6h\n\
+                 - Reasoning: bar\n\n\
+                 ### Comment by @c on conversation (general)\n\
+                 - Severity: Blocking\n\
+                 - Action: Fixed\n\
+                 - Fixup SHA: 0123456\n\
+                 - Reasoning: baz\n";
+        let shas = parse_fixup_shas(s);
+        assert_eq!(shas, vec!["a1b2c3d", "e4f5g6h", "0123456"]);
+    }
+
+    #[test]
+    fn parse_fixup_shas_filters_n_a() {
+        // Deferred / Skipped comments emit `Fixup SHA: n/a`. The result is
+        // the field name `fixup_commits` -- "n/a" is not a commit, so it
+        // must not pollute the array. Case-insensitive because agent drift.
+        let s = "### Comment 1\n\
+                 - Severity: Blocking\n\
+                 - Action: Fixed\n\
+                 - Fixup SHA: a1b2c3d\n\n\
+                 ### Comment 2\n\
+                 - Severity: Suggestion\n\
+                 - Action: Deferred\n\
+                 - Fixup SHA: n/a\n\n\
+                 ### Comment 3\n\
+                 - Severity: Nit\n\
+                 - Action: Skipped (nit)\n\
+                 - Fixup SHA: N/A\n";
+        let shas = parse_fixup_shas(s);
+        assert_eq!(shas, vec!["a1b2c3d"]);
+    }
+
+    #[test]
+    fn parse_fixup_shas_empty_when_no_review_comments() {
+        // The fix step's NO_REVIEW_COMMENTS sentinel produces no Fixup SHA
+        // lines. Empty array is the correct shape -- not None, not error.
+        let s = "NO_REVIEW_COMMENTS\n";
+        assert!(parse_fixup_shas(s).is_empty());
+    }
+
+    #[test]
+    fn parse_fixup_shas_strips_trailing_punctuation() {
+        // Agent drift sometimes emits `- Fixup SHA: a1b2c3d.` -- the
+        // trailing period must not leak into the SHA. Same defensive
+        // shape as the sibling pr_url parser.
+        let s = "- Fixup SHA: a1b2c3d.\n- Fixup SHA: `e4f5g6h`\n";
+        let shas = parse_fixup_shas(s);
+        assert_eq!(shas, vec!["a1b2c3d", "e4f5g6h"]);
+    }
+
+    #[test]
+    fn parse_fixup_shas_ignores_inline_substrings() {
+        // The label must start a bullet at column zero (after optional
+        // indentation) -- prose mentioning "Fixup SHA: abc" inline should
+        // not match. Mirrors the verdict regex's line-anchoring.
+        let s = "the format says: Fixup SHA: a1b2c3d (in prose)\n";
+        // Note: this still matches because we anchor to line start with
+        // optional whitespace + dash. The line above has no `-` prefix
+        // so it should NOT match -- verifies the anchor.
+        assert!(parse_fixup_shas(s).is_empty());
+    }
+
+    // ---- parse_summary_count ----
+
+    #[test]
+    fn parse_summary_count_reads_resolved() {
+        let s = "### Summary\n- Blocking comments: 3\n- Resolved: 2\n- FINAL_VERDICT: INCOMPLETE\n";
+        assert_eq!(parse_summary_count(s, "Resolved"), 2);
+    }
+
+    #[test]
+    fn parse_summary_count_reads_deferred_suggestions() {
+        // The fix Summary uses a multi-word label. `regex_lite::escape` keeps
+        // the literal space safe inside the dynamically-built pattern.
+        let s = "### Summary\n- Blocking addressed: 2 / 2\n- Deferred suggestions: 4\n- Skipped nits: 1\n- New fixup commits: 2\n";
+        assert_eq!(parse_summary_count(s, "Deferred suggestions"), 4);
+    }
+
+    #[test]
+    fn parse_summary_count_zero_when_label_absent() {
+        // Agent drift could omit the Summary section entirely. Tool must
+        // not error -- caller can fall back to show_output.
+        let s = "no summary here";
+        assert_eq!(parse_summary_count(s, "Resolved"), 0);
+        assert_eq!(parse_summary_count(s, "Deferred suggestions"), 0);
+    }
+
+    #[test]
+    fn parse_summary_count_zero_when_value_not_a_number() {
+        // `- Resolved: many` is malformed -- do not promote to a count.
+        let s = "- Resolved: many\n";
+        assert_eq!(parse_summary_count(s, "Resolved"), 0);
+    }
+
+    #[test]
+    fn parse_summary_count_takes_first_match() {
+        // Stray duplicate must not change the count. Mirrors the verdict
+        // regex's first-match semantics.
+        let s = "- Resolved: 2\n- Resolved: 99\n";
+        assert_eq!(parse_summary_count(s, "Resolved"), 2);
+    }
+
+    // ---- Tool::call validation ----
+
+    #[tokio::test]
+    async fn rework_pr_rejects_missing_arg() {
+        let tool = ReworkPr;
+        let err = tool.call(json!({})).await.unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn rework_pr_rejects_zero() {
+        let tool = ReworkPr;
+        let err = tool.call(json!({"pr": 0})).await.unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn rework_pr_rejects_negative() {
+        let tool = ReworkPr;
+        let err = tool.call(json!({"pr": -1})).await.unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn rework_pr_rejects_non_integer() {
+        let tool = ReworkPr;
+        let err = tool.call(json!({"pr": "abc"})).await.unwrap_err();
+        assert_eq!(err.code, McpErrorCode::InvalidParams);
+    }
+
+    #[tokio::test]
+    async fn rework_pr_descriptor_registers() {
+        // Registry invariants: verb_noun, non-empty description, unique.
+        // Schema must declare `pr` as required so MCP clients validate
+        // before sending -- otherwise a missing field would key off a
+        // default zero.
+        let mut reg = super::super::tools::ToolRegistry::new();
+        reg.register(Box::new(ReworkPr)).unwrap();
+        let descs = reg.descriptors();
+        assert_eq!(descs.len(), 1);
+        let desc = &descs[0];
+        assert_eq!(desc.name, "rework_pr");
         assert_eq!(desc.input_schema["required"], json!(["pr"]));
         assert_eq!(desc.input_schema["properties"]["pr"]["type"], "integer");
     }
