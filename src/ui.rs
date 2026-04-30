@@ -202,6 +202,48 @@ pub fn print_shell_step_banner(
     println!("{meta}");
 }
 
+/// Banner for a conversation step (issue #170).
+///
+/// Mirrors [`print_shell_step_banner`] but shows the participant list and
+/// labels the kind as `conversation`. The participants are surfaced eagerly
+/// so the user can spot a misconfigured agents list before the underlying
+/// CLIs are spawned.
+pub fn print_conversation_step_banner(
+    n: usize,
+    total: usize,
+    step_id: &str,
+    agents: &[String],
+    input: &[String],
+) {
+    let t = &DARK;
+    let marker = style::style("▶").with(t.cyan).attribute(Attribute::Bold);
+    println!();
+    println!(
+        "  {}  {} Step {}/{}  {}  {}  {}",
+        style::style("──").with(t.muted),
+        marker,
+        n,
+        total,
+        style::style(step_id).with(t.fg).attribute(Attribute::Bold),
+        style::style("──").with(t.muted),
+        style::style("conversation").with(t.magenta),
+    );
+
+    let mut meta = format!(
+        "      {} {}",
+        style::style("agents").with(t.dim),
+        style::style(agents.join(", ")).with(t.yellow),
+    );
+    if !input.is_empty() {
+        meta.push_str(&format!(
+            "   {} [{}]",
+            style::style("input").with(t.dim),
+            input.join(", "),
+        ));
+    }
+    println!("{meta}");
+}
+
 pub fn print_step_banner(n: usize, total: usize, step: &StepInfo) {
     let t = &DARK;
     let (marker, color) = match step.state {

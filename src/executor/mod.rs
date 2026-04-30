@@ -204,6 +204,57 @@ pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_promp
     parts.join(" ")
 }
 
+/// Build a `tokio::process::Command` for an interactive Claude CLI session
+/// driven through [`StreamJsonTransport`](transport::StreamJsonTransport).
+///
+/// The interactive form differs from [`build_claude_command`] in two
+/// fundamental ways:
+///
+/// * No `--print`. Print mode is a one-shot: feed a prompt argument, get a
+///   single response, exit. The router needs the agent to stay alive across
+///   multiple turns so it can deliver the other agents' messages as they
+///   arrive.
+/// * `--input-format stream-json`. The transport writes
+///   `{"type":"user","message":...}` NDJSON envelopes to stdin; without this
+///   flag the CLI would interpret stdin as raw text and fail to parse it.
+///
+/// Output format is the same stream-json the executor already understands,
+/// so the messaging Router can reuse the existing [`stream_json::parse_line`]
+/// pipeline. Permissions are skipped to match the non-interactive path --
+/// the CLI in stream-json mode otherwise blocks waiting for an approval
+/// prompt the user cannot answer.
+///
+/// `system_prompt` is optional. When set, it is passed as `--system-prompt`
+/// just like in print mode; per-agent personas survive the switch to
+/// interactive transport.
+///
+/// `kill_on_drop(true)` is set so a partial spawn (one of N participants
+/// fails to come up, an early error in `run_conversation_step`, an
+/// unwound future) tears down the already-running children rather than
+/// leaking detached `claude` processes. The transport has no `Drop` impl
+/// of its own and `close()` is not always reached on the error path; the
+/// kill flag is the backstop.
+///
+/// (issue #170)
+pub fn build_claude_interactive_command(
+    model: &str,
+    system_prompt: Option<&str>,
+) -> tokio::process::Command {
+    let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
+    let mut cmd = tokio::process::Command::new(claude_bin);
+    cmd.arg("--model").arg(model);
+    cmd.arg("--input-format").arg("stream-json");
+    cmd.arg("--output-format").arg("stream-json");
+    cmd.arg("--verbose");
+    cmd.arg("--include-partial-messages");
+    cmd.arg("--dangerously-skip-permissions");
+    if let Some(system) = system_prompt {
+        cmd.arg("--system-prompt").arg(system);
+    }
+    cmd.kill_on_drop(true);
+    cmd
+}
+
 /// Build the CLI command string for a codex backend.
 ///
 /// Uses `codex exec` in full-auto mode (no approval prompts, sandboxed).

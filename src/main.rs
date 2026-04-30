@@ -405,6 +405,9 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
             backend: None,
             print_output: i == agents.len() - 1, // last step prints
             post_comment: None,
+            agents: Vec::new(),
+            max_turns: None,
+            turn_timeout: None,
         });
     }
 
@@ -1508,6 +1511,9 @@ mod tests {
             backend: None,
             print_output: false,
             post_comment: None,
+            agents: Vec::new(),
+            max_turns: None,
+            turn_timeout: None,
         }
     }
 
@@ -1722,6 +1728,7 @@ mod tests {
                 exit_code: 0,
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
+                participants: Vec::new(),
             },
         }];
 

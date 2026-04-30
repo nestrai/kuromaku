@@ -136,6 +136,29 @@ pub enum RunError {
 
     #[error("skill error: {0}")]
     Skill(#[from] skills::SkillsError),
+
+    /// A conversation step (#170) referenced a backend other than
+    /// `claude-cli`. Other backends do not yet implement the [`Transport`]
+    /// trait, so the Router cannot drive them. Surfaced explicitly rather
+    /// than silently falling back to the executor path because the user's
+    /// agent file is what would need to change.
+    #[error(
+        "step '{step}' is a conversation but agent '{agent}' uses backend '{backend:?}' -- only claude-cli is supported for conversation steps"
+    )]
+    ConversationUnsupportedBackend {
+        step: String,
+        agent: String,
+        backend: Backend,
+    },
+
+    /// Spawning a participant transport failed (process did not start, pipes
+    /// could not be captured, etc).
+    #[error("step '{step}' failed to spawn agent '{agent}': {source}")]
+    ConversationSpawn {
+        step: String,
+        agent: String,
+        source: executor::transport::TransportError,
+    },
 }
 
 /// Result of running a single step, used for the summary table and the run
@@ -545,6 +568,7 @@ async fn run_shell_step(
         exit_code: 0,
         input_steps: step.input.clone(),
         output_file: content_filename.clone(),
+        participants: Vec::new(),
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &stdout).map_err(|e| {
         RunError::Stack {
@@ -616,6 +640,307 @@ async fn run_shell_step(
     })
 }
 
+/// Run a `type: conversation` step (issue #170).
+///
+/// Spawns one [`StreamJsonTransport`](executor::transport::StreamJsonTransport)
+/// per participant, hands them to a [`Router`](crate::messaging::router::Router),
+/// and drives the conversation with the assembled task as the initial
+/// broadcast prompt. The router's log entries are collected synchronously
+/// through an `Arc<Mutex<...>>`; once the router terminates we render them
+/// to a markdown transcript via [`render_transcript`] and persist that as the
+/// step's output file.
+///
+/// Limitations:
+///
+/// * Only the `claude-cli` backend is supported. The other backends (`api`,
+///   `codex`, `ollama`) do not have a [`Transport`](executor::transport::Transport)
+///   implementation. We refuse to start rather than silently falling back.
+/// * The step-level `model:` / `backend:` fields are rejected by the parser
+///   so the per-agent settings are the single source of truth here.
+async fn run_conversation_step(
+    step: &Step,
+    agent_map: &HashMap<&str, &Agent>,
+    ctx: &RunContext,
+    step_num: usize,
+    total: usize,
+) -> Result<StepRunResult, RunError> {
+    use std::sync::{Arc, Mutex};
+
+    use crate::messaging::router::{LogEntry, Router, RouterConfig};
+
+    // Resolve all participant agents up front -- a missing agent must fail
+    // before we spawn any transports, otherwise the user gets a partially
+    // started conversation that is hard to diagnose.
+    let participants: Vec<&Agent> = step
+        .agents
+        .iter()
+        .map(|id| {
+            agent_map
+                .get(id.as_str())
+                .copied()
+                .ok_or_else(|| RunError::UnknownAgent {
+                    step: step.id.clone(),
+                    agent: id.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Backend gate: only claude-cli has a Transport. We check before
+    // spawning so we never end up with half a conversation alive.
+    for agent in &participants {
+        if agent.backend != Backend::ClaudeCli {
+            return Err(RunError::ConversationUnsupportedBackend {
+                step: step.id.clone(),
+                agent: agent.id.clone(),
+                backend: agent.backend,
+            });
+        }
+    }
+
+    let participant_names: Vec<String> = participants.iter().map(|a| a.id.clone()).collect();
+    ui::print_conversation_step_banner(step_num, total, &step.id, &participant_names, &step.input);
+
+    // Pre-compute the output path the same way agent steps do, so users can
+    // `tail -f` the transcript while the conversation runs. We don't stream
+    // partial rebuilds, but the path is announced for consistency.
+    let content_filename = llm_output_filename(step_num, &step.id);
+    let output_path = ctx
+        .run_path
+        .join(stack::STEPS_SUBDIR)
+        .join(&content_filename);
+    let output_file = format!(
+        "{}/{}/{}",
+        ctx.run_id,
+        stack::STEPS_SUBDIR,
+        content_filename
+    );
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    eprintln!(
+        "      output: {}",
+        output_path
+            .canonicalize()
+            .unwrap_or(output_path.clone())
+            .display()
+    );
+
+    // Build the seed prompt. The flow's task plus any `input:` outputs are
+    // funneled into the Router as the initial broadcast -- exactly the same
+    // semantics as agent steps, minus the per-step `task:` flavor. The
+    // conversation's `task:` (if any) is appended via build_user_prompt.
+    let seed_prompt = build_user_prompt(&ctx.task, step, &ctx.run_path)?;
+
+    // Configure the router. A missing turn_timeout falls back to the
+    // RouterConfig default (600s, see #169).
+    let mut router_cfg = RouterConfig::default();
+    if let Some(n) = step.max_turns {
+        router_cfg.max_turns = n;
+    }
+    if let Some(secs) = step.turn_timeout {
+        router_cfg.turn_timeout = std::time::Duration::from_secs(secs);
+    }
+
+    // Logger collects entries into a Vec we own. Arc<Mutex<...>> rather than
+    // an mpsc because we only need the entries after the router has
+    // terminated -- no streaming consumer.
+    let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = Arc::clone(&log);
+    let logger = Arc::new(move |entry: LogEntry| {
+        if let Ok(mut v) = log_clone.lock() {
+            v.push(entry);
+        }
+    });
+
+    let mut router = Router::new(router_cfg, logger);
+
+    // Spawn each agent's transport and hand it to the router. If any spawn
+    // fails we abort -- partial setups would leak processes.
+    for agent in &participants {
+        let system_prompt =
+            build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
+        let cmd = executor::build_claude_interactive_command(&agent.model, Some(&system_prompt));
+        let transport = executor::transport::StreamJsonTransport::spawn(cmd)
+            .await
+            .map_err(|e| RunError::ConversationSpawn {
+                step: step.id.clone(),
+                agent: agent.id.clone(),
+                source: e,
+            })?;
+        router.add_agent(agent.id.clone(), transport);
+    }
+
+    let start = Instant::now();
+    let step_started_at = chrono::Utc::now();
+    let spinner = ui::start_spinner();
+    let termination = router.run(Some(&seed_prompt)).await;
+    spinner.stop();
+    let duration = start.elapsed();
+
+    // Drain the log under the mutex; the router task has terminated so no
+    // more writers exist.
+    let entries = log.lock().map(|v| v.clone()).unwrap_or_default();
+    let transcript = render_transcript(&entries, &termination, &participant_names);
+
+    // Per-agent breakdown (#170 acceptance criterion). One row per
+    // participant in the order they were declared on the step. Tokens stay
+    // `None` until the transport surfaces per-message counts to the router.
+    let participants_stats: Vec<stack::ParticipantStat> = participants
+        .iter()
+        .map(|agent| stack::ParticipantStat {
+            agent: agent.id.clone(),
+            model: agent.model.clone(),
+            turns: count_agent_turns(&entries, &agent.id),
+            tokens_in: None,
+            tokens_out: None,
+        })
+        .collect();
+
+    let started_at = step_started_at.to_rfc3339();
+    let record = StepRecord {
+        step_id: step.id.clone(),
+        kind: "conversation".to_string(),
+        // No single agent for a conversation; leave None so the audit
+        // schema reflects "many agents" via the participants list below.
+        agent: None,
+        model_requested: None,
+        model_actual: None,
+        // Step-type discrimination lives in `kind: "conversation"`. The
+        // backend label sticks to the documented vocabulary
+        // (api/claude-cli/codex/ollama/shell), so audit consumers don't
+        // see a value that's missing from the schema. Conversation steps
+        // are enforced to run on claude-cli upstream, so this is also
+        // factually accurate.
+        backend: "claude-cli".to_string(),
+        tokens_in: None,
+        tokens_out: None,
+        duration_ms: duration.as_millis(),
+        started_at,
+        exit_code: 0,
+        input_steps: step.input.clone(),
+        output_file: content_filename.clone(),
+        participants: participants_stats,
+    };
+    stack::write_run_step(&ctx.run_path, step_num, &record, &transcript).map_err(|e| {
+        RunError::Stack {
+            step: step.id.clone(),
+            source: e,
+        }
+    })?;
+
+    let display_path = output_path
+        .canonicalize()
+        .unwrap_or(output_path.clone())
+        .display()
+        .to_string();
+    ui::print_step_done(&format_duration(duration), "—", "—", &display_path);
+
+    Ok(StepRunResult {
+        step_id: step.id.clone(),
+        agent_name: participant_names.join(", "),
+        backend: "conversation".to_string(),
+        duration,
+        tokens_in: None,
+        tokens_out: None,
+        output_file,
+        print_output: step.print_output,
+        record,
+    })
+}
+
+/// Render a router log to a markdown transcript.
+///
+/// Pure function over the log entries so it is unit-testable without
+/// spawning processes. The transcript layout is intentionally simple:
+///
+/// * One `## <agent>` header per final inbound message.
+/// * Body text verbatim under the header.
+/// * Tool-use entries shown as a single italic line so audit consumers see
+///   the activity but transcripts stay readable.
+/// * Send failures appear inline as a fenced warning block.
+/// * The trailing line records the termination reason and participant set.
+///
+/// Partial fragments are deliberately skipped -- they are streaming deltas
+/// of text the same agent later emits as a final result, and including them
+/// would duplicate the body.
+fn render_transcript(
+    entries: &[crate::messaging::router::LogEntry],
+    termination: &crate::messaging::router::TerminationReason,
+    participants: &[String],
+) -> String {
+    use crate::messaging::router::{LogKind, MessageKind, Source};
+
+    let mut out = String::new();
+    out.push_str("# Conversation transcript\n\n");
+    out.push_str(&format!("Participants: {}\n\n", participants.join(", ")));
+
+    for entry in entries {
+        match &entry.kind {
+            LogKind::Inbound { content, message } => {
+                let speaker = match &entry.from {
+                    Source::Agent(id) => id.clone(),
+                    Source::Human => "human".to_string(),
+                    Source::Router => "router".to_string(),
+                };
+                match message {
+                    MessageKind::Final => {
+                        out.push_str(&format!("## {speaker}\n\n{}\n\n", content.trim_end()));
+                    }
+                    MessageKind::ToolUse { name } => {
+                        out.push_str(&format!("_{speaker} used tool: {name}_\n\n"));
+                    }
+                    MessageKind::Partial => {
+                        // Streaming partial -- the final result entry will
+                        // carry the canonical text. Skipping avoids
+                        // duplicate output in the transcript.
+                    }
+                }
+            }
+            LogKind::Outbound { .. } => {
+                // Outbound deliveries duplicate inbound text -- skip them
+                // in the transcript.
+            }
+            LogKind::SendFailed { to, error } => {
+                out.push_str(&format!(
+                    "```\nwarning: failed to deliver to {to}: {error}\n```\n\n"
+                ));
+            }
+            LogKind::Termination { .. } => {
+                // Rendered explicitly below so it is always the last line.
+            }
+        }
+    }
+
+    // Display (not Debug) so the on-disk transcript carries the stable
+    // string form ("max_turns", "convergence", ...) rather than the variant
+    // identifier; renaming a TerminationReason variant in source code must
+    // not silently mutate historical audit text.
+    out.push_str(&format!("---\nTermination: {termination}\n"));
+    out
+}
+
+/// Count how many `Final` inbound messages `agent_id` emitted in the
+/// router log. Tool-use entries and streaming partials do not count -- a
+/// "turn" is a canonical result from the agent. Pure function so the
+/// `meta.yaml` `participants` breakdown is testable without spawning a
+/// router.
+fn count_agent_turns(entries: &[crate::messaging::router::LogEntry], agent_id: &str) -> usize {
+    use crate::messaging::router::{LogKind, MessageKind, Source};
+    entries
+        .iter()
+        .filter(|e| matches!(&e.from, Source::Agent(id) if id == agent_id))
+        .filter(|e| {
+            matches!(
+                &e.kind,
+                LogKind::Inbound {
+                    message: MessageKind::Final,
+                    ..
+                }
+            )
+        })
+        .count()
+}
+
 /// Run steps sequentially in topological order.
 pub async fn run_steps(
     steps: &[&Step],
@@ -643,6 +968,14 @@ pub async fn run_steps(
         if step.is_shell() {
             let result =
                 run_shell_step(executor.as_ref(), step, ctx, i + 1, total, &results).await?;
+            results.push(result);
+            continue;
+        }
+
+        // Conversation steps (issue #170) drive multiple agents through the
+        // messaging Router instead of a single agent's executor invocation.
+        if step.is_conversation() {
+            let result = run_conversation_step(step, &agent_map, ctx, i + 1, total).await?;
             results.push(result);
             continue;
         }
@@ -760,6 +1093,7 @@ pub async fn run_steps(
             exit_code: 0,
             input_steps: step.input.clone(),
             output_file: content_filename.clone(),
+            participants: Vec::new(),
         };
 
         // Write the canonical content file plus the meta.yaml. Executor
@@ -947,6 +1281,7 @@ mod tests {
                 exit_code: 0,
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
+                participants: Vec::new(),
             },
         }];
         let summary = build_summary(&results);
@@ -1214,6 +1549,9 @@ mod tests {
             backend: None,
             print_output: false,
             post_comment: None,
+            agents: Vec::new(),
+            max_turns: None,
+            turn_timeout: None,
         }
     }
 
@@ -1345,6 +1683,7 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: stack::step_content_filename(1, "fetch", "txt"),
+            participants: Vec::new(),
         };
         stack::write_run_step(&ctx.run_path, 1, &rec, "PR diff goes here").unwrap();
 
@@ -1360,6 +1699,9 @@ mod tests {
             backend: None,
             print_output: false,
             post_comment: None,
+            agents: Vec::new(),
+            max_turns: None,
+            turn_timeout: None,
         };
 
         let prompt = build_user_prompt("Top-level task", &downstream, &ctx.run_path).unwrap();
@@ -1458,6 +1800,273 @@ mod tests {
         assert_ne!(
             started_one, &run_started,
             "step 1 started_at must come from chrono::Utc::now() at step start, not ctx.started_at"
+        );
+    }
+
+    // --- Conversation transcript rendering (issue #170) ---
+
+    #[test]
+    fn render_transcript_includes_participants_and_finals() {
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source, TerminationReason};
+
+        let entries = vec![
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "I propose option A.".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+            LogEntry {
+                from: Source::Agent("Mika".to_string()),
+                kind: LogKind::Inbound {
+                    content: "I disagree, option B is safer.".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+        ];
+        let participants = vec!["Levi".to_string(), "Mika".to_string()];
+
+        let out = render_transcript(&entries, &TerminationReason::MaxTurns, &participants);
+
+        assert!(out.starts_with("# Conversation transcript\n"), "got: {out}");
+        assert!(
+            out.contains("Participants: Levi, Mika"),
+            "missing participants line: {out}"
+        );
+        assert!(out.contains("## Levi"), "missing Levi heading: {out}");
+        assert!(out.contains("## Mika"), "missing Mika heading: {out}");
+        assert!(out.contains("I propose option A."));
+        assert!(out.contains("option B is safer."));
+        // Termination footer uses the stable Display string, not the
+        // Debug variant identifier. Variant renames in source must not
+        // mutate historical transcript text.
+        assert!(
+            out.contains("Termination: max_turns"),
+            "expected stable Display string 'max_turns', got: {out}"
+        );
+        assert!(
+            !out.contains("MaxTurns"),
+            "transcript must not leak the Debug/variant name: {out}"
+        );
+    }
+
+    #[test]
+    fn render_transcript_skips_partials_and_outbound() {
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source, TerminationReason};
+
+        let entries = vec![
+            // Streaming partial -- must not appear in transcript.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "thinking...".to_string(),
+                    message: MessageKind::Partial,
+                },
+            },
+            // Outbound delivery -- duplicates inbound, must be skipped.
+            LogEntry {
+                from: Source::Router,
+                kind: LogKind::Outbound {
+                    to: "Mika".to_string(),
+                    content: "I propose option A.".to_string(),
+                },
+            },
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "Final answer.".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+        ];
+        let participants = vec!["Levi".to_string(), "Mika".to_string()];
+
+        let out = render_transcript(&entries, &TerminationReason::Convergence, &participants);
+
+        assert!(
+            !out.contains("thinking..."),
+            "partial fragments must be skipped: {out}"
+        );
+        assert!(
+            !out.contains("I propose option A."),
+            "outbound deliveries must be skipped (they duplicate inbound text): {out}"
+        );
+        assert!(out.contains("Final answer."));
+    }
+
+    #[test]
+    fn count_agent_turns_only_counts_final_inbound() {
+        // Acceptance: per-agent `turns` in meta.yaml counts canonical
+        // results only. Tool-use, partials, outbound deliveries, send
+        // failures, and other agents' messages must not contribute.
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source};
+        let entries = vec![
+            // Final by Levi -> counts.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "first".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+            // Partial by Levi -> ignored.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "thinking".to_string(),
+                    message: MessageKind::Partial,
+                },
+            },
+            // Tool-use by Levi -> ignored (not a turn).
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: String::new(),
+                    message: MessageKind::ToolUse {
+                        name: "read_file".to_string(),
+                    },
+                },
+            },
+            // Final by Mika -> ignored when counting Levi.
+            LogEntry {
+                from: Source::Agent("Mika".to_string()),
+                kind: LogKind::Inbound {
+                    content: "rebut".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+            // Outbound delivery -> not an agent emission.
+            LogEntry {
+                from: Source::Router,
+                kind: LogKind::Outbound {
+                    to: "Levi".to_string(),
+                    content: "first".to_string(),
+                },
+            },
+            // Final by Levi #2 -> counts.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "second".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+        ];
+
+        assert_eq!(count_agent_turns(&entries, "Levi"), 2);
+        assert_eq!(count_agent_turns(&entries, "Mika"), 1);
+        assert_eq!(count_agent_turns(&entries, "Nobody"), 0);
+    }
+
+    #[test]
+    fn participant_stat_serializes_to_meta_yaml() {
+        // Acceptance: `meta.yaml` carries per-agent rows; non-conversation
+        // steps stay backward-compatible (no `participants:` key emitted).
+        let convo = stack::StepRecord {
+            step_id: "debate".to_string(),
+            kind: "conversation".to_string(),
+            agent: None,
+            model_requested: None,
+            model_actual: None,
+            backend: "claude-cli".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 1234,
+            started_at: "2026-04-30T16:00:00Z".to_string(),
+            exit_code: 0,
+            input_steps: vec![],
+            output_file: "01-debate.md".to_string(),
+            participants: vec![
+                stack::ParticipantStat {
+                    agent: "Levi".to_string(),
+                    model: "claude-sonnet-4-5".to_string(),
+                    turns: 3,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+                stack::ParticipantStat {
+                    agent: "Mika".to_string(),
+                    model: "claude-opus-4-5".to_string(),
+                    turns: 2,
+                    tokens_in: None,
+                    tokens_out: None,
+                },
+            ],
+        };
+        let yaml = serde_yaml::to_string(&convo).unwrap();
+        assert!(
+            yaml.contains("participants:"),
+            "conversation meta must include participants: {yaml}"
+        );
+        assert!(yaml.contains("agent: Levi"));
+        assert!(yaml.contains("turns: 3"));
+        assert!(yaml.contains("agent: Mika"));
+        assert!(yaml.contains("turns: 2"));
+
+        // Backend uses the stable schema vocabulary, not "conversation".
+        assert!(
+            yaml.contains("backend: claude-cli"),
+            "audit backend must stick to api/claude-cli/codex/ollama/shell: {yaml}"
+        );
+
+        // Non-conversation step has no participants key (skip_serializing_if).
+        let llm = stack::StepRecord {
+            step_id: "design".to_string(),
+            kind: "llm".to_string(),
+            agent: Some("Levi".to_string()),
+            model_requested: Some("claude-sonnet-4-5".to_string()),
+            model_actual: Some("claude-sonnet-4-5".to_string()),
+            backend: "claude-cli".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 100,
+            started_at: "2026-04-30T16:00:00Z".to_string(),
+            exit_code: 0,
+            input_steps: vec![],
+            output_file: "01-design.md".to_string(),
+            participants: vec![],
+        };
+        let yaml = serde_yaml::to_string(&llm).unwrap();
+        assert!(
+            !yaml.contains("participants"),
+            "non-conversation steps must omit participants for backward-compat: {yaml}"
+        );
+    }
+
+    #[test]
+    fn render_transcript_renders_tool_use_and_send_failures() {
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source, TerminationReason};
+
+        let entries = vec![
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: String::new(),
+                    message: MessageKind::ToolUse {
+                        name: "read_file".to_string(),
+                    },
+                },
+            },
+            LogEntry {
+                from: Source::Router,
+                kind: LogKind::SendFailed {
+                    to: "Mika".to_string(),
+                    error: "transport closed".to_string(),
+                },
+            },
+        ];
+        let participants = vec!["Levi".to_string(), "Mika".to_string()];
+
+        let out = render_transcript(&entries, &TerminationReason::Timeout, &participants);
+
+        assert!(
+            out.contains("_Levi used tool: read_file_"),
+            "tool-use must render as italic note: {out}"
+        );
+        assert!(
+            out.contains("failed to deliver to Mika") && out.contains("transport closed"),
+            "send-failure must surface in transcript: {out}"
         );
     }
 }
