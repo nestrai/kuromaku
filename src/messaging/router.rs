@@ -74,6 +74,27 @@ pub enum Source {
     Router,
 }
 
+/// Stable classification of an inbound message, decoupled from the
+/// executor's wire format.
+///
+/// The router observes [`Fragment`]s coming off the transport, but audit
+/// consumers (#170 persistence, future TUI views) should not be locked to
+/// that schema. `Fragment` is the executor's on-the-wire representation
+/// and is allowed to evolve; `MessageKind` is the messaging layer's stable
+/// view of "what kind of thing was said".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageKind {
+    /// Streaming partial text mid-turn. No turn boundary, not routed.
+    Partial,
+    /// Agent invoked a tool. `name` is the tool name as the agent reported
+    /// it; preserved because audit views typically surface tool activity.
+    ToolUse { name: String },
+    /// Final, canonical text for a turn. The unit routing decisions key on
+    /// (broadcast, convergence, max_turns). Also used for human messages,
+    /// which are complete utterances rather than streaming deltas.
+    Final,
+}
+
 /// Kind of logged event.
 ///
 /// Separate from [`Source`] so a single entry says both "who" and "what":
@@ -82,10 +103,15 @@ pub enum Source {
 /// LogKind::Inbound` is something the reviewer said.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogKind {
-    /// A fragment received from an agent or human, with its rendered text.
-    /// `fragment` is preserved so audit consumers can distinguish a final
-    /// result from a streaming delta without re-parsing the text.
-    Inbound { content: String, fragment: Fragment },
+    /// A message received from an agent or human, with its rendered text.
+    /// `message` classifies it (partial, tool-use, final) so audit
+    /// consumers can distinguish a final result from a streaming delta
+    /// without re-parsing the text, and without depending on the
+    /// executor's [`Fragment`] schema.
+    Inbound {
+        content: String,
+        message: MessageKind,
+    },
     /// Router delivered `content` to `to`.
     Outbound { to: AgentId, content: String },
     /// Router tried to deliver to `to` but the transport rejected the send.
@@ -328,7 +354,7 @@ impl Router {
                         from: Source::Agent(from.clone()),
                         kind: LogKind::Inbound {
                             content: fragment_text(&event),
-                            fragment: event.clone(),
+                            message: message_kind(&event),
                         },
                     });
                     if let Fragment::Result(text) = &event {
@@ -375,10 +401,11 @@ impl Router {
                         from: Source::Human,
                         kind: LogKind::Inbound {
                             content: content.clone(),
-                            // No real Fragment for human input; reuse
-                            // Fragment::Text so consumers can treat it
-                            // uniformly with agent text.
-                            fragment: Fragment::Text(content.clone()),
+                            // Human input is a complete utterance, so it
+                            // classifies as Final. Source::Human already
+                            // marks the origin; MessageKind only carries
+                            // the shape of the message.
+                            message: MessageKind::Final,
                         },
                     });
                     // New human input opens a fresh round: clear the
@@ -469,6 +496,17 @@ fn fragment_text(fragment: &Fragment) -> String {
         Fragment::Text(s) => s.clone(),
         Fragment::ToolUse { name } => format!("[tool: {name}]"),
         Fragment::Result(s) => s.clone(),
+    }
+}
+
+/// Project the executor's [`Fragment`] onto the messaging layer's stable
+/// [`MessageKind`]. The router does this conversion at its boundary so
+/// log consumers (and #170 persistence) never see `Fragment` directly.
+fn message_kind(fragment: &Fragment) -> MessageKind {
+    match fragment {
+        Fragment::Text(_) => MessageKind::Partial,
+        Fragment::ToolUse { name } => MessageKind::ToolUse { name: name.clone() },
+        Fragment::Result(_) => MessageKind::Final,
     }
 }
 
@@ -756,7 +794,7 @@ mod tests {
             from: Source::Agent("a".into()),
             kind: LogKind::Inbound {
                 content: "hello".into(),
-                fragment: Fragment::Result("hello".into()),
+                message: MessageKind::Final,
             },
         }));
 
