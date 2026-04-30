@@ -22,6 +22,8 @@ mod executor;
 mod koto_config;
 #[allow(dead_code)]
 mod llm;
+#[allow(dead_code)]
+mod messaging;
 mod notify;
 mod resolver;
 mod runner;
