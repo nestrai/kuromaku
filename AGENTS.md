@@ -28,7 +28,18 @@ After code changes that affect CLI behavior, run `just release` so the local `ku
 
 ## Workflow
 
-When you are assigned an issue, follow these steps. Do not skip any.
+The full lifecycle for every issue is:
+
+```
+implement-issue  ->  review-pr  ->  rework-pr (if needed)  ->  merge
+```
+
+1. **implement-issue**: Create a branch, implement the change, open a draft PR.
+2. **review-pr**: Review the PR against the issue's acceptance criteria. Post a verdict.
+3. **rework-pr**: If the review says REQUEST_CHANGES, fix the feedback as fixup commits.
+4. **merge**: After APPROVE, the maintainer squashes and merges.
+
+This cycle repeats until the review passes. Every PR gets reviewed before merge, no exceptions.
 
 ### Implementing an issue
 
