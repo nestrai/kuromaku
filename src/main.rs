@@ -43,7 +43,7 @@ use crate::stack::{Manifest, ResourceRecord, RoleResolution, SeedRecord};
 const KOTO_DIR: &str = ".koto";
 
 #[derive(Parser)]
-#[command(name = "koto", about = "Reproducible AI agent teams", version)]
+#[command(name = "kuro", about = "Reproducible AI agent teams", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
