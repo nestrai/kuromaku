@@ -67,7 +67,7 @@ kuro run review-pr id=67
 
 **Rules** are Markdown files in `.kuro/rules/`. Multiple agents can reference the same rules. Rules are composed into the system prompt at runtime: Guide > Rules > Skills > Role.
 
-**Stack** is where outputs land. Each step writes its result to `~/.koto/stacks/<project>/`. Results from earlier steps are injected as context into later steps.
+**Stack** is where outputs land. Each step writes its result to `~/.kuro/stacks/<project>/`. Results from earlier steps are injected as context into later steps.
 
 **Template variables** allow flows to define reusable prompts with `{{key}}` placeholders, filled via `key=value` CLI arguments.
 
