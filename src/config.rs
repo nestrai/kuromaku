@@ -2149,4 +2149,224 @@ flow:
         assert_eq!(agents.len(), 1, "shell step must not produce an agent load");
         assert_eq!(agents[0].id, "Levi");
     }
+
+    // --- Conversation step parsing/validation tests (issue #170) ---
+
+    const CONVERSATION_OK: &str = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    agents: [Levi, Mika]
+    max_turns: 6
+    turn_timeout: 120
+    task: "Discuss the architecture"
+"#;
+
+    #[test]
+    fn conversation_step_parses_minimal() {
+        let flow = load_flow_from_str(CONVERSATION_OK).unwrap();
+        assert_eq!(flow.steps.len(), 1);
+        let step = &flow.steps[0];
+        assert!(step.is_conversation());
+        assert_eq!(step.id, "debate");
+        assert_eq!(step.agents, vec!["Levi", "Mika"]);
+        assert_eq!(step.max_turns, Some(6));
+        assert_eq!(step.turn_timeout, Some(120));
+        assert_eq!(step.task.as_deref(), Some("Discuss the architecture"));
+        // Conversation steps must not carry agent/role/run.
+        assert!(step.agent.is_empty());
+        assert!(step.role.is_none());
+        assert!(step.run.is_none());
+    }
+
+    #[test]
+    fn conversation_step_requires_two_agents() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    agents: [Levi]
+    max_turns: 4
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("at least 2 entries") && err.contains("debate"),
+            "expected min-2-agents error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_requires_max_turns() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    agents: [Levi, Mika]
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("max_turns") && err.contains("debate"),
+            "expected missing-max_turns error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_rejects_zero_max_turns() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    agents: [Levi, Mika]
+    max_turns: 0
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("max_turns: 0") || err.contains("must be > 0"),
+            "expected max_turns: 0 rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_rejects_duplicate_agents() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    agents: [Levi, Levi]
+    max_turns: 4
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("more than once") && err.contains("Levi"),
+            "expected duplicate-agent error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_rejects_agent_field() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    agent: Levi
+    agents: [Levi, Mika]
+    max_turns: 4
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("must not set 'agent:'"),
+            "expected agent-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_rejects_run_field() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    run: "echo hi"
+    agents: [Levi, Mika]
+    max_turns: 4
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("must not set 'run:'"),
+            "expected run-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_rejects_step_level_model() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: conversation
+    model: claude-opus-4-5
+    agents: [Levi, Mika]
+    max_turns: 4
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("must not set 'model:'"),
+            "expected model rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_unknown_type_errors() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  debate:
+    type: chitchat
+    agents: [Levi, Mika]
+    max_turns: 4
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("unknown type") && err.contains("chitchat"),
+            "expected unknown-type error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn agents_field_requires_conversation_type() {
+        // `agents:` outside `type: conversation` must fail with a hint.
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  oops:
+    agent: Levi
+    agents: [Levi, Mika]
+    max_turns: 4
+"#;
+        let err = load_flow_from_str(yaml).unwrap_err().to_string();
+        assert!(
+            err.contains("type: conversation"),
+            "expected hint pointing to type: conversation, got: {err}"
+        );
+    }
+
+    #[test]
+    fn conversation_step_input_merges_into_needs() {
+        let yaml = r#"
+version: "1"
+name: chat
+flow:
+  brief:
+    agent: Levi
+  debate:
+    type: conversation
+    agents: [Levi, Mika]
+    max_turns: 4
+    input: [brief]
+"#;
+        let flow = load_flow_from_str(yaml).unwrap();
+        let debate = flow.steps.iter().find(|s| s.id == "debate").unwrap();
+        assert_eq!(debate.input, vec!["brief"]);
+        assert!(
+            debate.needs.contains(&"brief".to_string()),
+            "input dependency must merge into needs: {:?}",
+            debate.needs
+        );
+    }
 }

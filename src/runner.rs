@@ -1756,4 +1756,129 @@ mod tests {
             "step 1 started_at must come from chrono::Utc::now() at step start, not ctx.started_at"
         );
     }
+
+    // --- Conversation transcript rendering (issue #170) ---
+
+    #[test]
+    fn render_transcript_includes_participants_and_finals() {
+        use crate::messaging::router::{
+            LogEntry, LogKind, MessageKind, Source, TerminationReason,
+        };
+
+        let entries = vec![
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "I propose option A.".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+            LogEntry {
+                from: Source::Agent("Mika".to_string()),
+                kind: LogKind::Inbound {
+                    content: "I disagree, option B is safer.".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+        ];
+        let participants = vec!["Levi".to_string(), "Mika".to_string()];
+
+        let out = render_transcript(&entries, &TerminationReason::MaxTurns, &participants);
+
+        assert!(out.starts_with("# Conversation transcript\n"), "got: {out}");
+        assert!(
+            out.contains("Participants: Levi, Mika"),
+            "missing participants line: {out}"
+        );
+        assert!(out.contains("## Levi"), "missing Levi heading: {out}");
+        assert!(out.contains("## Mika"), "missing Mika heading: {out}");
+        assert!(out.contains("I propose option A."));
+        assert!(out.contains("option B is safer."));
+        // Termination footer must be the last block.
+        assert!(out.contains("Termination:"), "missing termination: {out}");
+    }
+
+    #[test]
+    fn render_transcript_skips_partials_and_outbound() {
+        use crate::messaging::router::{
+            LogEntry, LogKind, MessageKind, Source, TerminationReason,
+        };
+
+        let entries = vec![
+            // Streaming partial -- must not appear in transcript.
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "thinking...".to_string(),
+                    message: MessageKind::Partial,
+                },
+            },
+            // Outbound delivery -- duplicates inbound, must be skipped.
+            LogEntry {
+                from: Source::Router,
+                kind: LogKind::Outbound {
+                    to: "Mika".to_string(),
+                    content: "I propose option A.".to_string(),
+                },
+            },
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: "Final answer.".to_string(),
+                    message: MessageKind::Final,
+                },
+            },
+        ];
+        let participants = vec!["Levi".to_string(), "Mika".to_string()];
+
+        let out = render_transcript(&entries, &TerminationReason::Convergence, &participants);
+
+        assert!(
+            !out.contains("thinking..."),
+            "partial fragments must be skipped: {out}"
+        );
+        assert!(
+            !out.contains("I propose option A."),
+            "outbound deliveries must be skipped (they duplicate inbound text): {out}"
+        );
+        assert!(out.contains("Final answer."));
+    }
+
+    #[test]
+    fn render_transcript_renders_tool_use_and_send_failures() {
+        use crate::messaging::router::{
+            LogEntry, LogKind, MessageKind, Source, TerminationReason,
+        };
+
+        let entries = vec![
+            LogEntry {
+                from: Source::Agent("Levi".to_string()),
+                kind: LogKind::Inbound {
+                    content: String::new(),
+                    message: MessageKind::ToolUse {
+                        name: "read_file".to_string(),
+                    },
+                },
+            },
+            LogEntry {
+                from: Source::Router,
+                kind: LogKind::SendFailed {
+                    to: "Mika".to_string(),
+                    error: "transport closed".to_string(),
+                },
+            },
+        ];
+        let participants = vec!["Levi".to_string(), "Mika".to_string()];
+
+        let out = render_transcript(&entries, &TerminationReason::Timeout, &participants);
+
+        assert!(
+            out.contains("_Levi used tool: read_file_"),
+            "tool-use must render as italic note: {out}"
+        );
+        assert!(
+            out.contains("failed to deliver to Mika") && out.contains("transport closed"),
+            "send-failure must surface in transcript: {out}"
+        );
+    }
 }
