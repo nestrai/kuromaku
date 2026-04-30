@@ -1,6 +1,6 @@
 # koto -- Agent Guide
 
-You are working on **koto**, a Rust CLI tool for reproducible AI agent teams with persistent shared state. Users define agent teams in YAML, run `koto up`, and get structured outputs.
+You are working on **koto**, a Rust CLI tool for reproducible AI agent teams with persistent shared state. Users define agent teams in YAML, run `koto run`, and get structured outputs.
 
 ## Repository
 

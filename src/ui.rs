@@ -739,7 +739,7 @@ impl StepInfo {
     }
 }
 
-/// Print the initial "$ koto up <file>" command echo.
+/// Print the initial "$ koto run <file>" command echo.
 pub fn print_command(cmd: &str) {
     let t = &DARK;
     println!("  {}", style::style(format!("$ {cmd}")).with(t.dim));

@@ -5,7 +5,7 @@
 Multi-step flows can drift from the original requirement through a telephone-game effect. When requirements pass through multiple agents and intermediate artifacts (design docs, interpretations, summaries), each step introduces the risk of divergence from what the user actually asked for.
 
 **Real-world failure:**
-User runs `koto up development -t "Add caching for step outputs"`. The architect interprets "caching" as in-memory only. The implementer builds in-memory caching correctly. The reviewer confirms implementation matches the design. All agents succeed, but the user wanted disk-based caching.
+User runs `koto run development -t "Add caching for step outputs"`. The architect interprets "caching" as in-memory only. The implementer builds in-memory caching correctly. The reviewer confirms implementation matches the design. All agents succeed, but the user wanted disk-based caching.
 
 The problem is undetectable when agents validate against intermediate artifacts instead of the original requirement.
 

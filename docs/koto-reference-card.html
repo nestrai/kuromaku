@@ -436,7 +436,7 @@
       <div class="sub">how developers read the spec at a glance</div>
     </div>
     <div class="meta">
-      <div><b>koto</b> -- a CLI for reproducible AI agent teams. Think <i>docker-compose for agents</i>. Define your team in YAML, run <code>koto up</code>.</div>
+      <div><b>koto</b> -- a CLI for reproducible AI agent teams. Think <i>docker-compose for agents</i>. Define your team in YAML, run <code>koto run</code>.</div>
       <div class="row">
         <div><span class="k">format</span><span class="v">YAML</span></div>
         <div><span class="k">audience</span><span class="v">CI/CD devs</span></div>
@@ -686,7 +686,7 @@
 <span class="req-key">agents</span>:
   - { <span class="req-key">id</span>: bot, <span class="req-key">role</span>: <span class="str">"say hi"</span> }
 </pre>
-      <div class="lines">$ koto up  ->  runs bot once, prints output</div>
+      <div class="lines">$ koto run  ->  runs bot once, prints output</div>
     </div>
 
     <div class="card example-block">
@@ -732,7 +732,7 @@
   <span class="req-key">backend</span>: local
   <span class="opt-key">path</span>:    .koto/state
 </pre>
-      <div class="lines">$ koto up  ->  research -> (draft | images) -> edit</div>
+      <div class="lines">$ koto run  ->  research -> (draft | images) -> edit</div>
     </div>
   </div>
 

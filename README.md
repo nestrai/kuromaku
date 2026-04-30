@@ -5,7 +5,7 @@ Reproducible AI agent teams, defined in YAML, versioned in your repo.
 Define your team once, run it anywhere. No Python, no framework lock-in, no glue code.
 
 ```
-koto up review-pr id=67
+koto run review-pr id=67
 ```
 
 ## What it does
@@ -56,7 +56,7 @@ flow:
 EOF
 
 # Run it
-koto up review-pr id=67
+koto run review-pr id=67
 ```
 
 ## Key concepts
