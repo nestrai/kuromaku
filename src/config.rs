@@ -35,7 +35,7 @@ pub enum Backend {
 ///
 /// Set on a step via `post_comment: pr` or `post_comment: issue`. The runner
 /// picks up the target number from the `id` template variable -- consistent
-/// with the placeholder convention used by every flow that ships with koto
+/// with the placeholder convention used by every flow that ships with kuromaku
 /// (see the tests in this module that ban `{{pr}}` and `{{issue}}` in flow
 /// YAML).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

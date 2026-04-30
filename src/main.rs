@@ -122,17 +122,17 @@ async fn main() -> Result<()> {
         Command::Run(args) => run_flow(&args).await?,
         Command::Up(args) => {
             eprintln!(
-                "warning: `koto up` is deprecated and will be removed in a future release; use `koto run` instead"
+                "warning: `kuro up` is deprecated and will be removed in a future release; use `kuro run` instead"
             );
             run_flow(&args).await?
         }
         Command::Task { agent, task } => run_task(&agent, &task).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
-            println!("koto down: not yet implemented");
+            println!("kuro down: not yet implemented");
         }
         Command::Status => {
-            println!("koto status: not yet implemented");
+            println!("kuro status: not yet implemented");
         }
     }
 
@@ -217,11 +217,17 @@ fn resolve_flow_path(flow: Option<&str>, file: Option<&str>, seeds: &Seeds) -> R
         .collect::<Vec<_>>()
         .join("\n");
     Err(eyre!(
-        "multiple flows found, specify one:\n\n{list}\n\nusage: koto run <flow-name> -t \"task\""
+        "multiple flows found, specify one:\n\n{list}\n\nusage: kuro run <flow-name> -t \"task\""
     ))
 }
 
-/// Resolve the stack path: explicit config > default (~/.koto/stacks/<project>/).
+/// Resolve the stack path: explicit config > default (`~/.koto/stacks/<project>/`).
+///
+/// The default home directory still uses `.koto/stacks/` even after the
+/// project-config rename to `.kuro/` (#176). Renaming the home stack root
+/// without a migration path would silently orphan every existing user's run
+/// history, so it stays as a compatibility path until a dedicated migration
+/// issue lands.
 fn resolve_stack_path(config_path: &str) -> PathBuf {
     if !config_path.is_empty() {
         return PathBuf::from(config_path);
@@ -411,7 +417,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     };
 
     ui::print_command(&format!(
-        "koto task --agent {} -t \"...\"",
+        "kuro task --agent {} -t \"...\"",
         agent_names.join(" --agent ")
     ));
 
@@ -451,7 +457,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
         let missing = skills::check_skills_available(&skill_names, &skills_dir);
         if !missing.is_empty() {
             return Err(eyre!(
-                "missing skills: {}\n\nhint: run `koto pull` to fetch skills",
+                "missing skills: {}\n\nhint: run `kuro pull` to fetch skills",
                 missing.join(", ")
             ));
         }
@@ -522,7 +528,7 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
     let path = resolve_flow_path(flow, file, &seeds)?;
     let display_path = path.display().to_string();
 
-    ui::print_command(&format!("koto run {}", flow.unwrap_or(&display_path)));
+    ui::print_command(&format!("kuro run {}", flow.unwrap_or(&display_path)));
 
     // Parse `--role` flags up front. Errors here surface bad syntax (unknown
     // field, bad model format, ...) before we touch any YAML.
@@ -763,7 +769,7 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
         let missing = skills::check_skills_available(&skill_names, &skills_dir);
         if !missing.is_empty() {
             return Err(eyre!(
-                "missing skills: {}\n\nhint: run `koto pull` to fetch skills",
+                "missing skills: {}\n\nhint: run `kuro pull` to fetch skills",
                 missing.join(", ")
             ));
         }
@@ -1236,9 +1242,9 @@ mod tests {
 
     #[test]
     fn run_subcommand_parses_canonically() {
-        // `koto run <flow>` is the canonical verb -- it must parse to
+        // `kuro run <flow>` is the canonical verb -- it must parse to
         // Command::Run, not the deprecated Up alias.
-        let (cli, kind) = parse_cli(&["koto", "run", "review-pr"]);
+        let (cli, kind) = parse_cli(&["kuro", "run", "review-pr"]);
         assert_eq!(kind, "run");
         let Command::Run(args) = cli.command else {
             unreachable!()
@@ -1248,10 +1254,10 @@ mod tests {
 
     #[test]
     fn up_subcommand_still_parses_for_deprecation() {
-        // `koto up <flow>` continues to work but parses to the hidden Up
+        // `kuro up <flow>` continues to work but parses to the hidden Up
         // variant so the dispatcher can emit the deprecation warning. Removing
         // this without a release cycle would break user scripts.
-        let (cli, kind) = parse_cli(&["koto", "up", "review-pr"]);
+        let (cli, kind) = parse_cli(&["kuro", "up", "review-pr"]);
         assert_eq!(kind, "up");
         let Command::Up(args) = cli.command else {
             unreachable!()
@@ -1277,12 +1283,12 @@ mod tests {
         ];
 
         let (run_cli, _) = parse_cli(
-            &[&["koto", "run"][..], &argv_common[..]]
+            &[&["kuro", "run"][..], &argv_common[..]]
                 .concat::<&str>()
                 .as_slice(),
         );
         let (up_cli, _) = parse_cli(
-            &[&["koto", "up"][..], &argv_common[..]]
+            &[&["kuro", "up"][..], &argv_common[..]]
                 .concat::<&str>()
                 .as_slice(),
         );
@@ -1418,16 +1424,19 @@ mod tests {
     }
 
     #[test]
-    fn cli_vars_override_koto_yaml_vars() {
-        // Replicates the merge logic used in run_up.
-        let mut koto_yaml_vars = std::collections::HashMap::new();
-        koto_yaml_vars.insert("owner".to_string(), "from-yaml".to_string());
-        koto_yaml_vars.insert("repo".to_string(), "from-yaml".to_string());
+    fn cli_vars_override_project_config_vars() {
+        // Replicates the merge logic used in run_flow: project config vars
+        // get shadowed by `--var` CLI flags. Renamed from the legacy
+        // koto_yaml/koto_yaml_vars wording -- the file is `.kuro/config.yaml`
+        // now and the test is generic over the project-config layer regardless.
+        let mut project_config_vars = std::collections::HashMap::new();
+        project_config_vars.insert("owner".to_string(), "from-yaml".to_string());
+        project_config_vars.insert("repo".to_string(), "from-yaml".to_string());
 
         let cli_args = vec!["repo=from-cli".to_string()];
         let cli_vars = parse_key_value_args(&cli_args).unwrap();
 
-        let mut effective = koto_yaml_vars;
+        let mut effective = project_config_vars;
         for (k, v) in cli_vars {
             effective.insert(k, v);
         }

@@ -1,6 +1,6 @@
 //! Terminal UI output module.
 //!
-//! Implements the visual language from the koto terminal design mockups:
+//! Implements the visual language from the kuromaku terminal design mockups:
 //! - Semantic color system (tokyonight-inspired dark theme)
 //! - Step pills, banners, and summary tables
 //! - Streaming output with spinners
@@ -88,7 +88,7 @@ pub struct StepPill {
 
 // --- Output functions ---
 
-/// Print the flow header: "koto flow <name> (<file>)"
+/// Print the flow header: "✓ loaded flow <name> (<file>)  (<n> steps, <m> agents)"
 pub fn print_flow_start(name: &str, file: &str, step_count: usize, agent_count: usize) {
     let t = &DARK;
     println!(
@@ -615,7 +615,7 @@ pub fn print_error_hints(hints: &[(&str, &str)]) {
 
 // --- Status command ---
 
-/// Print the koto status table header.
+/// Print the status table header.
 pub fn print_status_header(run_id: &str, flow_name: &str, status: StepState) {
     let t = &DARK;
     let status_str = match status {
@@ -739,7 +739,7 @@ impl StepInfo {
     }
 }
 
-/// Print the initial "$ koto run <file>" command echo.
+/// Print the initial "$ kuro run <file>" command echo.
 pub fn print_command(cmd: &str) {
     let t = &DARK;
     println!("  {}", style::style(format!("$ {cmd}")).with(t.dim));

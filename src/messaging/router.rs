@@ -185,8 +185,8 @@ pub enum TerminationReason {
 /// The public [`Transport`] trait uses `impl Future` (return-position impl
 /// trait), which makes it dyn-incompatible. The router needs to hold a
 /// heterogeneous set of transports (mixed-backend flows: claude-cli alongside
-/// api alongside ollama, see #170 and koto's "backend-agnostic" principle in
-/// CLAUDE.md), so we type-erase here with a `Pin<Box<dyn Future>>` shim.
+/// api alongside ollama, see #170 and kuromaku's "backend-agnostic" principle
+/// in CLAUDE.md), so we type-erase here with a `Pin<Box<dyn Future>>` shim.
 ///
 /// This is internal: callers still interact with the [`Transport`] trait. The
 /// blanket impl below makes any `T: Transport + Send + Sync + 'static` usable
