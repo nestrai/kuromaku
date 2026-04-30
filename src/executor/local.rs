@@ -30,11 +30,35 @@ struct RunningProcess {
     stderr_reader: Option<JoinHandle<()>>,
 }
 
+/// Environment variables allowed to propagate from the parent process into
+/// spawned child processes. Everything else is cleared so agent execution
+/// is deterministic regardless of the user's shell environment, and
+/// sensitive keys (API tokens, credentials) never leak into child
+/// processes. Backend-specific vars should come from agent YAML config via
+/// `task.env`, not from parent inheritance.
+const ALLOWED_ENV_VARS: [&str; 14] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "SHELL",
+    "TERM",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "XDG_RUNTIME_DIR",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+];
+
 /// Executes steps locally as child processes.
 ///
-/// Spawns commands via `sh -c` inheriting the current environment, streams
-/// stdout line-by-line to the configured artifact file (and into a buffer
-/// returned at wait time), and surfaces stderr via the buffer too.
+/// Spawns commands via `sh -c` with a clean environment (allowlisted vars
+/// only), streams stdout line-by-line to the configured artifact file (and
+/// into a buffer returned at wait time), and surfaces stderr via the
+/// buffer too.
 pub struct LocalExecutor {
     processes: Arc<Mutex<HashMap<String, RunningProcess>>>,
 }
@@ -54,6 +78,12 @@ impl Executor for LocalExecutor {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
+        cmd.env_clear();
+        for key in ALLOWED_ENV_VARS {
+            if let Ok(value) = std::env::var(key) {
+                cmd.env(key, value);
+            }
+        }
         for (key, value) in &task.env {
             cmd.env(key, value);
         }
@@ -353,14 +383,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn spawn_inherits_env() {
+    async fn spawn_passes_task_env() {
         let executor = LocalExecutor::new();
         let mut env = HashMap::new();
-        env.insert("KOTO_TEST_VAR".to_string(), "works".to_string());
+        env.insert("KURO_TEST_VAR".to_string(), "works".to_string());
 
         let task = ExecutionTask {
             id: "test-env".to_string(),
-            command: "echo $KOTO_TEST_VAR".to_string(),
+            command: "echo $KURO_TEST_VAR".to_string(),
             env,
             stdout_file: None,
             output_format: OutputFormat::Raw,
@@ -369,6 +399,31 @@ mod tests {
         let handle = executor.spawn(task).await.unwrap();
         let output = executor.wait(&handle).await.unwrap();
         assert_eq!(output.stdout, "works");
+    }
+
+    #[tokio::test]
+    async fn spawn_does_not_inherit_parent_env() {
+        // Set a var in this process that is NOT on the allowlist.
+        // The child must not see it.
+        // SAFETY: this test runs in isolation; no other threads depend on
+        // this variable.
+        unsafe { std::env::set_var("ANTHROPIC_API_KEY", "sk-secret-leaked") };
+
+        let executor = LocalExecutor::new();
+        let task = ExecutionTask {
+            id: "test-no-leak".to_string(),
+            command: "echo ${ANTHROPIC_API_KEY:-clean}".to_string(),
+            env: HashMap::new(),
+            stdout_file: None,
+            output_format: OutputFormat::Raw,
+        };
+
+        let handle = executor.spawn(task).await.unwrap();
+        let output = executor.wait(&handle).await.unwrap();
+        assert_eq!(output.stdout, "clean");
+
+        // SAFETY: cleanup after test, same isolation assumption.
+        unsafe { std::env::remove_var("ANTHROPIC_API_KEY") };
     }
 
     #[tokio::test]
