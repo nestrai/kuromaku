@@ -401,6 +401,14 @@ impl Router {
         );
 
         // Tell readers to stop, then wait so we don't leak tasks.
+        //
+        // Drop `events_rx` first. A reader that already pulled an event out
+        // of `transport.recv()` is now inside `tx.send(..).await` and no
+        // longer in the surrounding `select!`, so the cancel signal cannot
+        // reach it. If the events channel is full at that moment, the send
+        // would block forever. Dropping the receiver closes the channel,
+        // which makes the pending send return Err and the reader exits.
+        drop(events_rx);
         let _ = cancel_tx.send(());
         for handle in reader_handles {
             let _ = handle.await;
