@@ -96,14 +96,18 @@ pub async fn run(verbose: bool) -> Result<()> {
     registry
         .register(Box::new(execution::ShowOutput))
         .map_err(|e| eyre!("register show_output: {:?}", e))?;
-    // Workflow tools (#196 split). `implement_issue` (#213) lands first;
-    // `review_pr` (#214) follows; `rework_pr` (#215) plugs in alongside.
+    // Workflow tools (#196 split). `implement_issue` (#213), `review_pr`
+    // (#214), `rework_pr` (#215) -- registration order is irrelevant because
+    // the registry is a BTreeMap, but kept in issue order for readability.
     registry
         .register(Box::new(workflow::ImplementIssue))
         .map_err(|e| eyre!("register implement_issue: {:?}", e))?;
     registry
         .register(Box::new(workflow::ReviewPr))
         .map_err(|e| eyre!("register review_pr: {:?}", e))?;
+    registry
+        .register(Box::new(workflow::ReworkPr))
+        .map_err(|e| eyre!("register rework_pr: {:?}", e))?;
 
     // Take ownership of the stdout fd BEFORE the runner can write to it.
     // Tools that call into `runner::execute_flow` indirectly invoke `ui::*`
