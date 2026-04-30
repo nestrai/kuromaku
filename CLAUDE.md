@@ -2,7 +2,7 @@
 
 ## What this is
 
-koto is a CLI tool for reproducible AI agent teams with persistent shared state. Define your team in a YAML file (`.koto/config.yaml`), run `koto run`.
+kuromaku is a CLI tool for reproducible AI agent teams with persistent shared state. Define your team in a YAML file (`.kuro/config.yaml`), run `kuro run`. The binary is `kuro`; the project name is `kuromaku` (kubernetes/kubectl pattern).
 
 ## Language and tooling
 
@@ -29,16 +29,16 @@ just run run  # cargo run -- run
 ## Architecture
 
 Single crate for now. Will split into workspace crates when complexity warrants it:
-- `koto-cli` -- binary, CLI interface, TUI
-- `koto-config` -- YAML config parsing and validation
-- `koto-engine` -- DAG resolution, agent orchestration
-- `koto-state` -- persistent state management
-- `koto-ui` -- shared TUI components (reusable across tools)
+- `kuromaku-cli` -- binary, CLI interface, TUI
+- `kuromaku-config` -- YAML config parsing and validation
+- `kuromaku-engine` -- DAG resolution, agent orchestration
+- `kuromaku-state` -- persistent state management
+- `kuromaku-ui` -- shared TUI components (reusable across tools)
 
 ## Config format
 
-See `docs/koto-reference-card.html` for the visual spec. Key points:
-- Config file: `.koto/config.yaml` (legacy `koto.yaml` in repo root still loads with a deprecation warning)
+See `docs/kuromaku-reference-card.html` for the visual spec. Key points:
+- Config file: `.kuro/config.yaml`. Legacy `.koto/config.yaml` and `koto.yaml` in repo root still load with a deprecation warning.
 - Stages are parallel by default, `needs` creates sequencing
 - `flow` as the orchestration keyword (not `workflow` or `pipeline`)
 

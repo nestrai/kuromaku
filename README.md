@@ -1,19 +1,19 @@
-# koto
+# kuromaku
 
 Reproducible AI agent teams, defined in YAML, versioned in your repo.
 
 Define your team once, run it anywhere. No Python, no framework lock-in, no glue code.
 
 ```
-koto run review-pr id=67
+kuro run review-pr id=67
 ```
 
 ## What it does
 
-koto orchestrates AI agent teams through declarative YAML configurations. A **flow** is a process -- a reusable sequence of steps like "fetch, implement, review, ship". **Agents** are the people who execute those steps. **Rules** are shared knowledge injected into agent prompts. The same flow can run with different agent teams depending on the task.
+kuromaku orchestrates AI agent teams through declarative YAML configurations. A **flow** is a process -- a reusable sequence of steps like "fetch, implement, review, ship". **Agents** are the people who execute those steps. **Rules** are shared knowledge injected into agent prompts. The same flow can run with different agent teams depending on the task.
 
 ```
-.koto/
+.kuro/
   agents/
     Levi.yaml          # software architect
     Noah.yaml          # senior developer
@@ -30,10 +30,10 @@ koto orchestrates AI agent teams through declarative YAML configurations. A **fl
 
 ```bash
 # In your project directory
-mkdir -p .koto/agents .koto/flows .koto/rules
+mkdir -p .kuro/agents .kuro/flows .kuro/rules
 
 # Define an agent
-cat > .koto/agents/Reviewer.yaml << 'EOF'
+cat > .kuro/agents/Reviewer.yaml << 'EOF'
 name: Reviewer
 title: code reviewer
 role: |
@@ -43,7 +43,7 @@ rules: [go-developer]
 EOF
 
 # Define a flow with template variables
-cat > .koto/flows/review-pr.yaml << 'EOF'
+cat > .kuro/flows/review-pr.yaml << 'EOF'
 version: "1"
 name: review-pr
 prompt: |
@@ -56,26 +56,26 @@ flow:
 EOF
 
 # Run it
-koto run review-pr id=67
+kuro run review-pr id=67
 ```
 
 ## Key concepts
 
-**Agents** are YAML files in `.koto/agents/`. Each agent has a name, title, role (system prompt), and references to shared rules. Agents can use different models and backends.
+**Agents** are YAML files in `.kuro/agents/`. Each agent has a name, title, role (system prompt), and references to shared rules. Agents can use different models and backends.
 
-**Flows** are YAML files in `.koto/flows/`. A flow defines steps as a map -- keys are step names, values configure which agent runs and what context they receive from prior steps.
+**Flows** are YAML files in `.kuro/flows/`. A flow defines steps as a map -- keys are step names, values configure which agent runs and what context they receive from prior steps.
 
-**Rules** are Markdown files in `.koto/rules/`. Multiple agents can reference the same rules. Rules are composed into the system prompt at runtime: Guide > Rules > Skills > Role.
+**Rules** are Markdown files in `.kuro/rules/`. Multiple agents can reference the same rules. Rules are composed into the system prompt at runtime: Guide > Rules > Skills > Role.
 
-**Stack** is where outputs land. Each step writes its result to `~/.koto/stacks/<project>/`. Results from earlier steps are injected as context into later steps.
+**Stack** is where outputs land. Each step writes its result to `~/.kuro/stacks/<project>/`. Results from earlier steps are injected as context into later steps.
 
 **Template variables** allow flows to define reusable prompts with `{{key}}` placeholders, filled via `key=value` CLI arguments.
 
 ## How it compares
 
-koto takes a fundamentally different approach from Python-based agent frameworks.
+kuromaku takes a fundamentally different approach from Python-based agent frameworks.
 
-|  | koto | CrewAI | LangGraph | AutoGen |
+|  | kuromaku | CrewAI | LangGraph | AutoGen |
 |---|---|---|---|---|
 | Configuration | YAML only | Python + YAML | Python only | Python only |
 | User code required | No | Yes | Yes | Yes |
@@ -91,7 +91,7 @@ koto takes a fundamentally different approach from Python-based agent frameworks
 
 **No framework lock-in.** Your team definition is YAML. Tomorrow a better LLM CLI appears -- you change one line in the agent file. No Python class hierarchies to refactor, no decorators to update, no dependency chains to untangle.
 
-**Repo-native by design.** `.koto/` lives next to your code. Agents, rules, and flows are versioned, diffable, and reviewable in PRs. Anyone on the team can read the YAML and understand what the AI agents do -- no Python knowledge required.
+**Repo-native by design.** `.kuro/` lives next to your code. Agents, rules, and flows are versioned, diffable, and reviewable in PRs. Anyone on the team can read the YAML and understand what the AI agents do -- no Python knowledge required.
 
 **Composable knowledge.** Rules are Markdown files that multiple agents share. A `go-developer.md` rule works for your architect, your developer, and your reviewer. Change it once, every agent picks it up. In other frameworks, you duplicate instructions across agent backstories.
 
@@ -108,6 +108,8 @@ just build
 cargo build --release
 ```
 
+This produces the `kuro` binary.
+
 ## Status
 
-Early development. The core flow engine works: sequential step execution, context injection between steps, template variables, persistent stack output. See the [issues](https://github.com/charemma/koto/issues) for the roadmap.
+Early development. The core flow engine works: sequential step execution, context injection between steps, template variables, persistent stack output. See the [issues](https://github.com/nestrai/kuromaku/issues) for the roadmap.
