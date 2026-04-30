@@ -136,6 +136,29 @@ pub enum RunError {
 
     #[error("skill error: {0}")]
     Skill(#[from] skills::SkillsError),
+
+    /// A conversation step (#170) referenced a backend other than
+    /// `claude-cli`. Other backends do not yet implement the [`Transport`]
+    /// trait, so the Router cannot drive them. Surfaced explicitly rather
+    /// than silently falling back to the executor path because the user's
+    /// agent file is what would need to change.
+    #[error(
+        "step '{step}' is a conversation but agent '{agent}' uses backend '{backend:?}' -- only claude-cli is supported for conversation steps"
+    )]
+    ConversationUnsupportedBackend {
+        step: String,
+        agent: String,
+        backend: Backend,
+    },
+
+    /// Spawning a participant transport failed (process did not start, pipes
+    /// could not be captured, etc).
+    #[error("step '{step}' failed to spawn agent '{agent}': {source}")]
+    ConversationSpawn {
+        step: String,
+        agent: String,
+        source: executor::transport::TransportError,
+    },
 }
 
 /// Result of running a single step, used for the summary table and the run
@@ -616,6 +639,265 @@ async fn run_shell_step(
     })
 }
 
+/// Run a `type: conversation` step (issue #170).
+///
+/// Spawns one [`StreamJsonTransport`](executor::transport::StreamJsonTransport)
+/// per participant, hands them to a [`Router`](crate::messaging::router::Router),
+/// and drives the conversation with the assembled task as the initial
+/// broadcast prompt. The router's log entries are collected synchronously
+/// through an `Arc<Mutex<...>>`; once the router terminates we render them
+/// to a markdown transcript via [`render_transcript`] and persist that as the
+/// step's output file.
+///
+/// Limitations:
+///
+/// * Only the `claude-cli` backend is supported. The other backends (`api`,
+///   `codex`, `ollama`) do not have a [`Transport`](executor::transport::Transport)
+///   implementation. We refuse to start rather than silently falling back.
+/// * The step-level `model:` / `backend:` fields are rejected by the parser
+///   so the per-agent settings are the single source of truth here.
+async fn run_conversation_step(
+    step: &Step,
+    agent_map: &HashMap<&str, &Agent>,
+    ctx: &RunContext,
+    step_num: usize,
+    total: usize,
+) -> Result<StepRunResult, RunError> {
+    use std::sync::{Arc, Mutex};
+
+    use crate::messaging::router::{LogEntry, Router, RouterConfig};
+
+    // Resolve all participant agents up front -- a missing agent must fail
+    // before we spawn any transports, otherwise the user gets a partially
+    // started conversation that is hard to diagnose.
+    let participants: Vec<&Agent> = step
+        .agents
+        .iter()
+        .map(|id| {
+            agent_map
+                .get(id.as_str())
+                .copied()
+                .ok_or_else(|| RunError::UnknownAgent {
+                    step: step.id.clone(),
+                    agent: id.clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Backend gate: only claude-cli has a Transport. We check before
+    // spawning so we never end up with half a conversation alive.
+    for agent in &participants {
+        if agent.backend != Backend::ClaudeCli {
+            return Err(RunError::ConversationUnsupportedBackend {
+                step: step.id.clone(),
+                agent: agent.id.clone(),
+                backend: agent.backend,
+            });
+        }
+    }
+
+    let participant_names: Vec<String> = participants.iter().map(|a| a.id.clone()).collect();
+    ui::print_conversation_step_banner(step_num, total, &step.id, &participant_names, &step.input);
+
+    // Pre-compute the output path the same way agent steps do, so users can
+    // `tail -f` the transcript while the conversation runs. We don't stream
+    // partial rebuilds, but the path is announced for consistency.
+    let content_filename = llm_output_filename(step_num, &step.id);
+    let output_path = ctx
+        .run_path
+        .join(stack::STEPS_SUBDIR)
+        .join(&content_filename);
+    let output_file = format!(
+        "{}/{}/{}",
+        ctx.run_id,
+        stack::STEPS_SUBDIR,
+        content_filename
+    );
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    eprintln!(
+        "      output: {}",
+        output_path
+            .canonicalize()
+            .unwrap_or(output_path.clone())
+            .display()
+    );
+
+    // Build the seed prompt. The flow's task plus any `input:` outputs are
+    // funneled into the Router as the initial broadcast -- exactly the same
+    // semantics as agent steps, minus the per-step `task:` flavor. The
+    // conversation's `task:` (if any) is appended via build_user_prompt.
+    let seed_prompt = build_user_prompt(&ctx.task, step, &ctx.run_path)?;
+
+    // Configure the router. A missing turn_timeout falls back to the
+    // RouterConfig default (600s, see #169).
+    let mut router_cfg = RouterConfig::default();
+    if let Some(n) = step.max_turns {
+        router_cfg.max_turns = n;
+    }
+    if let Some(secs) = step.turn_timeout {
+        router_cfg.turn_timeout = std::time::Duration::from_secs(secs);
+    }
+
+    // Logger collects entries into a Vec we own. Arc<Mutex<...>> rather than
+    // an mpsc because we only need the entries after the router has
+    // terminated -- no streaming consumer.
+    let log: Arc<Mutex<Vec<LogEntry>>> = Arc::new(Mutex::new(Vec::new()));
+    let log_clone = Arc::clone(&log);
+    let logger = Arc::new(move |entry: LogEntry| {
+        if let Ok(mut v) = log_clone.lock() {
+            v.push(entry);
+        }
+    });
+
+    let mut router = Router::new(router_cfg, logger);
+
+    // Spawn each agent's transport and hand it to the router. If any spawn
+    // fails we abort -- partial setups would leak processes.
+    for agent in &participants {
+        let system_prompt =
+            build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
+        let cmd = executor::build_claude_interactive_command(&agent.model, Some(&system_prompt));
+        let transport = executor::transport::StreamJsonTransport::spawn(cmd)
+            .await
+            .map_err(|e| RunError::ConversationSpawn {
+                step: step.id.clone(),
+                agent: agent.id.clone(),
+                source: e,
+            })?;
+        router.add_agent(agent.id.clone(), transport);
+    }
+
+    let start = Instant::now();
+    let step_started_at = chrono::Utc::now();
+    let spinner = ui::start_spinner();
+    let termination = router.run(Some(&seed_prompt)).await;
+    spinner.stop();
+    let duration = start.elapsed();
+
+    // Drain the log under the mutex; the router task has terminated so no
+    // more writers exist.
+    let entries = log.lock().map(|v| v.clone()).unwrap_or_default();
+    let transcript = render_transcript(&entries, &termination, &participant_names);
+
+    let started_at = step_started_at.to_rfc3339();
+    let record = StepRecord {
+        step_id: step.id.clone(),
+        kind: "conversation".to_string(),
+        // No single agent for a conversation; leave None so the audit
+        // schema reflects "many agents" via the transcript itself.
+        agent: None,
+        model_requested: None,
+        model_actual: None,
+        // The participants all run on claude-cli (enforced above), but the
+        // step itself is a Router-driven dialogue, not a single CLI
+        // invocation. Use a distinct label so audit consumers can tell
+        // these apart from regular agent steps without parsing the kind
+        // field.
+        backend: "conversation".to_string(),
+        tokens_in: None,
+        tokens_out: None,
+        duration_ms: duration.as_millis(),
+        started_at,
+        exit_code: 0,
+        input_steps: step.input.clone(),
+        output_file: content_filename.clone(),
+    };
+    stack::write_run_step(&ctx.run_path, step_num, &record, &transcript).map_err(|e| {
+        RunError::Stack {
+            step: step.id.clone(),
+            source: e,
+        }
+    })?;
+
+    let display_path = output_path
+        .canonicalize()
+        .unwrap_or(output_path.clone())
+        .display()
+        .to_string();
+    ui::print_step_done(&format_duration(duration), "—", "—", &display_path);
+
+    Ok(StepRunResult {
+        step_id: step.id.clone(),
+        agent_name: participant_names.join(", "),
+        backend: "conversation".to_string(),
+        duration,
+        tokens_in: None,
+        tokens_out: None,
+        output_file,
+        print_output: step.print_output,
+        record,
+    })
+}
+
+/// Render a router log to a markdown transcript.
+///
+/// Pure function over the log entries so it is unit-testable without
+/// spawning processes. The transcript layout is intentionally simple:
+///
+/// * One `## <agent>` header per final inbound message.
+/// * Body text verbatim under the header.
+/// * Tool-use entries shown as a single italic line so audit consumers see
+///   the activity but transcripts stay readable.
+/// * Send failures appear inline as a fenced warning block.
+/// * The trailing line records the termination reason and participant set.
+///
+/// Partial fragments are deliberately skipped -- they are streaming deltas
+/// of text the same agent later emits as a final result, and including them
+/// would duplicate the body.
+fn render_transcript(
+    entries: &[crate::messaging::router::LogEntry],
+    termination: &crate::messaging::router::TerminationReason,
+    participants: &[String],
+) -> String {
+    use crate::messaging::router::{LogKind, MessageKind, Source};
+
+    let mut out = String::new();
+    out.push_str("# Conversation transcript\n\n");
+    out.push_str(&format!("Participants: {}\n\n", participants.join(", ")));
+
+    for entry in entries {
+        match &entry.kind {
+            LogKind::Inbound { content, message } => {
+                let speaker = match &entry.from {
+                    Source::Agent(id) => id.clone(),
+                    Source::Human => "human".to_string(),
+                    Source::Router => "router".to_string(),
+                };
+                match message {
+                    MessageKind::Final => {
+                        out.push_str(&format!("## {speaker}\n\n{}\n\n", content.trim_end()));
+                    }
+                    MessageKind::ToolUse { name } => {
+                        out.push_str(&format!("_{speaker} used tool: {name}_\n\n"));
+                    }
+                    MessageKind::Partial => {
+                        // Streaming partial -- the final result entry will
+                        // carry the canonical text. Skipping avoids
+                        // duplicate output in the transcript.
+                    }
+                }
+            }
+            LogKind::Outbound { .. } => {
+                // Outbound deliveries duplicate inbound text -- skip them
+                // in the transcript.
+            }
+            LogKind::SendFailed { to, error } => {
+                out.push_str(&format!(
+                    "```\nwarning: failed to deliver to {to}: {error}\n```\n\n"
+                ));
+            }
+            LogKind::Termination { .. } => {
+                // Rendered explicitly below so it is always the last line.
+            }
+        }
+    }
+
+    out.push_str(&format!("---\nTermination: {termination:?}\n"));
+    out
+}
+
 /// Run steps sequentially in topological order.
 pub async fn run_steps(
     steps: &[&Step],
@@ -643,6 +925,14 @@ pub async fn run_steps(
         if step.is_shell() {
             let result =
                 run_shell_step(executor.as_ref(), step, ctx, i + 1, total, &results).await?;
+            results.push(result);
+            continue;
+        }
+
+        // Conversation steps (issue #170) drive multiple agents through the
+        // messaging Router instead of a single agent's executor invocation.
+        if step.is_conversation() {
+            let result = run_conversation_step(step, &agent_map, ctx, i + 1, total).await?;
             results.push(result);
             continue;
         }
@@ -1214,6 +1504,9 @@ mod tests {
             backend: None,
             print_output: false,
             post_comment: None,
+            agents: Vec::new(),
+            max_turns: None,
+            turn_timeout: None,
         }
     }
 
@@ -1360,6 +1653,9 @@ mod tests {
             backend: None,
             print_output: false,
             post_comment: None,
+            agents: Vec::new(),
+            max_turns: None,
+            turn_timeout: None,
         };
 
         let prompt = build_user_prompt("Top-level task", &downstream, &ctx.run_path).unwrap();

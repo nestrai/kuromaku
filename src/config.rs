@@ -116,6 +116,14 @@ pub struct RawDefaults {
 /// A step in the flow map. The key in the map is the step ID.
 #[derive(Debug, Deserialize)]
 pub struct RawStep {
+    /// Step discriminator. Currently the only value the parser acts on is
+    /// `"conversation"` (issue #170). Absent or `"agent"`/`"shell"` falls
+    /// back to the existing implicit kind detection (`agent:` -> LLM,
+    /// `run:` -> shell). Kept as a free-form string so a future schema
+    /// version can add types without a breaking enum migration; unknown
+    /// values trigger a validation error so typos surface early.
+    #[serde(rename = "type")]
+    pub step_type: Option<String>,
     pub agent: Option<String>,
     pub role: Option<String>,
     pub task: Option<String>,
@@ -123,6 +131,17 @@ pub struct RawStep {
     /// set, the step is a shell step: `agent`, `role`, `task`, `model`, and
     /// `backend` must not be set. stdout is captured as the step output.
     pub run: Option<String>,
+    /// Conversation-step participants (issue #170). Used together with
+    /// `type: conversation`. Each entry is an agent ID resolved via the
+    /// seeds cascade, same as `agent:` and `role:`.
+    #[serde(default)]
+    pub agents: Vec<String>,
+    /// Conversation-step hard cap on total agent turns across the
+    /// conversation. Required when `type: conversation`.
+    pub max_turns: Option<usize>,
+    /// Conversation-step idle timeout in seconds. Defaults to 600 (issue
+    /// #169 RouterConfig default).
+    pub turn_timeout: Option<u64>,
     #[serde(default)]
     pub input: Vec<String>,
     #[serde(default)]
@@ -204,8 +223,9 @@ pub struct Agent {
 pub struct Step {
     pub id: String,
     /// Agent ID for LLM-backed steps. Empty string for shell steps (where
-    /// `run` is `Some`). Use [`Step::is_shell`] to discriminate; never
-    /// assume non-empty.
+    /// `run` is `Some`) and conversation steps (where `agents` is
+    /// non-empty). Use [`Step::is_shell`] / [`Step::is_conversation`] to
+    /// discriminate; never assume non-empty.
     pub agent: String,
     /// Role name when the step uses `role:` instead of a direct `agent:`.
     /// `None` for direct agent assignment or shell steps. Drives the role
@@ -223,12 +243,30 @@ pub struct Step {
     pub backend: Option<Backend>,
     pub print_output: bool,
     pub post_comment: Option<PostCommentTarget>,
+    /// Conversation-step participants (issue #170). Non-empty only when the
+    /// step is a conversation step. The runner spawns one transport per
+    /// participant and routes messages through the messaging Router.
+    pub agents: Vec<String>,
+    /// Conversation-step hard cap on total turns. Required and `> 0` for
+    /// conversation steps; `None` otherwise.
+    pub max_turns: Option<usize>,
+    /// Conversation-step idle timeout in seconds. `None` means "use the
+    /// Router default" (currently 600s -- see RouterConfig).
+    pub turn_timeout: Option<u64>,
 }
 
 impl Step {
     /// True when this step is a shell step (has `run:` instead of `agent:`).
     pub fn is_shell(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// True when this step is a multi-agent conversation step (issue #170).
+    /// Detected by a non-empty `agents:` list -- validation in
+    /// [`validate_and_resolve`] guarantees the list is only populated when
+    /// `type: conversation` was specified.
+    pub fn is_conversation(&self) -> bool {
+        !self.agents.is_empty()
     }
 }
 
@@ -439,6 +477,23 @@ pub fn load_agents_for_flow_with_seeds(
         if step.is_shell() {
             continue;
         }
+        // Conversation steps (issue #170) carry their participants in
+        // `agents:` instead of the singular `agent:` field. Iterate the
+        // list and dedupe via the same `seen` set so an agent that
+        // appears in both an agent step and a conversation step is loaded
+        // exactly once.
+        if step.is_conversation() {
+            for agent_id in &step.agents {
+                if seen.insert(agent_id.clone()) {
+                    let (agent, seed_idx, sha) =
+                        load_agent_file_with_seeds(seeds, agent_id, &config.defaults, koto_config)?;
+                    origins.insert(agent.id.clone(), seed_idx);
+                    hashes.insert(agent.id.clone(), sha);
+                    agents.push(agent);
+                }
+            }
+            continue;
+        }
         if seen.insert(step.agent.clone()) {
             let (agent, seed_idx, sha) =
                 load_agent_file_with_seeds(seeds, &step.agent, &config.defaults, koto_config)?;
@@ -539,6 +594,51 @@ fn validate_and_resolve(
         .flow
         .into_iter()
         .map(|(id, s)| {
+            // Conversation step (issue #170) is selected by `type:
+            // conversation`. We dispatch on it BEFORE the
+            // agent/role/run/conversation kind check so the error messages
+            // can be tailored to the step kind ("conversation step needs
+            // `agents:`" beats a generic "must specify one of agent, role,
+            // run").
+            //
+            // Unknown `type:` values are rejected up front so a typo
+            // surfaces here, not as a silent fallback to LLM mode.
+            if let Some(ref t) = s.step_type {
+                match t.as_str() {
+                    "conversation" => {
+                        return resolve_conversation_step(id, s);
+                    }
+                    "agent" | "shell" => {
+                        // Explicit aliases for the implicit kinds. Fall
+                        // through to the agent/role/run logic below.
+                    }
+                    other => {
+                        return Err(ConfigError::Validation(format!(
+                            "step '{id}' has unknown type '{other}' -- expected 'agent', 'shell', or 'conversation'"
+                        )));
+                    }
+                }
+            }
+
+            // Conversation-only fields used outside a conversation step are
+            // always a config error -- they would otherwise be silently
+            // dropped.
+            if !s.agents.is_empty() {
+                return Err(ConfigError::Validation(format!(
+                    "step '{id}' sets 'agents:' but is not a conversation step -- add 'type: conversation'"
+                )));
+            }
+            if s.max_turns.is_some() {
+                return Err(ConfigError::Validation(format!(
+                    "step '{id}' sets 'max_turns:' but is not a conversation step -- add 'type: conversation'"
+                )));
+            }
+            if s.turn_timeout.is_some() {
+                return Err(ConfigError::Validation(format!(
+                    "step '{id}' sets 'turn_timeout:' but is not a conversation step -- add 'type: conversation'"
+                )));
+            }
+
             // Exactly one of `agent`, `role`, `run` must be set. Listing each
             // present field in the error makes the conflict obvious instead of
             // forcing the user to guess which two collided.
@@ -607,6 +707,9 @@ fn validate_and_resolve(
                     backend: None,
                     print_output: s.print_output,
                     post_comment: s.post_comment,
+                    agents: Vec::new(),
+                    max_turns: None,
+                    turn_timeout: None,
                 });
             }
 
@@ -624,6 +727,9 @@ fn validate_and_resolve(
                     backend: s.backend,
                     print_output: s.print_output,
                     post_comment: s.post_comment,
+                    agents: Vec::new(),
+                    max_turns: None,
+                    turn_timeout: None,
                 });
             }
 
@@ -663,6 +769,9 @@ fn validate_and_resolve(
                 backend: s.backend,
                 print_output: s.print_output,
                 post_comment: s.post_comment,
+                agents: Vec::new(),
+                max_turns: None,
+                turn_timeout: None,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -688,6 +797,114 @@ fn validate_and_resolve(
         roles: resolved_roles,
         steps,
         stack,
+    })
+}
+
+/// Resolve a `type: conversation` step (issue #170).
+///
+/// A conversation step uses the messaging Router to drive a multi-agent
+/// dialogue. Validation rules:
+///
+/// * `agents:` must contain at least 2 entries (a "conversation" with one
+///   participant is just an agent step).
+/// * Duplicate agent IDs are rejected -- the Router uses the agent ID as a
+///   routing key, so duplicates would conflict.
+/// * `max_turns:` must be present and `> 0`. The default is intentionally
+///   not provided here: the user must make the cap explicit because
+///   conversations can otherwise burn budget unchecked.
+/// * `agent:`, `role:`, and `run:` must not be set -- the participant list
+///   lives in `agents:`.
+/// * `model:` and `backend:` on the step itself are also rejected: each
+///   participant is configured by its own agent file. Allowing a
+///   step-level override would be ambiguous (does it apply to all
+///   participants, only the first, etc).
+///
+/// `task:` is allowed and becomes the Router's initial broadcast prompt.
+/// `input:` continues to work as ordering edges; the runner injects upstream
+/// outputs into the broadcast prompt the same way it does for agent steps.
+fn resolve_conversation_step(id: String, s: RawStep) -> Result<Step, ConfigError> {
+    if s.agent.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "conversation step '{id}' must not set 'agent:' -- use 'agents:' to list participants"
+        )));
+    }
+    if s.role.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "conversation step '{id}' must not set 'role:' -- use 'agents:' to list participants"
+        )));
+    }
+    if s.run.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "conversation step '{id}' must not set 'run:' -- conversation steps drive an LLM dialogue, not a shell command"
+        )));
+    }
+    if s.model.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "conversation step '{id}' must not set 'model:' -- model is configured per agent in agents/<Name>.yaml"
+        )));
+    }
+    if s.backend.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "conversation step '{id}' must not set 'backend:' -- backend is configured per agent in agents/<Name>.yaml"
+        )));
+    }
+    if s.agents.len() < 2 {
+        return Err(ConfigError::Validation(format!(
+            "conversation step '{id}' requires at least 2 entries in 'agents:' (got {})",
+            s.agents.len()
+        )));
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    for a in &s.agents {
+        if a.trim().is_empty() {
+            return Err(ConfigError::Validation(format!(
+                "conversation step '{id}' has an empty agent ID in 'agents:'"
+            )));
+        }
+        if !seen.insert(a.as_str()) {
+            return Err(ConfigError::Validation(format!(
+                "conversation step '{id}' lists agent '{a}' more than once -- each participant must be unique"
+            )));
+        }
+    }
+    let max_turns = match s.max_turns {
+        Some(n) if n > 0 => n,
+        Some(_) => {
+            return Err(ConfigError::Validation(format!(
+                "conversation step '{id}' has 'max_turns: 0' -- must be > 0"
+            )));
+        }
+        None => {
+            return Err(ConfigError::Validation(format!(
+                "conversation step '{id}' must specify 'max_turns:' (the per-conversation turn cap)"
+            )));
+        }
+    };
+
+    // Merge `input:` into `needs` -- same edge semantics as agent/shell
+    // steps.
+    let mut needs: Vec<String> = s.needs.clone();
+    for input_dep in &s.input {
+        if !needs.contains(input_dep) {
+            needs.push(input_dep.clone());
+        }
+    }
+
+    Ok(Step {
+        id,
+        agent: String::new(),
+        role: None,
+        task: s.task,
+        run: None,
+        input: s.input,
+        needs,
+        model: None,
+        backend: None,
+        print_output: s.print_output,
+        post_comment: s.post_comment,
+        agents: s.agents,
+        max_turns: Some(max_turns),
+        turn_timeout: s.turn_timeout,
     })
 }
 

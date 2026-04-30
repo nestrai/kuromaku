@@ -193,6 +193,9 @@ flow:
                 backend: None,
                 print_output: false,
                 post_comment: None,
+                agents: Vec::new(),
+                max_turns: None,
+                turn_timeout: None,
             }],
             stack: crate::config::StackConfig {
                 backend: "local".to_string(),
