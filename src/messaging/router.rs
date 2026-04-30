@@ -74,6 +74,25 @@ pub enum Source {
     Router,
 }
 
+/// Stable string form, distinct from `Debug`. Audit transcripts render the
+/// source via `Display` so the on-disk identifier (`"user"` for the human,
+/// agent id verbatim, `"router"` for the router) stays frozen even if the
+/// in-source variant names change. Same rationale as
+/// [`TerminationReason::Display`].
+///
+/// Acceptance (#171): human messages in the audit log identify their origin
+/// as `"user"`. Centralised here so persistence consumers (#170 and later)
+/// pick up a single canonical mapping.
+impl std::fmt::Display for Source {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Source::Agent(id) => f.write_str(id),
+            Source::Human => f.write_str("user"),
+            Source::Router => f.write_str("router"),
+        }
+    }
+}
+
 /// Stable classification of an inbound message, decoupled from the
 /// executor's wire format.
 ///
@@ -537,6 +556,17 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
+
+    /// Acceptance (#171): the audit log renders human input with
+    /// `from: "user"`. The transcript and #170 persistence both go through
+    /// `Source::Display`, so pinning the strings here pins the on-disk
+    /// identifier across renames.
+    #[test]
+    fn source_display_is_stable() {
+        assert_eq!(format!("{}", Source::Human), "user");
+        assert_eq!(format!("{}", Source::Router), "router");
+        assert_eq!(format!("{}", Source::Agent("Levi".into())), "Levi");
+    }
 
     /// The audit transcript (#170) renders termination via Display, not
     /// Debug. Lock the strings down so a future variant rename triggers a

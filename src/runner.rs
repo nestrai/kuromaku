@@ -640,6 +640,63 @@ async fn run_shell_step(
     })
 }
 
+/// Spawn a background task that reads lines from `reader` and forwards them
+/// on the returned mpsc receiver. Empty / whitespace-only lines are skipped
+/// so a stray Enter does not inject a no-op message into the conversation.
+/// EOF on the reader drops the sender, which makes the router terminate
+/// with [`TerminationReason::HumanClosed`].
+///
+/// Generic over `R: AsyncBufRead` so tests can drive it from a `Cursor`
+/// without spawning a TTY. Production callers use [`spawn_stdin_human_reader`]
+/// which wires this up to `tokio::io::stdin()` after a TTY check.
+///
+/// Issue #171 (stdin fallback): the conversation step attaches this reader
+/// to [`Router::set_human_input`] when running interactively.
+fn spawn_line_reader<R>(reader: R) -> tokio::sync::mpsc::Receiver<String>
+where
+    R: tokio::io::AsyncBufRead + Send + Unpin + 'static,
+{
+    use tokio::io::AsyncBufReadExt;
+
+    // Bounded channel: 8 is plenty for a human typing speed, and prevents
+    // a runaway producer (shouldn't happen with stdin, but bounded is the
+    // safe default).
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(8);
+    tokio::spawn(async move {
+        let mut lines = reader.lines();
+        // EOF (Ctrl-D) or a read error ends the human session: the loop
+        // exits, `tx` drops, and the channel close signals the router to
+        // stop waiting for input.
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if tx.send(trimmed.to_string()).await.is_err() {
+                // Router dropped the receiver (run terminated).
+                break;
+            }
+        }
+    });
+    rx
+}
+
+/// Spawn the stdin-based human input reader for `kuro run` -- but only when
+/// stdin is connected to a terminal. If stdin is piped or redirected, return
+/// `None` so the conversation step does not accidentally consume pipeline
+/// data as human messages (e.g. in CI).
+///
+/// Acceptance #171: human can type messages on stdin during a conversation
+/// when running interactively.
+fn spawn_stdin_human_reader() -> Option<tokio::sync::mpsc::Receiver<String>> {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    Some(spawn_line_reader(stdin))
+}
+
 /// Run a `type: conversation` step (issue #170).
 ///
 /// Spawns one [`StreamJsonTransport`](executor::transport::StreamJsonTransport)
@@ -753,6 +810,17 @@ async fn run_conversation_step(
     });
 
     let mut router = Router::new(router_cfg, logger);
+
+    // Attach stdin for human-in-the-loop injection (#171). Only when stdin
+    // is a TTY: piped/redirected stdin is left alone so scripted runs
+    // (CI, `kuro run < file`) do not have pipeline data interpreted as
+    // human messages. The line reader runs as a tokio task; it terminates
+    // on EOF (Ctrl-D), which closes the channel and stops the router with
+    // HumanClosed.
+    if let Some(rx) = spawn_stdin_human_reader() {
+        eprintln!("      human input: type a message and press Enter to inject; Ctrl-D to end");
+        router.set_human_input(rx);
+    }
 
     // Spawn each agent's transport and hand it to the router. If any spawn
     // fails we abort -- partial setups would leak processes.
@@ -868,7 +936,7 @@ fn render_transcript(
     termination: &crate::messaging::router::TerminationReason,
     participants: &[String],
 ) -> String {
-    use crate::messaging::router::{LogKind, MessageKind, Source};
+    use crate::messaging::router::{LogKind, MessageKind};
 
     let mut out = String::new();
     out.push_str("# Conversation transcript\n\n");
@@ -877,11 +945,11 @@ fn render_transcript(
     for entry in entries {
         match &entry.kind {
             LogKind::Inbound { content, message } => {
-                let speaker = match &entry.from {
-                    Source::Agent(id) => id.clone(),
-                    Source::Human => "human".to_string(),
-                    Source::Router => "router".to_string(),
-                };
+                // Use `Source::Display`, which is the stable on-disk
+                // identifier (`"user"` for the human, agent id for agents,
+                // `"router"` for router-internal entries). Acceptance #171:
+                // human messages must carry `from: "user"` in the audit log.
+                let speaker = entry.from.to_string();
                 match message {
                     MessageKind::Final => {
                         out.push_str(&format!("## {speaker}\n\n{}\n\n", content.trim_end()));
@@ -2067,6 +2135,83 @@ mod tests {
         assert!(
             out.contains("failed to deliver to Mika") && out.contains("transport closed"),
             "send-failure must surface in transcript: {out}"
+        );
+    }
+
+    // --- Human input (issue #171) ---
+
+    /// Acceptance #171: human messages appear in the transcript with the
+    /// `from: "user"` identifier (not `"human"` or any other label). The
+    /// mapping flows through `Source::Display`, so this test pins the
+    /// rendered string in the audit log.
+    #[test]
+    fn render_transcript_renders_human_as_user() {
+        use crate::messaging::router::{LogEntry, LogKind, MessageKind, Source, TerminationReason};
+
+        let entries = vec![LogEntry {
+            from: Source::Human,
+            kind: LogKind::Inbound {
+                content: "focus on tests".to_string(),
+                message: MessageKind::Final,
+            },
+        }];
+        let participants = vec!["Levi".to_string()];
+
+        let out = render_transcript(&entries, &TerminationReason::HumanClosed, &participants);
+
+        assert!(
+            out.contains("## user\n"),
+            "human input must render under `## user` heading: {out}"
+        );
+        assert!(out.contains("focus on tests"));
+        assert!(
+            !out.contains("## human\n"),
+            "transcript must not use the legacy `human` label: {out}"
+        );
+    }
+
+    /// Sanity for the test helper: a sequence of lines arrives on the
+    /// receiver in order, EOF closes the channel.
+    #[tokio::test]
+    async fn spawn_line_reader_forwards_lines() {
+        let input = b"hello\nworld\n".to_vec();
+        let mut rx = spawn_line_reader(std::io::Cursor::new(input));
+
+        assert_eq!(rx.recv().await.as_deref(), Some("hello"));
+        assert_eq!(rx.recv().await.as_deref(), Some("world"));
+        // EOF: sender drops, channel closes.
+        assert!(rx.recv().await.is_none(), "EOF must close the channel");
+    }
+
+    /// Empty / whitespace-only lines must not surface as messages -- they
+    /// would inject zero-information content into the conversation and
+    /// confuse agents. A stray Enter is the most likely cause.
+    #[tokio::test]
+    async fn spawn_line_reader_skips_empty_lines() {
+        let input = b"\n   \n\t\nfirst\n\nsecond\n".to_vec();
+        let mut rx = spawn_line_reader(std::io::Cursor::new(input));
+
+        assert_eq!(rx.recv().await.as_deref(), Some("first"));
+        assert_eq!(rx.recv().await.as_deref(), Some("second"));
+        assert!(rx.recv().await.is_none());
+    }
+
+    /// EOF must drop the sender so `Router::run` can exit with
+    /// `TerminationReason::HumanClosed` instead of hanging waiting for more
+    /// input. This wires the line reader's contract to the router's
+    /// termination logic without spawning the router itself.
+    #[tokio::test]
+    async fn spawn_line_reader_closes_channel_on_eof() {
+        let input = b"only line\n".to_vec();
+        let mut rx = spawn_line_reader(std::io::Cursor::new(input));
+
+        // Drain the message.
+        assert_eq!(rx.recv().await.as_deref(), Some("only line"));
+        // Next recv returns None: closed channel signals HumanClosed to the
+        // router.
+        assert!(
+            rx.recv().await.is_none(),
+            "channel must close on EOF so the router can terminate cleanly"
         );
     }
 }
