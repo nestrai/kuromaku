@@ -50,7 +50,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::executor::stream_json::Fragment;
-use crate::executor::transport::{Transport, TransportError, TransportEvent};
+use crate::executor::transport::{Transport, TransportEvent};
 
 /// Stable identifier for an agent participating in the conversation.
 ///
@@ -58,18 +58,6 @@ use crate::executor::transport::{Transport, TransportError, TransportEvent};
 /// agents by name (`developer`, `reviewer`), and translating to and from
 /// indexes at the boundary just adds noise.
 pub type AgentId = String;
-
-// --- Errors ---
-
-#[derive(Debug, thiserror::Error)]
-pub enum RouterError {
-    #[error("transport error for agent {agent}: {source}")]
-    Transport {
-        agent: AgentId,
-        #[source]
-        source: TransportError,
-    },
-}
 
 // --- Logging ---
 
@@ -219,7 +207,7 @@ impl<T: Transport + 'static> Router<T> {
     ///
     /// Consumes `self`: a router cannot be reused after run because reader
     /// tasks have already attached to the transports' recv halves.
-    pub async fn run(self, initial_prompt: Option<&str>) -> Result<TerminationReason, RouterError> {
+    pub async fn run(self, initial_prompt: Option<&str>) -> TerminationReason {
         let Self {
             agents,
             mut human_input,
@@ -270,7 +258,7 @@ impl<T: Transport + 'static> Router<T> {
 
         // Initial seed.
         if let Some(prompt) = initial_prompt {
-            broadcast(&agents, &logger, prompt, None).await?;
+            broadcast(&agents, &logger, prompt, None).await;
         }
 
         let mut turn_count: usize = 0;
@@ -311,7 +299,7 @@ impl<T: Transport + 'static> Router<T> {
                         // happen even though the loop exits afterwards;
                         // that is the correct trade-off for a "every
                         // message gets delivered" router.
-                        broadcast(&agents, &logger, text, Some(&from)).await?;
+                        broadcast(&agents, &logger, text, Some(&from)).await;
 
                         // max_turns is the hard cap; check it before
                         // convergence so it always dominates.
@@ -352,7 +340,7 @@ impl<T: Transport + 'static> Router<T> {
                     // last-result map so convergence requires every agent
                     // to respond again before terminating.
                     last_result.clear();
-                    broadcast(&agents, &logger, &content, None).await?;
+                    broadcast(&agents, &logger, &content, None).await;
                 }
             }
         };
@@ -373,7 +361,7 @@ impl<T: Transport + 'static> Router<T> {
             let _ = handle.await;
         }
 
-        Ok(reason)
+        reason
     }
 }
 
@@ -387,7 +375,7 @@ async fn broadcast<T: Transport>(
     logger: &Logger,
     content: &str,
     except: Option<&str>,
-) -> Result<(), RouterError> {
+) {
     for agent in agents {
         if Some(agent.id.as_str()) == except {
             continue;
@@ -419,7 +407,6 @@ async fn broadcast<T: Transport>(
             }
         }
     }
-    Ok(())
 }
 
 fn log(logger: &Logger, entry: LogEntry) {
@@ -442,6 +429,7 @@ fn fragment_text(fragment: &Fragment) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::executor::transport::TransportError;
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
     use tokio::sync::Mutex as TokioMutex;
@@ -544,7 +532,7 @@ mod tests {
         // Agent A speaks; nothing from B and C, so they only ever receive.
         h_a.push(Fragment::Result("hello from A".to_string()));
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(reason, TerminationReason::MaxTurns);
 
         assert_eq!(
@@ -585,7 +573,7 @@ mod tests {
         h_a.push(Fragment::Result("gamma".to_string()));
         h_b.push(Fragment::Result("delta".to_string()));
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(reason, TerminationReason::MaxTurns);
     }
 
@@ -611,7 +599,7 @@ mod tests {
         h_b.push(Fragment::Result("DONE".to_string()));
         h_c.push(Fragment::Result("DONE".to_string()));
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(reason, TerminationReason::Convergence);
     }
 
@@ -639,7 +627,7 @@ mod tests {
         h_b.push(Fragment::Result("DONE".to_string()));
         // Note: h_c is silent.
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(
             reason,
             TerminationReason::MaxTurns,
@@ -665,7 +653,7 @@ mod tests {
         router.add_agent("a", mt_a);
 
         let start = std::time::Instant::now();
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         let elapsed = start.elapsed();
 
         assert_eq!(reason, TerminationReason::Timeout);
@@ -694,7 +682,7 @@ mod tests {
 
         h_a.push(Fragment::Result("hello".to_string()));
 
-        let reason = router.run(Some("kickoff")).await.unwrap();
+        let reason = router.run(Some("kickoff")).await;
         assert_eq!(reason, TerminationReason::MaxTurns);
 
         let log = entries.lock().unwrap().clone();
@@ -767,7 +755,7 @@ mod tests {
             drop(human_tx);
         });
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(reason, TerminationReason::HumanClosed);
 
         // Both agents received the human message.
@@ -825,7 +813,7 @@ mod tests {
             drop(human_tx);
         });
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(
             reason,
             TerminationReason::Timeout,
@@ -861,7 +849,7 @@ mod tests {
             name: "Read".to_string(),
         });
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(
             reason,
             TerminationReason::Timeout,
@@ -888,7 +876,7 @@ mod tests {
 
         h_a.push(Fragment::Result("ok".into()));
 
-        let reason = router.run(None).await.unwrap();
+        let reason = router.run(None).await;
         assert_eq!(reason, TerminationReason::MaxTurns);
         h_a.close();
     }
