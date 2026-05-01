@@ -986,6 +986,7 @@ dependencies = [
  "color-eyre",
  "crossterm 0.28.1",
  "dirs",
+ "futures-util",
  "indexmap",
  "libc",
  "predicates",

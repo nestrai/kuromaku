@@ -33,6 +33,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 libc = "0.2"
+# futures-util pulls in `FuturesUnordered`, used by the MCP server to
+# dispatch JSON-RPC frames concurrently without requiring a `'static`
+# bound on the writer (which would break the in-memory test setup).
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

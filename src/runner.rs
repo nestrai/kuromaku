@@ -655,6 +655,13 @@ async fn run_shell_step(
 ///
 /// Issue #171 (stdin fallback): the conversation step attaches this reader
 /// to [`Router::set_human_input`] when running interactively.
+///
+/// Currently only the unit tests exercise this directly; production code
+/// goes through [`spawn_stdin_to_accessor`], which wraps the same channel
+/// model with the [`flow_api::RouterAccessor`] so MCP injections share
+/// the path. Kept as a focused helper (and tested) because it is the
+/// minimal building block for the production flow.
+#[allow(dead_code)]
 fn spawn_line_reader<R>(reader: R) -> tokio::sync::mpsc::Receiver<String>
 where
     R: tokio::io::AsyncBufRead + Send + Unpin + 'static,
@@ -684,20 +691,34 @@ where
     rx
 }
 
-/// Spawn the stdin-based human input reader for `kuro run` -- but only when
-/// stdin is connected to a terminal. If stdin is piped or redirected, return
-/// `None` so the conversation step does not accidentally consume pipeline
-/// data as human messages (e.g. in CI).
+/// Forward stdin lines into a [`flow_api::RouterAccessor`]. Counterpart to
+/// [`spawn_line_reader`] that funnels into the same human-input channel as
+/// the MCP `send_message` tool, so a conversation can take both at once.
 ///
-/// Acceptance #171: human can type messages on stdin during a conversation
-/// when running interactively.
-fn spawn_stdin_human_reader() -> Option<tokio::sync::mpsc::Receiver<String>> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() {
-        return None;
-    }
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    Some(spawn_line_reader(stdin))
+/// The task exits on stdin EOF (Ctrl-D), or as soon as the accessor's
+/// channel rejects a send (router has terminated). When this is the last
+/// alive sender, the router observes `HumanClosed` -- preserving the legacy
+/// "Ctrl-D ends the conversation" behavior from #171.
+fn spawn_stdin_to_accessor(accessor: flow_api::RouterAccessor) {
+    use tokio::io::AsyncBufReadExt;
+
+    tokio::spawn(async move {
+        let stdin = tokio::io::BufReader::new(tokio::io::stdin());
+        let mut lines = stdin.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if accessor
+                .inject_human_message(trimmed.to_string())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 }
 
 /// Run a `type: conversation` step (issue #170).
@@ -723,7 +744,9 @@ async fn run_conversation_step(
     ctx: &RunContext,
     step_num: usize,
     total: usize,
+    run_state: Option<std::sync::Arc<flow_api::RunState>>,
 ) -> Result<StepRunResult, RunError> {
+    use std::io::IsTerminal;
     use std::sync::{Arc, Mutex};
 
     use crate::messaging::audit::{MessageLogWriter, message_log_path};
@@ -851,15 +874,44 @@ async fn run_conversation_step(
 
     let mut router = Router::new(router_cfg, logger);
 
-    // Attach stdin for human-in-the-loop injection (#171). Only when stdin
-    // is a TTY: piped/redirected stdin is left alone so scripted runs
-    // (CI, `kuro run < file`) do not have pipeline data interpreted as
-    // human messages. The line reader runs as a tokio task; it terminates
-    // on EOF (Ctrl-D), which closes the channel and stops the router with
-    // HumanClosed.
-    if let Some(rx) = spawn_stdin_human_reader() {
-        eprintln!("      human input: type a message and press Enter to inject; Ctrl-D to end");
+    // Attach human-input sources to the router. Two senders feed the same
+    // mpsc channel (`Router::set_human_input` only stores one receiver):
+    //
+    // 1. The MCP `send_message` tool (#199) -- only when the conversation
+    //    runs under a `RunHandle` whose `state` slot we can publish to.
+    // 2. Stdin lines, but only when stdin is connected to a terminal.
+    //    Piped/redirected stdin is left alone so scripted runs (CI,
+    //    `kuro run < file`) do not have pipeline data interpreted as
+    //    human messages. On Ctrl-D the forwarder task exits, dropping its
+    //    sender clone; if it was the last alive sender, the router stops
+    //    with `HumanClosed` -- preserving the legacy interactive behavior.
+    //
+    // The accessor is created only when at least one source is wired up.
+    // Without any source, the router gets no human channel at all, so the
+    // human-input arm of the select stays pending forever (current
+    // behaviour for non-interactive runs).
+    let stdin_is_tty = std::io::stdin().is_terminal();
+    let need_human_channel = run_state.is_some() || stdin_is_tty;
+    if need_human_channel {
+        let (accessor, rx) = flow_api::RouterAccessor::new();
         router.set_human_input(rx);
+        if let Some(state) = &run_state {
+            // Publishing under the state slot is what `RunHandle::router`
+            // and `ActiveRouter::current` read; the MCP server snapshots
+            // through `ActiveRouter` to find the right conversation when
+            // dispatching `send_message`.
+            state.set_router(accessor.clone());
+        }
+        if stdin_is_tty {
+            eprintln!("      human input: type a message and press Enter to inject; Ctrl-D to end");
+            spawn_stdin_to_accessor(accessor.clone());
+        }
+        // Drop the local accessor: keeping it alive here would prevent the
+        // router from observing `HumanClosed` even after the last real
+        // source (stdin / state) drops its clone. The clones live in the
+        // forwarder task and the run state; both have well-defined drop
+        // points.
+        drop(accessor);
     }
 
     // Spawn each agent's transport and hand it to the router. If any spawn
@@ -883,6 +935,15 @@ async fn run_conversation_step(
     let spinner = ui::start_spinner();
     let termination = router.run(Some(&seed_prompt)).await;
     spinner.stop();
+    // The conversation has stopped; drop the published accessor so a
+    // concurrent observer (e.g. MCP `send_message`) reading the run state
+    // sees "no live conversation" instead of holding a stale, closed
+    // RouterAccessor. Doing this before any other post-run work means a
+    // racing `send_message` cannot land on a router that has already
+    // returned from `run`.
+    if let Some(state) = &run_state {
+        state.clear_router();
+    }
     let duration = start.elapsed();
 
     // Drain the log under the mutex; the router task has terminated so no
@@ -1068,6 +1129,25 @@ pub async fn run_steps(
     agents: &[Agent],
     ctx: &RunContext,
 ) -> Result<Vec<StepRunResult>, RunError> {
+    // Public, state-less entry point. Plain `kuro run` (and tests) drive the
+    // runner this way -- there is no `RunHandle` to publish a router on, so
+    // conversation steps fall back to "stdin only when TTY" behavior.
+    run_steps_with_state(steps, agents, ctx, None).await
+}
+
+/// Internal entry point that accepts the shared run-state slot a
+/// [`flow_api::RunHandle`] uses to publish its [`RouterAccessor`]. The MCP
+/// server (#199) drives the runner through this path so its `send_message`
+/// tool can reach the live router during a conversation step.
+///
+/// Kept private so the `pub(super)` `RunState` type does not leak into the
+/// crate's public surface.
+pub(crate) async fn run_steps_with_state(
+    steps: &[&Step],
+    agents: &[Agent],
+    ctx: &RunContext,
+    run_state: Option<std::sync::Arc<flow_api::RunState>>,
+) -> Result<Vec<StepRunResult>, RunError> {
     // Ensure the run directory layout (`steps/`, `messages/`) exists before
     // any step writes. main.rs `run_up` also calls this for the audit-write
     // ordering, but the task flow path doesn't, so we do it here too.
@@ -1096,7 +1176,12 @@ pub async fn run_steps(
         // Conversation steps (issue #170) drive multiple agents through the
         // messaging Router instead of a single agent's executor invocation.
         if step.is_conversation() {
-            let result = run_conversation_step(step, &agent_map, ctx, i + 1, total).await?;
+            // Pass the shared run state through so the conversation step can
+            // publish its `RouterAccessor` for external observers (MCP
+            // `send_message`, #199). Stateless callers pass `None`.
+            let state_clone = run_state.clone();
+            let result =
+                run_conversation_step(step, &agent_map, ctx, i + 1, total, state_clone).await?;
             results.push(result);
             continue;
         }
@@ -1384,7 +1469,7 @@ mod flow_api {
     use crate::stack::{self, Manifest, ResourceRecord, RoleResolution, SeedRecord};
     use crate::ui;
 
-    use super::{RunContext, StepRunResult, run_steps};
+    use super::{RunContext, StepRunResult, run_steps_with_state};
 
     /// Where to read the flow YAML from. The CLI partitions its `--file`
     /// flag into the explicit `File` arm; `Name` triggers a seed walk;
@@ -1464,8 +1549,14 @@ mod flow_api {
     /// Shared mutable state held jointly by the `RunHandle` and the
     /// spawned execution task. The handle reads `active_router` and writes
     /// `cancel`; the task does the inverse.
+    ///
+    /// Visibility is `pub(crate)` so the conversation step in
+    /// [`super::run_steps_with_state`] can call `set_router`/`clear_router`
+    /// without taking a dependency on the `RunHandle` itself. The struct is
+    /// not part of the crate's outward-facing API; external callers reach
+    /// the slot through [`ActiveRouter`] / [`RunHandle::router`].
     #[derive(Default)]
-    pub(super) struct RunState {
+    pub(crate) struct RunState {
         cancel: AtomicBool,
         active_router: Mutex<Option<RouterAccessor>>,
     }
@@ -1480,14 +1571,14 @@ mod flow_api {
         /// `None` between conversations so an external accessor reflects
         /// "no live conversation" honestly.
         #[allow(dead_code)]
-        pub(super) fn set_router(&self, accessor: RouterAccessor) {
+        pub(crate) fn set_router(&self, accessor: RouterAccessor) {
             if let Ok(mut guard) = self.active_router.lock() {
                 *guard = Some(accessor);
             }
         }
 
         #[allow(dead_code)]
-        pub(super) fn clear_router(&self) {
+        pub(crate) fn clear_router(&self) {
             if let Ok(mut guard) = self.active_router.lock() {
                 *guard = None;
             }
@@ -1519,7 +1610,6 @@ mod flow_api {
         /// `Router::set_human_input`; the accessor is published on the
         /// shared run state so external callers (MCP `send_message`) can
         /// inject messages while the conversation runs.
-        #[allow(dead_code)]
         pub(super) fn new() -> (Self, mpsc::Receiver<String>) {
             let (tx, rx) = mpsc::channel(16);
             (Self { sender: tx }, rx)
@@ -1546,6 +1636,27 @@ mod flow_api {
     pub enum RouterAccessorError {
         #[error("router channel closed -- conversation has terminated")]
         Closed,
+    }
+
+    /// Cloneable view onto a run's shared state, scoped to looking up the
+    /// live [`RouterAccessor`]. Distinct from [`RunHandle`] because the
+    /// handle owns the join future and `await_completion` consumes it; the
+    /// MCP `send_message` tool needs to read the live router after the
+    /// run-flow tool has already moved into `await_completion`.
+    ///
+    /// Returns `None` between conversation steps or before the first one
+    /// starts -- so a `send_message` call that arrives during a non-
+    /// conversation step honestly reports "no live conversation".
+    #[derive(Clone)]
+    pub struct ActiveRouter {
+        state: Arc<RunState>,
+    }
+
+    impl ActiveRouter {
+        /// Snapshot of the currently published accessor, if any.
+        pub fn current(&self) -> Option<RouterAccessor> {
+            self.state.snapshot_router()
+        }
     }
 
     /// Handle returned by [`execute_flow`]. Holds the join handle for the
@@ -1580,6 +1691,21 @@ mod flow_api {
         #[allow(dead_code)]
         pub fn router(&self) -> Option<RouterAccessor> {
             self.state.snapshot_router()
+        }
+
+        /// Cloneable handle that survives `await_completion`. Use it to
+        /// query the live [`RouterAccessor`] from another task while the
+        /// run is in progress -- needed because `await_completion` consumes
+        /// `self`, so callers cannot hold both the join handle and a
+        /// router-lookup at the same time without splitting them up first.
+        ///
+        /// Wired to the MCP `send_message` tool (#199): the server stores
+        /// one [`ActiveRouter`] per active run in its session state and
+        /// resolves the live accessor on each call.
+        pub fn active_router(&self) -> ActiveRouter {
+            ActiveRouter {
+                state: Arc::clone(&self.state),
+            }
         }
 
         /// Request cancellation. Best-effort: the flag is currently only
@@ -2412,7 +2538,10 @@ mod flow_api {
             })
             .collect();
 
-        let results = run_steps(&steps, &agents, &ctx).await?;
+        // Pass `state` through so the conversation step can publish its
+        // `RouterAccessor` for `RunHandle::router` / `ActiveRouter::current`
+        // (#199 dependency on the #209 wiring).
+        let results = run_steps_with_state(&steps, &agents, &ctx, Some(Arc::clone(&state))).await?;
 
         let total_elapsed = flow_start.elapsed();
 
@@ -2465,6 +2594,42 @@ mod flow_api {
             format!("{}.{:01}s", secs, d.subsec_millis() / 100)
         }
     }
+
+    /// Test-only constructors for the in-tree MCP session module. We do not
+    /// want a public ctor for `ActiveRouter` -- production code reaches it
+    /// only through [`RunHandle::active_router`] -- but the session tests
+    /// need to register and observe accessors without spinning up a real
+    /// flow run. Gated on `#[cfg(test)]` so it never enters release builds.
+    #[cfg(test)]
+    pub mod test_support {
+        use super::{ActiveRouter, RouterAccessor, RunState};
+        use std::sync::Arc;
+
+        /// `ActiveRouter` over a fresh, empty `RunState`. `current()` always
+        /// returns `None` until something publishes via `set_router`.
+        pub fn fresh_active_router() -> ActiveRouter {
+            ActiveRouter {
+                state: Arc::new(RunState::default()),
+            }
+        }
+
+        /// `ActiveRouter` plus the `RouterAccessor` that has been published
+        /// onto the same shared state. `current()` resolves to a clone of
+        /// the accessor for as long as the state is alive; the returned
+        /// accessor is the original sender and can be used to send through
+        /// the same channel as `current()` does.
+        pub fn active_router_with_published() -> (ActiveRouter, RouterAccessor) {
+            let state = Arc::new(RunState::default());
+            let (accessor, _rx) = RouterAccessor::new();
+            state.set_router(accessor.clone());
+            // The receiver is dropped here, so `inject_human_message` would
+            // fail with `Closed`; tests that need a live channel build
+            // their own pair. The published accessor is enough to make
+            // `ActiveRouter::current()` resolve to `Some(...)`, which is
+            // what the session-state tests assert on.
+            (ActiveRouter { state }, accessor)
+        }
+    }
 }
 
 // Public library API entry points. Several of these (FlowResult, RunHandle,
@@ -2474,8 +2639,8 @@ mod flow_api {
 // shrink the surface promised by #209.
 #[allow(unused_imports)]
 pub use flow_api::{
-    ExecuteFlowSpec, FlowResult, FlowSource, RouterAccessor, RouterAccessorError, RunHandle,
-    execute_flow,
+    ActiveRouter, ExecuteFlowSpec, FlowResult, FlowSource, RouterAccessor, RouterAccessorError,
+    RunHandle, execute_flow,
 };
 
 // Crate-internal re-exports so the CLI tests (and any other in-tree caller)
@@ -2489,6 +2654,12 @@ pub(crate) use flow_api::{
     resolve_stack_path_for_flow_name, resolve_task, substitute_placeholders, substitute_vars,
     verify_flow_step_ids,
 };
+
+// Test-only re-export so in-tree consumers (notably the MCP session module)
+// reach helpers via `runner::test_support::...`. Production builds never see
+// this module; gating mirrors the inner `#[cfg(test)] pub mod test_support`.
+#[cfg(test)]
+pub use flow_api::test_support;
 
 #[cfg(test)]
 mod tests {
