@@ -45,7 +45,7 @@ use async_trait::async_trait;
 use regex_lite::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::runner::{self, ExecuteFlowSpec, FlowResult, FlowSource};
 use crate::stack;
@@ -53,6 +53,10 @@ use crate::stack;
 use super::error::{McpError, McpErrorCode};
 use super::execution::classify_setup_error;
 use super::tools::Tool;
+use super::umbrella::{
+    ChildResult, SubIssueRef, UmbrellaSummary, fetch_issue_body, log_starting_child, merge_pr,
+    parse_subissues, post_comment, render_summary_comment, sync_to_main, tick_checkbox,
+};
 
 /// Flow name resolved through the seed cascade. Pinned as a `const` so a
 /// rename of the seed file surfaces here as a single edit -- the team
@@ -150,7 +154,16 @@ struct ImplementIssueResult {
     /// the reviewer agent emits. `unclear` is reserved for outputs that
     /// neither token matched -- the call still succeeds so the caller can
     /// inspect the run via `show_output`.
+    ///
+    /// In umbrella mode this is the aggregate verdict: `"PASS"` if every
+    /// child passed and merged, `"FAIL"` on the first child failure
+    /// (orchestrator stopped). The per-child detail is in `umbrella`.
     verdict: String,
+    /// Populated when the issue passed to `implement_issue` was an umbrella
+    /// (its body contains a sub-issue task list). `None` for the regular
+    /// single-issue path so the result shape stays backwards-compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    umbrella: Option<UmbrellaSummary>,
 }
 
 async fn run_implement_issue(issue: u64) -> Result<ImplementIssueResult, McpError> {
@@ -170,6 +183,31 @@ async fn run_implement_issue(issue: u64) -> Result<ImplementIssueResult, McpErro
         )));
     }
 
+    // Umbrella detection: if the issue body lists sub-issues as task list
+    // items, run them sequentially instead of treating the umbrella as a
+    // single flow. Detection failures (gh missing, network blip) are
+    // logged and we fall back to the single-issue path -- the user can
+    // re-run after fixing their environment, and we still produce a
+    // useful result for non-umbrella issues.
+    let subissues = match fetch_issue_body(issue) {
+        Ok(body) => parse_subissues(&body),
+        Err(e) => {
+            warn!(error = %e, issue, "could not fetch issue body for umbrella detection; falling back to single-issue path");
+            Vec::new()
+        }
+    };
+    if subissues.iter().any(|r| !r.already_done) {
+        return run_umbrella(issue, subissues).await;
+    }
+
+    run_single_issue(issue).await
+}
+
+/// Single-issue path: run the canonical flow once and parse the
+/// per-step outputs. Extracted from `run_implement_issue` so the
+/// umbrella orchestrator can reuse it for each child without retriggering
+/// detection (which would recurse on a nested-umbrella body).
+async fn run_single_issue(issue: u64) -> Result<ImplementIssueResult, McpError> {
     let mut bare_args = HashMap::new();
     bare_args.insert("id".to_string(), issue.to_string());
 
@@ -206,6 +244,192 @@ async fn run_implement_issue(issue: u64) -> Result<ImplementIssueResult, McpErro
     Ok(build_result(run_id, &stack_path, &flow_result))
 }
 
+/// Umbrella path: iterate sub-issues sequentially, merging each child PR
+/// before starting the next. Stops on the first child that does not
+/// reach a clean `PASS + merge`. Posts a summary comment on the umbrella
+/// either way.
+///
+/// Already-checked task list items are recorded in the result as
+/// `verdict: "skipped"` and not re-run. This makes re-runs idempotent --
+/// a previous run that completed children #128 and #129 before failing
+/// on #130 will, on the next call, only re-attempt #130 onwards.
+async fn run_umbrella(
+    parent_issue: u64,
+    refs: Vec<SubIssueRef>,
+) -> Result<ImplementIssueResult, McpError> {
+    let total = refs.len();
+    info!(
+        parent_issue,
+        total, "umbrella detected; starting sequential children"
+    );
+
+    let mut children: Vec<ChildResult> = Vec::with_capacity(total);
+    let mut completed: usize = 0;
+    let mut failed_at: Option<u64> = None;
+    // Track the last successful child so the aggregate result can carry
+    // *some* run_id back to the caller -- aggregate-level run_id makes
+    // less sense than per-child run_ids, but keeping the field populated
+    // matches the existing single-issue contract for show_output discovery.
+    let mut last_run_id: Option<String> = None;
+    let mut last_pr_url: Option<String> = None;
+
+    for (idx, sub) in refs.iter().enumerate() {
+        // 1) Skipped: already-checked task list items are not re-run.
+        //    Record them so the summary comment is exhaustive.
+        if sub.already_done {
+            children.push(ChildResult {
+                issue: sub.issue,
+                run_id: None,
+                pr_url: None,
+                verdict: "skipped".into(),
+            });
+            continue;
+        }
+        // 2) After a prior failure, mark remaining items as not-attempted.
+        //    Loud-failure mode: stop the orchestrator, do not silently
+        //    skip into the next child.
+        if failed_at.is_some() {
+            children.push(ChildResult {
+                issue: sub.issue,
+                run_id: None,
+                pr_url: None,
+                verdict: "not-attempted".into(),
+            });
+            continue;
+        }
+
+        log_starting_child(parent_issue, sub.issue, idx, total);
+
+        // 3) Run the child as a regular single-issue flow. Note the
+        //    direct call to `run_single_issue` (not `run_implement_issue`):
+        //    this prevents the orchestrator from recursing into a child
+        //    that happens to be itself an umbrella -- nested umbrellas
+        //    are out of V1 scope.
+        let child = match run_single_issue(sub.issue).await {
+            Ok(r) => r,
+            Err(e) => {
+                // Setup or executor error for this child -- treat as a
+                // failure but record what we know.
+                warn!(error = %format!("{:?}", e), child = sub.issue, "child run errored");
+                children.push(ChildResult {
+                    issue: sub.issue,
+                    run_id: None,
+                    pr_url: None,
+                    verdict: "FAIL".into(),
+                });
+                failed_at = Some(sub.issue);
+                continue;
+            }
+        };
+
+        // 4) Verdict gate: only PASS + a PR URL proceeds to merge. FAIL
+        //    or unclear stops the orchestrator immediately.
+        if child.verdict != VERDICT_PASS {
+            children.push(ChildResult {
+                issue: sub.issue,
+                run_id: Some(child.run_id.clone()),
+                pr_url: child.pr_url.clone(),
+                verdict: child.verdict.clone(),
+            });
+            failed_at = Some(sub.issue);
+            continue;
+        }
+        let pr_url = match &child.pr_url {
+            Some(u) => u.clone(),
+            None => {
+                // PASS without a URL: the agent claimed PASS but did not
+                // produce a PR. Treat as failure -- do not silently skip
+                // a missing artifact.
+                children.push(ChildResult {
+                    issue: sub.issue,
+                    run_id: Some(child.run_id.clone()),
+                    pr_url: None,
+                    verdict: "FAIL".into(),
+                });
+                failed_at = Some(sub.issue);
+                continue;
+            }
+        };
+
+        // 5) Merge the child PR before starting the next child. A merge
+        //    failure (branch protection, conflicts, etc.) is loud and
+        //    stops the orchestrator -- consistent with the V1 scoping.
+        if let Err(e) = merge_pr(&pr_url) {
+            warn!(error = %e, child = sub.issue, "merge failed");
+            children.push(ChildResult {
+                issue: sub.issue,
+                run_id: Some(child.run_id.clone()),
+                pr_url: Some(pr_url),
+                verdict: "merge-failed".into(),
+            });
+            failed_at = Some(sub.issue);
+            continue;
+        }
+
+        // 6) Sync local state to the post-merge tip. Best-effort: if the
+        //    sync fails we log and keep going -- the next child's flow
+        //    re-fetches origin internally.
+        if let Err(e) = sync_to_main() {
+            warn!(error = %e, "post-merge sync failed; next child may fetch its own tip");
+        }
+
+        // 7) Tick the umbrella checkbox so progress is visible on
+        //    GitHub even mid-run. Best-effort.
+        if let Err(e) = tick_checkbox(parent_issue, sub.issue) {
+            warn!(error = %e, child = sub.issue, "could not tick umbrella checkbox");
+        }
+
+        last_run_id = Some(child.run_id.clone());
+        last_pr_url = Some(pr_url.clone());
+        children.push(ChildResult {
+            issue: sub.issue,
+            run_id: Some(child.run_id),
+            pr_url: Some(pr_url),
+            verdict: VERDICT_PASS.into(),
+        });
+        completed += 1;
+    }
+
+    let summary = UmbrellaSummary {
+        parent_issue,
+        total,
+        completed,
+        failed_at,
+        children,
+    };
+
+    // Post a summary comment on the umbrella. Best-effort: the structured
+    // result is the source of truth for the caller; the comment is for
+    // human consumers reading the umbrella issue.
+    if let Err(e) = post_comment(parent_issue, &render_summary_comment(&summary)) {
+        warn!(error = %e, parent_issue, "could not post umbrella summary comment");
+    }
+
+    let aggregate_verdict = if failed_at.is_some() {
+        VERDICT_FAIL
+    } else if completed == 0 {
+        // Edge case: every task list item was already checked. The
+        // umbrella is effectively done -- treat as PASS so the caller
+        // does not see a misleading failure.
+        VERDICT_PASS
+    } else {
+        VERDICT_PASS
+    };
+
+    let aggregate_run_id = last_run_id.unwrap_or_else(|| format!("umbrella-{parent_issue}"));
+
+    Ok(ImplementIssueResult {
+        run_id: aggregate_run_id,
+        // After a successful umbrella run we end up on detached origin/main
+        // (post `sync_to_main`); branch is intentionally None so callers
+        // do not mistake it for a feature branch worth pushing.
+        branch: None,
+        pr_url: last_pr_url,
+        verdict: aggregate_verdict.to_string(),
+        umbrella: Some(summary),
+    })
+}
+
 fn build_result(
     run_id: String,
     stack_path: &Path,
@@ -224,6 +448,7 @@ fn build_result(
                 branch: current_branch(),
                 pr_url: None,
                 verdict: VERDICT_UNCLEAR.to_string(),
+                umbrella: None,
             };
         }
     };
@@ -240,6 +465,7 @@ fn build_result(
         branch,
         pr_url,
         verdict: verdict.to_string(),
+        umbrella: None,
     }
 }
 

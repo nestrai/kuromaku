@@ -52,6 +52,7 @@ pub mod protocol;
 pub mod server;
 pub mod session;
 pub mod tools;
+pub mod umbrella;
 pub mod workflow;
 
 // Re-exports used inside the module.
