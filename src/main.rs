@@ -354,6 +354,25 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
         }
     }
 
+    // Discoverability hint (issue #90): when the flow YAML declares
+    // `suggests: [<flow>, ...]`, surface each suggestion as
+    // `next › kuro run <flow>`. This is CLI-only -- MCP/library callers
+    // get the same data via `FlowResult::suggests` and decide whether to
+    // chain themselves. We pre-format owned strings so the call site can
+    // borrow them as `&[(&str, &str)]` for `print_next_hint`. The second
+    // tuple element is unused by the renderer today but kept for parity
+    // with the existing API; future work may surface a per-suggestion
+    // description.
+    if !result.suggests.is_empty() {
+        let cmds: Vec<String> = result
+            .suggests
+            .iter()
+            .map(|name| format!("kuro run {name}"))
+            .collect();
+        let pairs: Vec<(&str, &str)> = cmds.iter().map(|s| (s.as_str(), "")).collect();
+        ui::print_next_hint(&pairs);
+    }
+
     Ok(())
 }
 
@@ -717,6 +736,7 @@ mod tests {
                 backend: "local".to_string(),
                 path: String::new(),
             },
+            suggests: Vec::new(),
         }
     }
 

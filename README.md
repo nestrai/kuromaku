@@ -71,6 +71,17 @@ kuro run review-pr id=67
 
 **Template variables** allow flows to define reusable prompts with `{{key}}` placeholders, filled via `key=value` CLI arguments.
 
+**Flow chaining** is opt-in. A flow can declare its natural follow-ups with the optional `suggests:` field, and `kuro run` prints `next › kuro run <name>` hints for each entry after a successful run. The CLI does not auto-chain; the hint just teaches the user the next action. Example:
+
+```yaml
+version: "1"
+name: fix-issue
+suggests: [review-pr]
+flow:
+  fix:
+    agent: dev
+```
+
 ## How it compares
 
 kuromaku takes a fundamentally different approach from Python-based agent frameworks.

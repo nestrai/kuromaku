@@ -101,6 +101,15 @@ pub struct RawFlowConfig {
     pub flow: IndexMap<String, RawStep>,
     #[serde(default)]
     pub stack: Option<RawStackConfig>,
+    /// Optional follow-up flow names. After this flow completes the CLI
+    /// prints `next › kuro run <name>` hints, one per entry, in declared
+    /// order. Lets a flow author teach the user about the natural next
+    /// action (issue #90) without having to document the chain elsewhere.
+    /// The library does not validate that the targets exist -- the suggested
+    /// flow may live in a different project, ship later, or be a placeholder
+    /// for a manual step.
+    #[serde(default)]
+    pub suggests: Vec<String>,
     #[serde(flatten)]
     pub unknown: HashMap<String, serde_yaml::Value>,
 }
@@ -198,6 +207,11 @@ pub struct FlowConfig {
     pub roles: HashMap<String, String>,
     pub steps: Vec<Step>,
     pub stack: StackConfig,
+    /// Follow-up flow names. The CLI surfaces these via `print_next_hint`
+    /// after a successful run; library callers (MCP) can read the field
+    /// to drive their own workflow chaining. See `RawFlowConfig::suggests`
+    /// for the YAML semantics.
+    pub suggests: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -797,6 +811,7 @@ fn validate_and_resolve(
         roles: resolved_roles,
         steps,
         stack,
+        suggests: raw.suggests,
     })
 }
 
@@ -1231,6 +1246,76 @@ flow:
         assert_eq!(config.steps[0].id, "design");
         assert_eq!(config.steps[1].id, "implement");
         assert_eq!(config.steps[2].id, "review");
+    }
+
+    // --- suggests field (issue #90) ---
+
+    #[test]
+    fn suggests_defaults_to_empty_when_omitted() {
+        // Flows that don't declare `suggests:` must continue to load. This
+        // is the existing-behavior contract: the field is opt-in and absence
+        // means "no follow-up hint".
+        let yaml = r#"
+version: "1"
+name: test
+flow:
+  code:
+    agent: dev
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert!(config.suggests.is_empty());
+    }
+
+    #[test]
+    fn suggests_parses_list_of_flow_names() {
+        // YAML list of strings should land verbatim in `suggests`, in the
+        // order they appear -- the CLI prints them in order, so order is
+        // part of the contract.
+        let yaml = r#"
+version: "1"
+name: fix-issue
+suggests: [review-pr, fix-pr]
+flow:
+  code:
+    agent: dev
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.suggests, vec!["review-pr", "fix-pr"]);
+    }
+
+    #[test]
+    fn suggests_accepts_single_entry() {
+        // The common case: one natural follow-up. This shape needs to work
+        // because the issue's primary example (`fix-issue → review-pr`)
+        // declares exactly one suggestion.
+        let yaml = r#"
+version: "1"
+name: fix-issue
+suggests:
+  - review-pr
+flow:
+  code:
+    agent: dev
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert_eq!(config.suggests, vec!["review-pr"]);
+    }
+
+    #[test]
+    fn suggests_accepts_empty_list() {
+        // An explicit empty list is allowed and treated the same as the
+        // field being absent. This lets a flow author template the field
+        // without any follow-ups without tripping a validation error.
+        let yaml = r#"
+version: "1"
+name: test
+suggests: []
+flow:
+  code:
+    agent: dev
+"#;
+        let config = load_flow_from_str(yaml).unwrap();
+        assert!(config.suggests.is_empty());
     }
 
     #[test]

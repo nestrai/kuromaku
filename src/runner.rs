@@ -1544,6 +1544,11 @@ mod flow_api {
         pub manifest: Manifest,
         pub step_results: Vec<StepRunResult>,
         pub total_elapsed: Duration,
+        /// Follow-up flow names declared via `suggests:` in the flow YAML.
+        /// The CLI surfaces these as `next › kuro run <name>` hints; MCP
+        /// and other library callers can read the field to drive their
+        /// own chaining (issue #90).
+        pub suggests: Vec<String>,
     }
 
     /// Shared mutable state held jointly by the `RunHandle` and the
@@ -2583,6 +2588,7 @@ mod flow_api {
             manifest,
             step_results: results,
             total_elapsed,
+            suggests: flow_config.suggests.clone(),
         })
     }
 

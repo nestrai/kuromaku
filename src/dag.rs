@@ -201,6 +201,7 @@ flow:
                 backend: "local".to_string(),
                 path: String::new(),
             },
+            suggests: Vec::new(),
         };
         let err = validate_dag(&config).unwrap_err();
         assert!(
