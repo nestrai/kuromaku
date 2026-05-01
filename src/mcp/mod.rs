@@ -35,17 +35,22 @@
 //! response writer.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+use self::session::SessionState;
+
 pub mod discovery;
 pub mod error;
 pub mod execution;
+pub mod messaging;
 pub mod protocol;
 pub mod server;
+pub mod session;
 pub mod tools;
 pub mod workflow;
 
@@ -76,6 +81,13 @@ pub async fn run(verbose: bool) -> Result<()> {
         Err(e) => warn!(error = %e, "project config invalid; continuing without it"),
     }
 
+    // One `SessionState` per MCP process: scopes the active-run registry
+    // to this stdio connection so a `send_message` call sees only flows
+    // that were started by *this* client. `Arc` because the registry is
+    // shared between `run_flow` (writer, on register/deregister) and
+    // `send_message` (reader, on every call).
+    let session = Arc::new(SessionState::new());
+
     let mut registry = tools::ToolRegistry::new();
     // Discovery tools (#197). `register` only fails on programmer error
     // (invalid name, duplicate, empty description); surface as eyre so a
@@ -91,11 +103,16 @@ pub async fn run(verbose: bool) -> Result<()> {
         .map_err(|e| eyre!("register load_agent: {:?}", e))?;
     // Flow execution tools (#198). Same loud-on-broken-build policy.
     registry
-        .register(Box::new(execution::RunFlow))
+        .register(Box::new(execution::RunFlow::new(Arc::clone(&session))))
         .map_err(|e| eyre!("register run_flow: {:?}", e))?;
     registry
         .register(Box::new(execution::ShowOutput))
         .map_err(|e| eyre!("register show_output: {:?}", e))?;
+    // Human-injection tool (#199). Reads the same session registry the
+    // run_flow tool writes into, so it can find the active conversation.
+    registry
+        .register(Box::new(messaging::SendMessage::new(Arc::clone(&session))))
+        .map_err(|e| eyre!("register send_message: {:?}", e))?;
     // Workflow tools (#196 split). `implement_issue` (#213), `review_pr`
     // (#214), `rework_pr` (#215) -- registration order is irrelevant because
     // the registry is a BTreeMap, but kept in issue order for readability.

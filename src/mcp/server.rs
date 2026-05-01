@@ -28,6 +28,7 @@
 
 use std::sync::Arc;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
@@ -69,19 +70,59 @@ where
         "mcp server ready"
     );
 
-    while let Some(line) = lines.next_line().await? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        debug!(bytes = line.len(), "frame in");
-        if let Some(response) = handle_line(&line, registry.clone()).await {
-            write_response(&writer, &response).await?;
+    // `FuturesUnordered` lets a long-running tool call (notably `run_flow`,
+    // which awaits the entire flow) overlap with later frames coming in --
+    // `send_message` depends on this, otherwise it could never reach the
+    // dispatcher while a flow is in flight. We avoid `tokio::spawn` here
+    // because that would force a `'static` bound on the writer and break
+    // the in-memory test harness; polling cooperatively in the same task
+    // gives concurrency without that constraint, and stdout framing stays
+    // correct because `write_response` serialises per-frame writes via
+    // the writer mutex.
+    let mut in_flight: FuturesUnordered<DispatchFuture<'_>> = FuturesUnordered::new();
+
+    loop {
+        tokio::select! {
+            biased;
+            // Drain completed dispatches as they finish so the FuturesUnordered
+            // does not grow unbounded under steady traffic.
+            Some(_) = in_flight.next(), if !in_flight.is_empty() => {}
+            line = lines.next_line() => {
+                match line? {
+                    None => break,
+                    Some(line) => {
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        debug!(bytes = line.len(), "frame in");
+                        let registry = Arc::clone(&registry);
+                        let writer = Arc::clone(&writer);
+                        in_flight.push(Box::pin(async move {
+                            if let Some(response) = handle_line(&line, registry).await
+                                && let Err(e) = write_response(&writer, &response).await
+                            {
+                                warn!(error = %e, "write response failed");
+                            }
+                        }));
+                    }
+                }
+            }
         }
     }
+
+    // Wait for any in-flight dispatches before returning so a final frame
+    // is not silently dropped on stdin EOF.
+    while in_flight.next().await.is_some() {}
 
     info!("stdin EOF, mcp server shutting down");
     Ok(())
 }
+
+/// Boxed dispatch future. Lifetime `'a` keeps the future tied to the local
+/// `run` call so non-`'static` writers (like `&mut Vec<u8>` in tests) stay
+/// valid for the duration. No `Send` bound -- `FuturesUnordered` polls the
+/// futures on the same task, so they never cross thread boundaries.
+type DispatchFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + 'a>>;
 
 /// Handle a single NDJSON line. Returns `None` for notifications (no reply
 /// on the wire) and `Some(Response)` for requests including parse failures.

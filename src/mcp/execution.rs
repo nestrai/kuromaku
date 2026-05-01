@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::Deserialize;
@@ -35,6 +36,7 @@ use crate::runner::{self, ExecuteFlowSpec, FlowSource};
 use crate::stack::{self, RunOutputs, RunStatus};
 
 use super::error::{McpError, McpErrorCode};
+use super::session::SessionState;
 use super::tools::Tool;
 
 fn invalid_params(reason: impl Into<String>) -> McpError {
@@ -66,7 +68,23 @@ struct RunFlowArgs {
 /// flow completes and returns `{ run_id, status }`. On a setup-side error
 /// (unknown flow, invalid YAML, missing template var) the call returns an
 /// `McpError`; the run id is not produced for an unrunnable flow.
-pub struct RunFlow;
+///
+/// Holds an [`Arc<SessionState>`] so the flow's [`runner::ActiveRouter`]
+/// is registered on the per-MCP-session registry while the run is in
+/// flight. The `send_message` tool reads that registry to find the
+/// conversation step it should inject into. Registration is scoped to the
+/// `await_completion` span: nothing leaks if the call returns early on a
+/// setup error, and the entry is removed unconditionally when the future
+/// resolves (success, failure, panic via the runner's join error path).
+pub struct RunFlow {
+    session: Arc<SessionState>,
+}
+
+impl RunFlow {
+    pub fn new(session: Arc<SessionState>) -> Self {
+        Self { session }
+    }
+}
 
 #[async_trait]
 impl Tool for RunFlow {
@@ -107,7 +125,7 @@ impl Tool for RunFlow {
             Some(v) => parse_string_map(v)?,
             None => HashMap::new(),
         };
-        do_run_flow(name, bare_args).await
+        do_run_flow(name, bare_args, Arc::clone(&self.session)).await
     }
 }
 
@@ -146,7 +164,11 @@ fn type_name(v: &Value) -> &'static str {
     }
 }
 
-async fn do_run_flow(name: String, bare_args: HashMap<String, String>) -> Result<Value, McpError> {
+async fn do_run_flow(
+    name: String,
+    bare_args: HashMap<String, String>,
+    session: Arc<SessionState>,
+) -> Result<Value, McpError> {
     let spec = ExecuteFlowSpec {
         flow: FlowSource::Name(name.clone()),
         bare_args,
@@ -159,6 +181,14 @@ async fn do_run_flow(name: String, bare_args: HashMap<String, String>) -> Result
         .await
         .map_err(|e| classify_setup_error(&name, e))?;
     let run_id = handle.run_id.clone();
+
+    // Pull the cloneable router view BEFORE await_completion consumes the
+    // handle. The slot is registered for the lifetime of the await; the
+    // RAII guard below removes it on every exit path (success, error,
+    // panic) so the registry never accumulates stale entries.
+    let active_router = handle.active_router();
+    let _slot_guard = SlotGuard::register(&session, active_router);
+
     match handle.await_completion().await {
         // `flow` rides along so the caller can pass it back to `show_output`
         // and reach a custom `stack.path` (the default-stack assumption was
@@ -181,6 +211,33 @@ async fn do_run_flow(name: String, bare_args: HashMap<String, String>) -> Result
                 "flow": name,
             }),
         )),
+    }
+}
+
+/// RAII helper around [`SessionState::register`] / [`SessionState::deregister`].
+/// Drops the registration when the guard goes out of scope -- in particular
+/// across the `await_completion` await, where neither a manual `deregister`
+/// before the `?` nor a panic in the spawned task could leave the registry
+/// stale. The session is held by `Arc`, so dropping the guard is safe even
+/// if the server is shutting down concurrently.
+struct SlotGuard {
+    session: Arc<SessionState>,
+    slot: super::session::RunSlot,
+}
+
+impl SlotGuard {
+    fn register(session: &Arc<SessionState>, ar: runner::ActiveRouter) -> Self {
+        let slot = session.register(ar);
+        Self {
+            session: Arc::clone(session),
+            slot,
+        }
+    }
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.session.deregister(self.slot);
     }
 }
 
@@ -541,23 +598,27 @@ mod tests {
         assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
+    fn fresh_session() -> Arc<SessionState> {
+        Arc::new(SessionState::new())
+    }
+
     #[tokio::test]
     async fn run_flow_tool_rejects_empty_name() {
-        let tool = RunFlow;
+        let tool = RunFlow::new(fresh_session());
         let err = tool.call(json!({"name": "   "})).await.unwrap_err();
         assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
     #[tokio::test]
     async fn run_flow_tool_rejects_missing_name() {
-        let tool = RunFlow;
+        let tool = RunFlow::new(fresh_session());
         let err = tool.call(json!({})).await.unwrap_err();
         assert_eq!(err.code, McpErrorCode::InvalidParams);
     }
 
     #[tokio::test]
     async fn run_flow_tool_rejects_non_string_arg_value() {
-        let tool = RunFlow;
+        let tool = RunFlow::new(fresh_session());
         let err = tool
             .call(json!({"name": "dev", "args": {"task": 42}}))
             .await
@@ -605,7 +666,8 @@ mod tests {
     #[tokio::test]
     async fn execution_tools_have_valid_descriptors() {
         let mut reg = super::super::tools::ToolRegistry::new();
-        reg.register(Box::new(RunFlow)).unwrap();
+        reg.register(Box::new(RunFlow::new(fresh_session())))
+            .unwrap();
         reg.register(Box::new(ShowOutput)).unwrap();
         let names: Vec<String> = reg.descriptors().into_iter().map(|d| d.name).collect();
         assert_eq!(names, vec!["run_flow", "show_output"]);
