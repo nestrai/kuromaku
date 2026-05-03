@@ -876,12 +876,13 @@ mod tests {
     #[test]
     fn build_codex_chat_command_no_persona_skips_initial_message() {
         // No persona means no positional initial message -- codex opens a
-        // clean REPL. Empty-string seeds would still emit a positional
-        // argument, which we want to avoid.
+        // clean REPL. Pin the exact argv so the test fails if any extra
+        // positional gets appended (the previous `last().is_empty()` check
+        // passed vacuously whenever the trailing arg was a non-empty model
+        // name, missing the actual regression we want to catch).
         let cmd = build_codex_chat_command("o3", None, &[]);
         let args = argv(&cmd);
-        // Last arg should be the model (after -m), not an empty string.
-        assert!(!args.last().map(|s| s.is_empty()).unwrap_or(true));
+        assert_eq!(args, vec!["-m".to_string(), "o3".to_string()]);
     }
 
     #[test]
