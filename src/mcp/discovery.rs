@@ -865,6 +865,7 @@ mod tests {
             rules: vec!["style".to_string()],
             skills: vec!["skill-x".to_string()],
             env: std::collections::HashMap::new(),
+            extra_args: std::collections::HashMap::new(),
         };
         let mut rules_cache = std::collections::HashMap::new();
         rules_cache.insert("style".to_string(), "STYLE-CONTENT".to_string());

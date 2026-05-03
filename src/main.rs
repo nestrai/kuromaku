@@ -203,6 +203,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
             agents: Vec::new(),
             max_turns: None,
             turn_timeout: None,
+            extra_args: std::collections::HashMap::new(),
         });
     }
 
@@ -693,6 +694,7 @@ mod tests {
             agents: Vec::new(),
             max_turns: None,
             turn_timeout: None,
+            extra_args: std::collections::HashMap::new(),
         }
     }
 
@@ -768,6 +770,7 @@ mod tests {
             model_source: "CLI override".to_string(),
             backend_source: "CLI override".to_string(),
             seed_origin: None,
+            extra_args: Vec::new(),
         }];
 
         apply_resolved_roles_to_steps(&mut flow, &resolved);
@@ -792,6 +795,7 @@ mod tests {
             model_source: "role override".to_string(),
             backend_source: "role override".to_string(),
             seed_origin: None,
+            extra_args: Vec::new(),
         }];
 
         apply_resolved_roles_to_steps(&mut flow, &resolved);
@@ -811,6 +815,7 @@ mod tests {
             model_source: "role override".to_string(),
             backend_source: "role override".to_string(),
             seed_origin: None,
+            extra_args: Vec::new(),
         }];
 
         apply_resolved_roles_to_steps(&mut flow, &resolved);
@@ -881,6 +886,7 @@ mod tests {
             model_source: "agent".to_string(),
             backend_source: "agent".to_string(),
             seed_origin: Some(".kuro/".to_string()),
+            extra_args: Vec::new(),
         }];
         let mut vars = std::collections::HashMap::new();
         vars.insert("owner".to_string(), "nestrai".to_string());

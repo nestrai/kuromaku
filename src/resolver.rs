@@ -71,6 +71,12 @@ pub struct ResolvedRole {
     /// `None` for callers that don't track seeds (e.g. the legacy single-dir
     /// path). The audit prints this as `<- <seed-display>` when present.
     pub seed_origin: Option<String>,
+    /// Agent-level `extra_args` for the resolved backend (#236). Empty when
+    /// the agent declares no `extra_args` for this backend. Step-level
+    /// overrides do not feed into the audit -- this captures the agent
+    /// binding so the user sees what would be applied unless a step
+    /// declares its own `extra_args`.
+    pub extra_args: Vec<String>,
 }
 
 // --- Override parsing ---
@@ -191,6 +197,11 @@ pub struct RoleResolveInput<'a> {
     pub agent_backend: Backend,
     /// The flow's `defaults.model`.
     pub flow_default_model: &'a str,
+    /// The agent's `extra_args` map keyed by backend (#236). `None` when the
+    /// caller has no agent yet (e.g. unresolved binding); otherwise the
+    /// resolver picks the slice for the resolved backend and stores it on
+    /// [`ResolvedRole`] so the audit can show it.
+    pub agent_extra_args: Option<&'a HashMap<Backend, Vec<String>>>,
 }
 
 /// Resolve the agent ID for a single role from the cascade.
@@ -306,6 +317,16 @@ pub fn resolve_role(
         (input.agent_backend, "agent".to_string())
     };
 
+    // --- extra_args (#236) ---
+    // Agent-level slice keyed by the resolved backend. Step-level overrides
+    // are merged later in the runner, but the audit reflects the per-role
+    // resolution which is agent-scoped.
+    let extra_args = input
+        .agent_extra_args
+        .and_then(|m| m.get(&backend))
+        .cloned()
+        .unwrap_or_default();
+
     Some(ResolvedRole {
         name: input.role_name.to_string(),
         agent,
@@ -314,6 +335,7 @@ pub fn resolve_role(
         model_source,
         backend_source,
         seed_origin: None,
+        extra_args,
     })
 }
 
@@ -357,6 +379,16 @@ pub fn format_audit(
             backend_label(r.backend),
             r.backend_source
         ));
+        // #236: surface the resolved extra_args so the audit captures the
+        // full per-role binding. Skip the line entirely when the agent
+        // declares nothing for the resolved backend -- the audit is meant
+        // to be terse, and an empty list adds noise.
+        if !r.extra_args.is_empty() {
+            out.push_str(&format!(
+                "           extra_args: [{}]\n",
+                r.extra_args.join(" ")
+            ));
+        }
     }
     if !cli_vars.is_empty() {
         let mut keys: Vec<&String> = cli_vars.keys().collect();
@@ -402,6 +434,7 @@ mod tests {
             agent_tier: tier,
             agent_backend: Backend::ClaudeCli,
             flow_default_model: "claude-sonnet-4-5",
+            agent_extra_args: None,
         }
     }
 
@@ -609,6 +642,98 @@ mod tests {
     }
 
     #[test]
+    fn extra_args_resolved_for_effective_backend() {
+        // #236 audit: ResolvedRole.extra_args carries the agent slice for
+        // the resolved backend. Slices for other backends are dropped --
+        // the audit shows the binding actually applied at runtime.
+        let mut agent_extra: HashMap<Backend, Vec<String>> = HashMap::new();
+        agent_extra.insert(
+            Backend::ClaudeCli,
+            vec!["--dangerously-skip-permissions".to_string()],
+        );
+        agent_extra.insert(Backend::Codex, vec!["--sandbox".to_string()]);
+
+        let input = RoleResolveInput {
+            role_name: "dev",
+            agent_model: "x/y",
+            agent_tier: None,
+            agent_backend: Backend::ClaudeCli,
+            flow_default_model: "claude-sonnet-4-5",
+            agent_extra_args: Some(&agent_extra),
+        };
+        let r = resolve_role(&input, Some("Sage"), None, &[], None).unwrap();
+        assert_eq!(r.backend, Backend::ClaudeCli);
+        assert_eq!(r.extra_args, vec!["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn extra_args_empty_when_no_entry_for_resolved_backend() {
+        // #236: the agent has extra_args for codex but the resolved
+        // backend is claude-cli -- the audit should reflect "nothing
+        // applies" via an empty Vec, not the codex slice.
+        let mut agent_extra: HashMap<Backend, Vec<String>> = HashMap::new();
+        agent_extra.insert(Backend::Codex, vec!["--sandbox".to_string()]);
+
+        let input = RoleResolveInput {
+            role_name: "dev",
+            agent_model: "x/y",
+            agent_tier: None,
+            agent_backend: Backend::ClaudeCli,
+            flow_default_model: "claude-sonnet-4-5",
+            agent_extra_args: Some(&agent_extra),
+        };
+        let r = resolve_role(&input, Some("Sage"), None, &[], None).unwrap();
+        assert!(r.extra_args.is_empty());
+    }
+
+    #[test]
+    fn format_audit_includes_extra_args_when_present() {
+        // #236 audit format: when the resolved role carries non-empty
+        // extra_args, the audit prints them on a dedicated line. Empty
+        // slices are suppressed to keep the audit terse (verified in
+        // format_audit_omits_extra_args_when_empty).
+        let role = ResolvedRole {
+            name: "dev".to_string(),
+            agent: "Sage".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+            model_source: "default".to_string(),
+            backend_source: "default".to_string(),
+            seed_origin: None,
+            extra_args: vec!["--dangerously-skip-permissions".to_string()],
+        };
+        let audit = format_audit(&Seeds::default_local(), &[role], &HashMap::new());
+        assert!(
+            audit.contains("extra_args: [--dangerously-skip-permissions]"),
+            "audit did not include extra_args line, got:\n{audit}"
+        );
+    }
+
+    #[test]
+    fn format_audit_omits_extra_args_when_empty() {
+        // Counter to format_audit_includes_extra_args_when_present:
+        // when the slice is empty the audit must not print an
+        // `extra_args: []` line. Empty noise hurts readability and a
+        // future reader would wonder whether the empty list is
+        // semantically distinct from "no entry".
+        let role = ResolvedRole {
+            name: "dev".to_string(),
+            agent: "Sage".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+            model_source: "default".to_string(),
+            backend_source: "default".to_string(),
+            seed_origin: None,
+            extra_args: Vec::new(),
+        };
+        let audit = format_audit(&Seeds::default_local(), &[role], &HashMap::new());
+        assert!(
+            !audit.contains("extra_args"),
+            "audit should not mention extra_args when empty, got:\n{audit}"
+        );
+    }
+
+    #[test]
     fn backend_keeps_agent_when_agent_overrides_project_default() {
         let input = RoleResolveInput {
             role_name: "dev",
@@ -616,6 +741,7 @@ mod tests {
             agent_tier: None,
             agent_backend: Backend::Ollama,
             flow_default_model: "claude-sonnet-4-5",
+            agent_extra_args: None,
         };
         let r = resolve_role(&input, Some("Sage"), None, &[], Some(KotoBackend::Cli)).unwrap();
         assert_eq!(r.backend, Backend::Ollama);

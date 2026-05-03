@@ -312,6 +312,33 @@ pub(crate) fn build_system_prompt(
 
 /// Build the user-facing prompt with context from prior steps.
 ///
+/// Resolve the effective `extra_args` slice for a step (#236).
+///
+/// Cascade is replace-not-merge: a non-empty step-level map fully shadows
+/// the agent map, even when it has no entry for the effective backend (in
+/// which case no override tokens are emitted). This matches the issue's
+/// "step replaces agent" semantics and keeps the lookup a single
+/// `HashMap::get` per layer.
+///
+/// Lifted into a free function so the conversation-step path (which has no
+/// step-level extra_args by construction -- the conversation validator
+/// rejects them) and the agent-step path share identical resolution logic
+/// without copy-pasting the cascade.
+fn resolve_extra_args<'a>(
+    step: &'a Step,
+    agent: &'a Agent,
+    effective_backend: Backend,
+) -> &'a [String] {
+    let map = if !step.extra_args.is_empty() {
+        &step.extra_args
+    } else {
+        &agent.extra_args
+    };
+    map.get(&effective_backend)
+        .map(|v| v.as_slice())
+        .unwrap_or(&[])
+}
+
 /// Reads the prior step content from the per-run directory (issue #31). The
 /// runner writes both an LLM `.md` and a shell `.txt` body keyed by step id;
 /// this lookup doesn't care about the kind because it just splices the body
@@ -352,6 +379,10 @@ fn build_user_prompt(task: &str, step: &Step, run_path: &Path) -> Result<String,
 /// that file line-by-line during execution -- the file fills up live and a
 /// concurrent `tail -f` sees output without waiting for the agent to finish
 /// (issue #16).
+///
+/// `extra_args` is the resolved per-step backend-keyed override slice
+/// (#236). The runner already cascades step → agent → empty before calling
+/// here, so the slice is always the right one for the backend in use.
 #[allow(clippy::too_many_arguments)]
 async fn run_step_via_executor(
     executor: &dyn ExecutorBoxed,
@@ -361,6 +392,7 @@ async fn run_step_via_executor(
     user_content: &str,
     model: &str,
     backend: Backend,
+    extra_args: &[String],
     output_path: &Path,
 ) -> Result<(String, Option<llm::Usage>), RunError> {
     // Build unique session name: kuro-<project>-<flow>-<step>-<short-id>
@@ -373,14 +405,16 @@ async fn run_step_via_executor(
 
     let command = match backend {
         Backend::ClaudeCli => {
-            executor::build_claude_command(model, Some(system_prompt), user_content)
+            executor::build_claude_command(model, Some(system_prompt), user_content, extra_args)
         }
-        Backend::Codex => executor::build_codex_command(model, Some(system_prompt), user_content),
+        Backend::Codex => {
+            executor::build_codex_command(model, Some(system_prompt), user_content, extra_args)
+        }
         Backend::Ollama => {
             let mut prompt = String::new();
             prompt.push_str(&format!("System: {system_prompt}\n\n"));
             prompt.push_str(&format!("User: {user_content}"));
-            executor::build_ollama_command(model, &prompt)
+            executor::build_ollama_command(model, &prompt, extra_args)
         }
         Backend::Api => unreachable!("API backend does not use executor"),
     };
@@ -919,7 +953,18 @@ async fn run_conversation_step(
     for agent in &participants {
         let system_prompt =
             build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
-        let cmd = executor::build_claude_interactive_command(&agent.model, Some(&system_prompt));
+        // Conversation steps always run via claude-cli interactive transport,
+        // so we resolve extra_args from the agent's claude-cli bucket.
+        let extra_args: &[String] = agent
+            .extra_args
+            .get(&Backend::ClaudeCli)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let cmd = executor::build_claude_interactive_command(
+            &agent.model,
+            Some(&system_prompt),
+            extra_args,
+        );
         let transport = executor::transport::StreamJsonTransport::spawn(cmd)
             .await
             .map_err(|e| RunError::ConversationSpawn {
@@ -1195,6 +1240,12 @@ pub(crate) async fn run_steps_with_state(
 
         let effective_model = step.model.as_deref().unwrap_or(&agent.model);
         let effective_backend = step.backend.unwrap_or(agent.backend);
+        // #236: extra_args cascade is replace-not-merge. A non-empty
+        // step-level map fully shadows the agent map, even if it has no
+        // entry for the effective backend (in which case no override
+        // tokens are used). This matches the issue text "step replaces
+        // agent" and keeps the resolution explicit -- no surprise merges.
+        let effective_extra_args: &[String] = resolve_extra_args(step, agent, effective_backend);
 
         let step_info = StepInfo {
             id: step.id.clone(),
@@ -1241,6 +1292,23 @@ pub(crate) async fn run_steps_with_state(
                 .display()
         );
 
+        // #236: surface the resolved extra_args next to the model/backend
+        // so a user looking at the run output can see what override tokens
+        // their YAML produced. We only print when non-empty -- the default
+        // case stays quiet so existing run logs are byte-identical.
+        if !effective_extra_args.is_empty() {
+            let source = if !step.extra_args.is_empty() {
+                "step"
+            } else {
+                "agent"
+            };
+            eprintln!(
+                "      extra_args ({source}, {}): [{}]",
+                effective_backend.yaml_name(),
+                effective_extra_args.join(" ")
+            );
+        }
+
         let system_prompt =
             build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
 
@@ -1260,6 +1328,7 @@ pub(crate) async fn run_steps_with_state(
                 &user_content,
                 effective_model,
                 effective_backend,
+                effective_extra_args,
                 &output_path,
             )
             .await?
@@ -2012,6 +2081,10 @@ mod flow_api {
                 agent_tier: agent_tier.as_deref(),
                 agent_backend,
                 flow_default_model: flow_config.defaults.model.as_str(),
+                // #236: feed the agent's extra_args through so the resolver
+                // can pin the slice for the resolved backend onto
+                // ResolvedRole.extra_args. The audit reads it from there.
+                agent_extra_args: agent.map(|a| &a.extra_args),
             };
 
             let resolved = resolve_role(
@@ -2747,6 +2820,7 @@ mod tests {
             rules: vec!["rust-developer".to_string()],
             skills: vec!["error-handling".to_string()],
             env: HashMap::new(),
+            extra_args: HashMap::new(),
         };
         let guide = Some("Project guide content".to_string());
         let mut rules_cache = HashMap::new();
@@ -2779,6 +2853,7 @@ mod tests {
             rules: vec!["rust".to_string(), "cli-ux".to_string()],
             skills: vec![],
             env: HashMap::new(),
+            extra_args: HashMap::new(),
         };
         let guide = None;
         let mut rules_cache = HashMap::new();
@@ -2809,6 +2884,7 @@ mod tests {
             rules: vec![],
             skills: vec![],
             env: HashMap::new(),
+            extra_args: HashMap::new(),
         };
         let guide = None;
         let rules_cache = HashMap::new();
@@ -2850,6 +2926,7 @@ mod tests {
             rules: vec!["rust-developer".to_string()],
             skills: vec![],
             env: HashMap::new(),
+            extra_args: HashMap::new(),
         }];
 
         let cache = load_rules_for_agents(&agents, dir.path()).unwrap();
@@ -2874,6 +2951,7 @@ mod tests {
             rules: vec!["rust".to_string(), "cli".to_string()],
             skills: vec![],
             env: HashMap::new(),
+            extra_args: HashMap::new(),
         }];
 
         let cache = load_rules_for_agents(&agents, dir.path()).unwrap();
@@ -2895,6 +2973,7 @@ mod tests {
             rules: vec!["nonexistent".to_string()],
             skills: vec![],
             env: HashMap::new(),
+            extra_args: HashMap::new(),
         }];
 
         let err = load_rules_for_agents(&agents, dir.path()).unwrap_err();
@@ -2996,6 +3075,7 @@ mod tests {
             agents: Vec::new(),
             max_turns: None,
             turn_timeout: None,
+            extra_args: HashMap::new(),
         }
     }
 
@@ -3149,6 +3229,7 @@ mod tests {
             agents: Vec::new(),
             max_turns: None,
             turn_timeout: None,
+            extra_args: HashMap::new(),
         };
 
         let prompt = build_user_prompt("Top-level task", &downstream, &ctx.run_path).unwrap();
