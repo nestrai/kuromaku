@@ -5,6 +5,7 @@ use clap::{Parser, Subcommand};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
+mod chat;
 mod config;
 mod dag;
 #[allow(dead_code)]
@@ -90,6 +91,15 @@ enum Command {
         #[arg(short = 't', long, required = true)]
         task: String,
     },
+    /// Drop into the agent's underlying CLI in interactive mode
+    /// (claude, codex, ollama) with the agent's persona + rules
+    /// pre-loaded. Stdin/stdout/stderr inherit from the parent shell;
+    /// exit with the upstream CLI's mechanism (`/exit`, Ctrl-D).
+    Chat {
+        /// Agent name from .kuro/agents/
+        #[arg(short, long, required = true)]
+        agent: String,
+    },
     /// Fetch skills from remote sources pinned in .kuro/skills.lock
     Pull,
     /// Stop the agent team
@@ -123,6 +133,7 @@ async fn main() -> Result<()> {
             run_flow(&args).await?
         }
         Command::Task { agent, task } => run_task(&agent, &task).await?,
+        Command::Chat { agent } => chat::run_chat(&agent).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
             println!("kuro down: not yet implemented");

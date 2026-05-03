@@ -317,6 +317,118 @@ pub fn build_claude_interactive_command(
     cmd
 }
 
+/// Build a `tokio::process::Command` for an interactive `claude-cli` chat
+/// session driven by the user's terminal (issue #244).
+///
+/// Distinct from [`build_claude_interactive_command`] -- that builder targets
+/// the messaging Router and speaks `stream-json` over stdin/stdout. Chat mode
+/// is a true REPL: the user types, claude-cli renders its own UI. We therefore
+/// avoid `--input-format stream-json` (would parse keystrokes as NDJSON and
+/// fail) and `--print` (one-shot mode, exits after one response).
+///
+/// Uses `--append-system-prompt` to layer the agent's persona + rules on top
+/// of claude-cli's default system prompt -- the user keeps the upstream
+/// behaviour and additionally sees the agent's persona. The malware preamble
+/// (#234) is prepended to the agent's system prompt before the append, so
+/// the mitigation lands here too.
+///
+/// `system_prompt` is optional: when `None`, only the preamble is appended.
+pub fn build_claude_chat_command(
+    model: &str,
+    system_prompt: Option<&str>,
+    extra_args: &[String],
+) -> tokio::process::Command {
+    let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
+    let mut cmd = tokio::process::Command::new(claude_bin);
+    cmd.arg("--model").arg(model);
+    let combined_system = compose_claude_system_prompt(system_prompt);
+    cmd.arg("--append-system-prompt").arg(combined_system);
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
+/// Build a `tokio::process::Command` for an interactive `codex` chat session
+/// (issue #244). Symmetric to [`build_codex_command`] but targets the REPL
+/// rather than `codex exec`.
+///
+/// Codex has no `--system` flag in interactive mode. Per the issue's
+/// implementer notes, the prototype injects the system prompt as the first
+/// positional argument to `codex` -- codex treats the trailing positional as
+/// the initial user message that seeds the conversation. The agent's first
+/// reply will therefore be a response to the persona/rules block, which is a
+/// known prototype limitation; the user can then continue the conversation
+/// normally. Document the choice here so future work can replace it with a
+/// proper system-prompt injection if codex grows that capability.
+///
+/// Unlike `codex exec`, no `--full-auto` flag is set -- the user is driving
+/// the session and codex's interactive defaults apply.
+pub fn build_codex_chat_command(
+    model: &str,
+    system_prompt: Option<&str>,
+    extra_args: &[String],
+) -> tokio::process::Command {
+    let codex_bin = std::env::var("CODEX_CLI_PATH").unwrap_or_else(|_| "codex".to_string());
+    let mut cmd = tokio::process::Command::new(codex_bin);
+    if model != "default" {
+        cmd.arg("-m").arg(model);
+    }
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    // Prototype: pass the system prompt as the initial user message via the
+    // trailing positional argument. Codex has no `--system` flag in interactive
+    // mode (issue #244 implementer notes). Skip when there is no persona so
+    // codex opens a clean REPL without an empty seed message.
+    if let Some(prompt) = system_prompt {
+        cmd.arg(prompt);
+    }
+    cmd
+}
+
+/// Build a `tokio::process::Command` for an interactive `ollama` chat session
+/// (issue #244). Symmetric to [`build_ollama_command`] but drops into the
+/// ollama REPL with the agent's persona pre-loaded via `--system`.
+///
+/// `ollama run <model> --system "<prompt>"` opens the interactive prompt with
+/// the system prompt already set when stdin is a TTY. `system_prompt` is
+/// optional: when `None`, the `--system` flag is omitted entirely so ollama
+/// uses the model's built-in default.
+pub fn build_ollama_chat_command(
+    model: &str,
+    system_prompt: Option<&str>,
+    extra_args: &[String],
+) -> tokio::process::Command {
+    let ollama_bin = std::env::var("OLLAMA_PATH").unwrap_or_else(|_| "ollama".to_string());
+    let mut cmd = tokio::process::Command::new(ollama_bin);
+    cmd.arg("run").arg(model);
+    if let Some(prompt) = system_prompt {
+        cmd.arg("--system").arg(prompt);
+    }
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
+    cmd
+}
+
+/// Spawn the given command with stdin/stdout/stderr inherited from the
+/// parent shell and wait for it to exit. Used by `kuro chat` (#244) to hand
+/// the terminal over to the upstream CLI for its full interactive UX.
+///
+/// Returns the child process's exit status. Errors only on spawn failure;
+/// non-zero exits propagate via the returned `ExitStatus` and are the
+/// caller's responsibility to map to an error.
+pub async fn spawn_interactive(
+    mut cmd: tokio::process::Command,
+) -> Result<std::process::ExitStatus, ExecutorError> {
+    use std::process::Stdio;
+    cmd.stdin(Stdio::inherit());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    cmd.status().await.map_err(ExecutorError::Io)
+}
+
 /// Build the CLI command string for a codex backend.
 ///
 /// Uses `codex exec` in full-auto mode (no approval prompts, sandboxed).
@@ -669,5 +781,145 @@ mod tests {
     #[test]
     fn create_executor_works() {
         let _ = create_executor();
+    }
+
+    // --- #244: chat-mode interactive command builders ---
+    //
+    // Tests cover the three supported backends (claude-cli, codex, ollama)
+    // and exercise the two preamble-related contracts spelled out in
+    // PR #235 / issue #234: the malware preamble lands on claude-cli but
+    // never on codex/ollama. Also pin the structural choices documented
+    // in the builders' doc comments (no --print, no stream-json, system
+    // prompt position) so a regression in those is caught at the unit
+    // test layer rather than at the user-facing UX layer.
+
+    fn argv(cmd: &tokio::process::Command) -> Vec<String> {
+        cmd.as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn build_claude_chat_command_uses_append_system_prompt() {
+        // Acceptance: chat mode uses --append-system-prompt (not
+        // --system-prompt) so the agent's persona layers on top of
+        // claude-cli's default behaviour rather than replacing it.
+        let cmd = build_claude_chat_command("claude-sonnet-4-5", Some("You are Sage"), &[]);
+        let args = argv(&cmd);
+        assert!(args.iter().any(|a| a == "--append-system-prompt"));
+        assert!(!args.iter().any(|a| a == "--system-prompt"));
+        let joined = args.join(" ");
+        assert!(joined.contains("You are Sage"));
+        assert!(joined.contains(PREAMBLE_MARKER));
+    }
+
+    #[test]
+    fn build_claude_chat_command_omits_print_and_stream_json() {
+        // Chat mode is a true REPL; --print would make claude-cli exit after
+        // one response and stream-json would parse keystrokes as NDJSON.
+        // Both must stay out of the chat-mode argv.
+        let cmd = build_claude_chat_command("claude-sonnet-4-5", Some("persona"), &[]);
+        let args = argv(&cmd);
+        assert!(!args.iter().any(|a| a == "--print"));
+        assert!(!args.iter().any(|a| a == "--input-format"));
+        assert!(!args.iter().any(|a| a == "--output-format"));
+    }
+
+    #[test]
+    fn build_claude_chat_command_no_persona_still_carries_preamble() {
+        // Issue #234 acceptance criterion mirrored to chat mode: even with
+        // no persona the malware preamble is always sent, on the same
+        // --append-system-prompt argv slot.
+        let cmd = build_claude_chat_command("claude-sonnet-4-5", None, &[]);
+        let args = argv(&cmd);
+        assert!(args.iter().any(|a| a == "--append-system-prompt"));
+        let joined = args.join(" ");
+        assert!(joined.contains(PREAMBLE_MARKER));
+    }
+
+    #[test]
+    fn build_claude_chat_command_passes_extra_args() {
+        // Per #236 escape hatch: extra_args propagate to the final argv
+        // even in chat mode, after kuromaku-managed flags.
+        let extra = vec!["--allowed-tools".to_string(), "Read".to_string()];
+        let cmd = build_claude_chat_command("claude-sonnet-4-5", Some("p"), &extra);
+        let args = argv(&cmd);
+        assert!(args.iter().any(|a| a == "--allowed-tools"));
+        assert!(args.iter().any(|a| a == "Read"));
+    }
+
+    #[test]
+    fn build_codex_chat_command_passes_system_prompt_as_initial_message() {
+        // Codex has no --system flag in interactive mode -- the prototype
+        // injects the persona block as the trailing positional argument
+        // (initial user message). Pin that wiring so a refactor that
+        // accidentally drops the prompt is caught.
+        let cmd = build_codex_chat_command("o3", Some("You are Sage"), &[]);
+        let args = argv(&cmd);
+        assert_eq!(args.last().map(String::as_str), Some("You are Sage"));
+        // No `exec` subcommand -- chat mode targets the REPL.
+        assert!(!args.iter().any(|a| a == "exec"));
+        // No --full-auto -- the user drives the interactive session.
+        assert!(!args.iter().any(|a| a == "--full-auto"));
+    }
+
+    #[test]
+    fn build_codex_chat_command_default_model_omits_minus_m() {
+        // Mirrors the non-interactive build_codex_command rule: "default"
+        // means use codex's built-in default model, no -m flag.
+        let cmd = build_codex_chat_command("default", Some("p"), &[]);
+        let args = argv(&cmd);
+        assert!(!args.iter().any(|a| a == "-m"));
+    }
+
+    #[test]
+    fn build_codex_chat_command_no_persona_skips_initial_message() {
+        // No persona means no positional initial message -- codex opens a
+        // clean REPL. Empty-string seeds would still emit a positional
+        // argument, which we want to avoid.
+        let cmd = build_codex_chat_command("o3", None, &[]);
+        let args = argv(&cmd);
+        // Last arg should be the model (after -m), not an empty string.
+        assert!(!args.last().map(|s| s.is_empty()).unwrap_or(true));
+    }
+
+    #[test]
+    fn build_codex_chat_command_does_not_carry_claude_preamble() {
+        // The malware preamble is claude-cli specific (issue #234). Codex
+        // and ollama must not see it -- carrying it forward would leak
+        // claude-cli-only language into the user-visible session prompt.
+        let cmd = build_codex_chat_command("o3", Some("You are Sage"), &[]);
+        let joined = argv(&cmd).join(" ");
+        assert!(!joined.contains(PREAMBLE_MARKER));
+    }
+
+    #[test]
+    fn build_ollama_chat_command_uses_system_flag() {
+        // Acceptance: ollama chat passes the persona via --system so the
+        // model has it loaded for the interactive REPL.
+        let cmd = build_ollama_chat_command("llama3", Some("You are Sage"), &[]);
+        let args = argv(&cmd);
+        assert!(args.iter().any(|a| a == "run"));
+        assert!(args.iter().any(|a| a == "llama3"));
+        assert!(args.iter().any(|a| a == "--system"));
+        assert!(args.iter().any(|a| a == "You are Sage"));
+    }
+
+    #[test]
+    fn build_ollama_chat_command_no_persona_omits_system_flag() {
+        // No persona means no --system flag at all -- ollama then uses the
+        // model's built-in default system prompt rather than receiving an
+        // empty override.
+        let cmd = build_ollama_chat_command("llama3", None, &[]);
+        let args = argv(&cmd);
+        assert!(!args.iter().any(|a| a == "--system"));
+    }
+
+    #[test]
+    fn build_ollama_chat_command_does_not_carry_claude_preamble() {
+        let cmd = build_ollama_chat_command("llama3", Some("You are Sage"), &[]);
+        let joined = argv(&cmd).join(" ");
+        assert!(!joined.contains(PREAMBLE_MARKER));
     }
 }
