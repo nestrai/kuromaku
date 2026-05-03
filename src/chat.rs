@@ -20,6 +20,20 @@ use crate::koto_config::{KOTO_DIR, KotoConfig, Seeds};
 use crate::runner;
 use crate::skills;
 
+/// Reject backends that have no interactive CLI to spawn into. Today only
+/// `api` falls in this bucket; the helper exists so the rejection rule can
+/// be unit-tested against the real check and its exact error message
+/// (acceptance criterion for `kuro chat`).
+fn ensure_chat_supported(backend: Backend) -> Result<()> {
+    if matches!(backend, Backend::Api) {
+        return Err(eyre!(
+            "chat mode not supported for {} backend",
+            backend.yaml_name()
+        ));
+    }
+    Ok(())
+}
+
 /// Entry point for `kuro chat --agent <name>`. Resolves the agent the same
 /// way `kuro task` does, builds the system prompt, prints a one-line
 /// preamble to stderr, and hands the terminal over to the upstream CLI.
@@ -47,14 +61,10 @@ pub async fn run_chat(agent_name: &str) -> Result<()> {
     // Reject backends that have no interactive CLI to spawn into. The issue
     // calls out shell explicitly; the Backend enum has no Shell variant
     // (shell is a step kind, not an agent backend), so the only non-CLI
-    // backend in scope today is `api`. Use the issue's exact phrasing for
-    // backwards compatibility with anyone scripting around the message.
-    if matches!(agent.backend, Backend::Api) {
-        return Err(eyre!(
-            "chat mode not supported for {} backend",
-            agent.backend.yaml_name()
-        ));
-    }
+    // backend in scope today is `api`. Extracted into a pure helper so the
+    // rejection rule has a unit test that exercises the real check (and its
+    // exact error message) rather than a tautological pattern match.
+    ensure_chat_supported(agent.backend)?;
 
     // Mirror `kuro task`'s context loading so the system prompt is
     // identical in shape. The runner already builds the cascade
@@ -158,22 +168,29 @@ mod tests {
     #[test]
     fn api_backend_is_rejected_for_chat() {
         // Acceptance criterion: backends without an interactive CLI fall
-        // through to a clear error. Rather than running the full async
-        // path (which needs filesystem fixtures), exercise the exact
-        // matcher the chat handler uses so the rejection rule has a unit
-        // test home.
+        // through to a clear error. We exercise the real `ensure_chat_supported`
+        // helper that `run_chat` calls (rather than the full async path,
+        // which needs filesystem fixtures) so a refactor that breaks the
+        // rejection rule or its error message gets caught here.
         let agent = make_agent(Backend::Api);
-        assert!(matches!(agent.backend, Backend::Api));
+        let err = ensure_chat_supported(agent.backend).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("chat mode not supported"),
+            "wrong message: {msg}"
+        );
+        assert!(msg.contains("api"), "should name the backend: {msg}");
     }
 
     #[test]
     fn supported_backends_pass_chat_gate() {
-        // The three CLI backends pass the chat gate. This test fails-fast
-        // if someone narrows the supported set without updating the
-        // dispatcher in run_chat.
+        // The three CLI backends pass the chat gate. Calls the real helper
+        // so a future change that accidentally narrows the supported set
+        // (e.g. rejecting ollama) fails next to the chat dispatcher.
         for b in [Backend::ClaudeCli, Backend::Codex, Backend::Ollama] {
             let agent = make_agent(b);
-            assert!(!matches!(agent.backend, Backend::Api));
+            ensure_chat_supported(agent.backend)
+                .unwrap_or_else(|e| panic!("backend {b:?} should be allowed, got: {e}"));
         }
     }
 
