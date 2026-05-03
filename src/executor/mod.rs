@@ -346,6 +346,11 @@ pub fn build_claude_chat_command(
     for arg in extra_args {
         cmd.arg(arg);
     }
+    // Mirror `build_claude_interactive_command`: ensure the child is torn
+    // down if the parent future is dropped (panic, runtime shutdown, signal
+    // handling) so we never leak a `claude` process that still owns the
+    // user's terminal.
+    cmd.kill_on_drop(true);
     cmd
 }
 
@@ -384,6 +389,10 @@ pub fn build_codex_chat_command(
     if let Some(prompt) = system_prompt {
         cmd.arg(prompt);
     }
+    // See `build_claude_chat_command`: kill the child if the parent future
+    // is dropped, so a panic or runtime shutdown does not leave a `codex`
+    // process attached to the user's terminal.
+    cmd.kill_on_drop(true);
     cmd
 }
 
@@ -409,6 +418,10 @@ pub fn build_ollama_chat_command(
     for arg in extra_args {
         cmd.arg(arg);
     }
+    // See `build_claude_chat_command`: tear down the child if the parent
+    // future is dropped so a panic or runtime shutdown does not leave an
+    // `ollama` process attached to the user's terminal.
+    cmd.kill_on_drop(true);
     cmd
 }
 
