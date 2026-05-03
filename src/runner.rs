@@ -2081,6 +2081,10 @@ mod flow_api {
                 agent_tier: agent_tier.as_deref(),
                 agent_backend,
                 flow_default_model: flow_config.defaults.model.as_str(),
+                // #236: feed the agent's extra_args through so the resolver
+                // can pin the slice for the resolved backend onto
+                // ResolvedRole.extra_args. The audit reads it from there.
+                agent_extra_args: agent.map(|a| &a.extra_args),
             };
 
             let resolved = resolve_role(
