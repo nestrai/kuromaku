@@ -466,7 +466,11 @@ pub fn load_agent_file_with_seeds(
 
 /// Convert a string-keyed `extra_args` map (raw YAML form) into a
 /// [`Backend`]-keyed map. Unknown keys produce a validation error that names
-/// the offending key and lists the supported backend names. Empty entries
+/// the offending key and lists the supported backend names. The `api` backend
+/// is rejected explicitly: it talks to the HTTP API rather than spawning a
+/// CLI, so there is no argv slot for extra arguments to slot into. Without
+/// the explicit reject, `api` keys would parse cleanly and then get silently
+/// dropped at command-build time -- a confusing footgun. Empty entries
 /// (`backend: []`) are kept as-is so callers can detect an explicit "clear
 /// extra_args for this backend" intent if a future feature wants it; they
 /// simply produce no argv tokens at command-build time.
@@ -478,9 +482,14 @@ fn validate_extra_args(
     for (key, val) in raw {
         let backend = Backend::from_yaml_name(&key).ok_or_else(|| {
             ConfigError::Validation(format!(
-                "unknown backend in extra_args: '{key}' (valid: claude-cli, codex, ollama, api) in {context}"
+                "unknown backend in extra_args: '{key}' (valid: claude-cli, codex, ollama) in {context}"
             ))
         })?;
+        if backend == Backend::Api {
+            return Err(ConfigError::Validation(format!(
+                "extra_args is not supported for backend 'api' in {context} -- the api backend talks to the HTTP API, not a CLI, so there is no argv to extend"
+            )));
+        }
         out.insert(backend, val);
     }
     Ok(out)
@@ -2605,11 +2614,15 @@ extra_args:
             "error must name the offending key: {msg}"
         );
         assert!(
-            msg.contains("claude-cli")
-                && msg.contains("codex")
-                && msg.contains("ollama")
-                && msg.contains("api"),
-            "error must list supported backends: {msg}"
+            msg.contains("claude-cli") && msg.contains("codex") && msg.contains("ollama"),
+            "error must list CLI-backend names: {msg}"
+        );
+        // 'api' is intentionally absent from the unknown-backend error: it has
+        // its own dedicated rejection path because extra_args has no meaning
+        // for an HTTP backend, so advertising it here would mislead users.
+        assert!(
+            !msg.contains("api"),
+            "'api' must not appear in the unknown-backend hint -- it has its own rejection: {msg}"
         );
 
         // Same check at the step level.
@@ -2628,6 +2641,67 @@ flow:
         assert!(
             msg.contains("claude-cli"),
             "error must list valid backends: {msg}"
+        );
+    }
+
+    #[test]
+    fn api_backend_in_extra_args_is_rejected_with_dedicated_error() {
+        // Acceptance (PR #243 review): the api backend has no CLI argv to
+        // extend. Accepting `api: [...]` and silently dropping it at
+        // command-build time would mislead users -- and the runner's
+        // "extra_args (...): [...]" log line would advertise tokens that were
+        // never applied. Reject up front in validation so the misuse is
+        // caught at parse time rather than at runtime.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Net.yaml"),
+            r#"
+name: Net
+role: "calls api"
+backend: api
+extra_args:
+  api: ["--temperature", "0.2"]
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "default".to_string(),
+            backend: Backend::Api,
+        };
+        let err = load_agent_file(dir.path(), "Net", &defaults, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported") && msg.contains("'api'"),
+            "agent-level error must explain api is unsupported: {msg}"
+        );
+        assert!(
+            msg.contains("Net"),
+            "agent-level error must name the file context: {msg}"
+        );
+
+        // Same rejection at the step level so a step-only override is caught
+        // even when the agent file is clean.
+        let step_yaml = r#"
+version: "1"
+name: t
+flow:
+  go:
+    agent: dev
+    extra_args:
+      api: ["--whatever"]
+"#;
+        let err = load_flow_from_str(step_yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not supported") && msg.contains("'api'"),
+            "step-level error must explain api is unsupported: {msg}"
+        );
+        assert!(
+            msg.contains("step 'go'"),
+            "step-level error must name the step id: {msg}"
         );
     }
 }
