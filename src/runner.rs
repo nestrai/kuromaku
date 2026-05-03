@@ -222,6 +222,22 @@ pub fn load_guide_from_seeds(seeds: &Seeds) -> Result<Option<String>, RunError> 
     }
 }
 
+/// Gate on whether to load `Guide.md` for repo-agnostic commands (`kuro task`,
+/// `kuro chat`). Returns `None` unless `include_project_context` is true so
+/// that, by default, an agent run via `kuro task` does not inherit the cwd
+/// project's identity (issue #245). `kuro run` keeps its own unconditional
+/// guide load -- flow runs ARE repo-specific by design.
+pub fn load_guide_for_task(
+    seeds: &Seeds,
+    include_project_context: bool,
+) -> Result<Option<String>, RunError> {
+    if include_project_context {
+        load_guide_from_seeds(seeds)
+    } else {
+        Ok(None)
+    }
+}
+
 /// Pre-load rules files for all agents that reference them.
 /// Test-only single-dir variant; the production loader is
 /// [`load_rules_for_agents_with_seeds`].
@@ -2907,6 +2923,148 @@ mod tests {
         std::fs::write(&guide_path, "# My Project\nContext here").unwrap();
         let content = load_guide(dir.path()).unwrap();
         assert!(content.contains("My Project"));
+    }
+
+    #[test]
+    fn load_guide_for_task_skips_guide_by_default() {
+        // Regression for #245: `kuro task` and `kuro chat` must NOT inject the
+        // cwd-project's Guide.md into agent system prompts. Even with a Guide
+        // sitting in the first seed, the gate returns None when the
+        // include-project-context flag is off.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Guide.md"),
+            "You are working on **kuromaku**...",
+        )
+        .unwrap();
+        let seeds = Seeds {
+            seeds: vec![crate::koto_config::Seed {
+                source: crate::koto_config::SeedSource::Local {
+                    display: dir.path().display().to_string(),
+                    path: dir.path().to_path_buf(),
+                },
+            }],
+        };
+        let guide = load_guide_for_task(&seeds, false).unwrap();
+        assert!(
+            guide.is_none(),
+            "kuro task must skip cwd Guide by default; got: {guide:?}"
+        );
+    }
+
+    #[test]
+    fn task_system_prompt_omits_cwd_guide_by_default() {
+        // Regression for #245 -- the full leak path. Assemble the system
+        // prompt the way `kuro task` does (load_guide_for_task ->
+        // build_system_prompt) and assert the cwd Guide content does NOT
+        // appear when the user has not opted in via
+        // --include-project-context. The assertion targets the project name
+        // the issue explicitly names ("kuromaku") so a future regression that
+        // re-introduces unconditional Guide injection will fail this test
+        // with the exact symptom from the bug report.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Guide.md"),
+            "You are working on **kuromaku** -- a CLI tool for reproducible AI agents.",
+        )
+        .unwrap();
+        let seeds = Seeds {
+            seeds: vec![crate::koto_config::Seed {
+                source: crate::koto_config::SeedSource::Local {
+                    display: dir.path().display().to_string(),
+                    path: dir.path().to_path_buf(),
+                },
+            }],
+        };
+        let agent = Agent {
+            id: "neo".to_string(),
+            name: "Neo".to_string(),
+            title: None,
+            role: "You are Neo, a Prompt Engineer.".to_string(),
+            model: "sonnet".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: vec![],
+            skills: vec![],
+            env: HashMap::new(),
+            extra_args: HashMap::new(),
+        };
+        let guide = load_guide_for_task(&seeds, false).unwrap();
+        let prompt = build_system_prompt(&agent, &guide, &HashMap::new(), &HashMap::new());
+        assert!(
+            !prompt.contains("kuromaku"),
+            "kuro task system prompt must not name the cwd project; got:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("You are Neo"),
+            "agent role must still be present: {prompt}"
+        );
+    }
+
+    #[test]
+    fn task_system_prompt_includes_guide_when_opted_in() {
+        // Symmetric to the regression test above: when the user explicitly
+        // opts in via --include-project-context, the Guide loads and the
+        // system prompt looks exactly like a flow run's prompt would. Keeps
+        // the opt-in path covered so a future change that breaks it surfaces
+        // here next to the regression test.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Guide.md"),
+            "You are working on **kuromaku** -- a CLI tool for reproducible AI agents.",
+        )
+        .unwrap();
+        let seeds = Seeds {
+            seeds: vec![crate::koto_config::Seed {
+                source: crate::koto_config::SeedSource::Local {
+                    display: dir.path().display().to_string(),
+                    path: dir.path().to_path_buf(),
+                },
+            }],
+        };
+        let agent = Agent {
+            id: "neo".to_string(),
+            name: "Neo".to_string(),
+            title: None,
+            role: "You are Neo, a Prompt Engineer.".to_string(),
+            model: "sonnet".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: vec![],
+            skills: vec![],
+            env: HashMap::new(),
+            extra_args: HashMap::new(),
+        };
+        let guide = load_guide_for_task(&seeds, true).unwrap();
+        let prompt = build_system_prompt(&agent, &guide, &HashMap::new(), &HashMap::new());
+        assert!(
+            prompt.contains("kuromaku"),
+            "opt-in must inject the Guide: {prompt}"
+        );
+        assert!(
+            prompt.starts_with("You are working on"),
+            "Guide must lead the cascade: {prompt}"
+        );
+    }
+
+    #[test]
+    fn load_guide_for_task_loads_when_opted_in() {
+        // Symmetric to the above: when the user explicitly opts in via
+        // `--include-project-context`, the Guide loads exactly as in flow runs.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("Guide.md"),
+            "You are working on **kuromaku**...",
+        )
+        .unwrap();
+        let seeds = Seeds {
+            seeds: vec![crate::koto_config::Seed {
+                source: crate::koto_config::SeedSource::Local {
+                    display: dir.path().display().to_string(),
+                    path: dir.path().to_path_buf(),
+                },
+            }],
+        };
+        let guide = load_guide_for_task(&seeds, true).unwrap();
+        assert_eq!(guide.as_deref(), Some("You are working on **kuromaku**..."));
     }
 
     #[test]

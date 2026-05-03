@@ -90,6 +90,13 @@ enum Command {
         /// Task prompt
         #[arg(short = 't', long, required = true)]
         task: String,
+
+        /// Inject the cwd project's Guide.md into the agent system prompt.
+        /// Off by default so seed agents stay repo-agnostic (issue #245); turn
+        /// on when you explicitly want the agent to operate as a member of
+        /// the current project's team.
+        #[arg(long = "include-project-context")]
+        include_project_context: bool,
     },
     /// Drop into the agent's underlying CLI in interactive mode
     /// (claude, codex, ollama) with the agent's persona + rules
@@ -99,6 +106,12 @@ enum Command {
         /// Agent name from .kuro/agents/
         #[arg(short, long, required = true)]
         agent: String,
+
+        /// Inject the cwd project's Guide.md into the agent system prompt.
+        /// Mirror of `kuro task --include-project-context`: off by default,
+        /// opt-in when the chat session is meant to be project-aware.
+        #[arg(long = "include-project-context")]
+        include_project_context: bool,
     },
     /// Fetch skills from remote sources pinned in .kuro/skills.lock
     Pull,
@@ -132,8 +145,15 @@ async fn main() -> Result<()> {
             );
             run_flow(&args).await?
         }
-        Command::Task { agent, task } => run_task(&agent, &task).await?,
-        Command::Chat { agent } => chat::run_chat(&agent).await?,
+        Command::Task {
+            agent,
+            task,
+            include_project_context,
+        } => run_task(&agent, &task, include_project_context).await?,
+        Command::Chat {
+            agent,
+            include_project_context,
+        } => chat::run_chat(&agent, include_project_context).await?,
         Command::Pull => run_pull()?,
         Command::Down => {
             println!("kuro down: not yet implemented");
@@ -163,7 +183,7 @@ fn parse_key_value_args(args: &[String]) -> Result<std::collections::HashMap<Str
     Ok(map)
 }
 
-async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
+async fn run_task(agent_names: &[String], task: &str, include_project_context: bool) -> Result<()> {
     let task_start = Instant::now();
     let koto_dir = Path::new(KOTO_DIR);
 
@@ -249,9 +269,13 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
     }
     ui::print_backends_ok(&backend_list);
 
-    // Load context through the seed list -- guide is optional, rules error
-    // with the seeds searched if a referenced rule is missing.
-    let guide = runner::load_guide_from_seeds(&seeds).map_err(|e| eyre!("{e}"))?;
+    // Load context through the seed list -- guide is gated on
+    // `--include-project-context` so `kuro task --agent X` stays repo-agnostic
+    // by default (issue #245). Rules still error with the seeds searched if a
+    // referenced rule is missing -- those are part of the agent persona, not
+    // cwd-project context.
+    let guide =
+        runner::load_guide_for_task(&seeds, include_project_context).map_err(|e| eyre!("{e}"))?;
     let rules_cache =
         runner::load_rules_for_agents_with_seeds(&agents, &seeds).map_err(|e| eyre!("{e}"))?;
     // koto_dir kept around for the skills directory below, which is not yet
