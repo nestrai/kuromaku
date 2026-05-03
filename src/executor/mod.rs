@@ -219,7 +219,19 @@ fn compose_claude_system_prompt(system_prompt: Option<&str>) -> String {
 ///
 /// The system prompt is always set: [`claude_preamble`] is prepended to the
 /// per-agent persona, or passed alone when there is no persona (issue #234).
-pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_prompt: &str) -> String {
+///
+/// `extra_args` is a backend-keyed escape hatch (#236). Tokens are passed
+/// verbatim and shell-escaped here; the caller is responsible for splitting
+/// `--flag value` pairs into separate slice entries. They are inserted
+/// **before the final positional user prompt**, after all kuromaku-managed
+/// flags, so users can override behaviour without disturbing the prompt
+/// position.
+pub fn build_claude_command(
+    model: &str,
+    system_prompt: Option<&str>,
+    user_prompt: &str,
+    extra_args: &[String],
+) -> String {
     let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
 
     let mut parts = vec![claude_bin];
@@ -235,6 +247,10 @@ pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_promp
     let combined_system = compose_claude_system_prompt(system_prompt);
     parts.push("--system-prompt".to_string());
     parts.push(shell_escape(&combined_system));
+
+    for arg in extra_args {
+        parts.push(shell_escape(arg));
+    }
 
     parts.push(shell_escape(user_prompt));
 
@@ -277,6 +293,7 @@ pub fn build_claude_command(model: &str, system_prompt: Option<&str>, user_promp
 pub fn build_claude_interactive_command(
     model: &str,
     system_prompt: Option<&str>,
+    extra_args: &[String],
 ) -> tokio::process::Command {
     let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
     let mut cmd = tokio::process::Command::new(claude_bin);
@@ -288,6 +305,14 @@ pub fn build_claude_interactive_command(
     cmd.arg("--dangerously-skip-permissions");
     let combined_system = compose_claude_system_prompt(system_prompt);
     cmd.arg("--system-prompt").arg(combined_system);
+    // #236: extra_args land at the end. The interactive form has no
+    // positional prompt argument (stdin drives the conversation), so
+    // appending after `--system-prompt` puts the override flags last on
+    // the argv -- mirroring the non-interactive form's "after kuromaku
+    // flags, before user prompt" position as closely as possible.
+    for arg in extra_args {
+        cmd.arg(arg);
+    }
     cmd.kill_on_drop(true);
     cmd
 }
@@ -296,7 +321,19 @@ pub fn build_claude_interactive_command(
 ///
 /// Uses `codex exec` in full-auto mode (no approval prompts, sandboxed).
 /// Codex has no --system-prompt flag, so system and user prompts are combined.
-pub fn build_codex_command(model: &str, system_prompt: Option<&str>, user_prompt: &str) -> String {
+///
+/// `extra_args` is the #236 escape hatch. Tokens are spliced in **between
+/// the model selection (`-m MODEL` or its absence) and the final positional
+/// prompt argument**, so the prompt always stays last and codex sees its
+/// `-c key=value` overrides on the same argv position the codex CLI
+/// documents for them. Each token is shell-escaped here -- the caller passes
+/// `["-c", "model_reasoning_effort=high"]` as two separate entries.
+pub fn build_codex_command(
+    model: &str,
+    system_prompt: Option<&str>,
+    user_prompt: &str,
+    extra_args: &[String],
+) -> String {
     let codex_bin = std::env::var("CODEX_CLI_PATH").unwrap_or_else(|_| "codex".to_string());
 
     // Codex CLI has no --system-prompt flag, so system and user prompts are
@@ -315,21 +352,29 @@ pub fn build_codex_command(model: &str, system_prompt: Option<&str>, user_prompt
         parts.push("-m".to_string());
         parts.push(shell_escape(model));
     }
+    // #236: extra_args sit between `-m MODEL` (or its absence) and the
+    // final positional prompt. Order matters -- the prompt MUST stay last.
+    for arg in extra_args {
+        parts.push(shell_escape(arg));
+    }
     parts.push(shell_escape(&prompt));
 
     parts.join(" ")
 }
 
 /// Build the CLI command string for an ollama backend.
-pub fn build_ollama_command(model: &str, prompt: &str) -> String {
+///
+/// `extra_args` (#236) is appended after `run <model>` and before the
+/// positional prompt, so the prompt stays the last argv token.
+pub fn build_ollama_command(model: &str, prompt: &str, extra_args: &[String]) -> String {
     let ollama_bin = std::env::var("OLLAMA_PATH").unwrap_or_else(|_| "ollama".to_string());
 
-    format!(
-        "{} run {} {}",
-        ollama_bin,
-        shell_escape(model),
-        shell_escape(prompt)
-    )
+    let mut parts = vec![ollama_bin, "run".to_string(), shell_escape(model)];
+    for arg in extra_args {
+        parts.push(shell_escape(arg));
+    }
+    parts.push(shell_escape(prompt));
+    parts.join(" ")
 }
 
 fn shell_escape(s: &str) -> String {
@@ -368,7 +413,7 @@ mod tests {
     fn build_claude_command_basic() {
         // claude-cli always carries --system-prompt now, even with no persona,
         // because the preamble alone must still ship (issue #234).
-        let cmd = build_claude_command("claude-sonnet-4-5", None, "write tests");
+        let cmd = build_claude_command("claude-sonnet-4-5", None, "write tests", &[]);
         assert!(cmd.contains("claude"));
         assert!(cmd.contains("--model"));
         assert!(cmd.contains("--print"));
@@ -381,7 +426,7 @@ mod tests {
         // Issue #156: plain text mode buffers internally and only flushes on
         // process exit, defeating live artifact tailing. Stream-json verbose
         // mode emits NDJSON events as content is generated.
-        let cmd = build_claude_command("claude-sonnet-4-5", None, "do work");
+        let cmd = build_claude_command("claude-sonnet-4-5", None, "do work", &[]);
         assert!(cmd.contains("--output-format stream-json"));
         assert!(cmd.contains("--verbose"));
         assert!(cmd.contains("--include-partial-messages"));
@@ -392,7 +437,12 @@ mod tests {
     #[test]
     fn build_claude_command_with_system() {
         // Persona survives, preamble is prepended (issue #234).
-        let cmd = build_claude_command("claude-sonnet-4-5", Some("You are a dev"), "write tests");
+        let cmd = build_claude_command(
+            "claude-sonnet-4-5",
+            Some("You are a dev"),
+            "write tests",
+            &[],
+        );
         assert!(cmd.contains("--system-prompt"));
         assert!(cmd.contains("You are a dev"));
         assert!(cmd.contains(PREAMBLE_MARKER));
@@ -412,7 +462,7 @@ mod tests {
     fn build_claude_command_no_system_still_carries_preamble() {
         // Acceptance criterion: when system_prompt is None, the preamble
         // alone is passed -- not omitted (issue #234).
-        let cmd = build_claude_command("claude-sonnet-4-5", None, "do work");
+        let cmd = build_claude_command("claude-sonnet-4-5", None, "do work", &[]);
         assert!(cmd.contains("--system-prompt"));
         assert!(cmd.contains(PREAMBLE_MARKER));
     }
@@ -422,7 +472,7 @@ mod tests {
         // Order matters: the infrastructure-level guidance comes before the
         // per-agent persona so the persona can override tone but the
         // anti-disclaimer rule stays anchored at the top of the system prompt.
-        let cmd = build_claude_command("claude-sonnet-4-5", Some("PERSONA_TOKEN"), "do work");
+        let cmd = build_claude_command("claude-sonnet-4-5", Some("PERSONA_TOKEN"), "do work", &[]);
         let preamble_pos = cmd.find(PREAMBLE_MARKER).expect("preamble missing");
         let persona_pos = cmd.find("PERSONA_TOKEN").expect("persona missing");
         assert!(
@@ -433,7 +483,7 @@ mod tests {
 
     #[test]
     fn build_claude_interactive_command_carries_preamble_with_persona() {
-        let cmd = build_claude_interactive_command("claude-sonnet-4-5", Some("You are a dev"));
+        let cmd = build_claude_interactive_command("claude-sonnet-4-5", Some("You are a dev"), &[]);
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -449,7 +499,7 @@ mod tests {
     fn build_claude_interactive_command_carries_preamble_without_persona() {
         // Same acceptance criterion as the non-interactive path: even with
         // no persona, --system-prompt with the preamble is always sent.
-        let cmd = build_claude_interactive_command("claude-sonnet-4-5", None);
+        let cmd = build_claude_interactive_command("claude-sonnet-4-5", None, &[]);
         let args: Vec<String> = cmd
             .as_std()
             .get_args()
@@ -462,7 +512,7 @@ mod tests {
 
     #[test]
     fn build_ollama_command_basic() {
-        let cmd = build_ollama_command("llama3", "hello world");
+        let cmd = build_ollama_command("llama3", "hello world", &[]);
         assert!(cmd.contains("ollama"));
         assert!(cmd.contains("run"));
         assert!(cmd.contains("llama3"));
@@ -470,7 +520,7 @@ mod tests {
 
     #[test]
     fn build_codex_command_basic() {
-        let cmd = build_codex_command("o3", None, "write docs");
+        let cmd = build_codex_command("o3", None, "write docs", &[]);
         assert!(cmd.contains("codex"));
         assert!(cmd.contains("exec"));
         assert!(cmd.contains("--full-auto"));
@@ -481,14 +531,14 @@ mod tests {
 
     #[test]
     fn build_codex_command_with_system() {
-        let cmd = build_codex_command("o3", Some("You are a writer"), "write docs");
+        let cmd = build_codex_command("o3", Some("You are a writer"), "write docs", &[]);
         assert!(cmd.contains("You are a writer"));
         assert!(cmd.contains("write docs"));
     }
 
     #[test]
     fn build_codex_command_default_model() {
-        let cmd = build_codex_command("default", None, "write docs");
+        let cmd = build_codex_command("default", None, "write docs", &[]);
         assert!(cmd.contains("codex"));
         assert!(cmd.contains("exec"));
         assert!(cmd.contains("--full-auto"));
@@ -502,9 +552,9 @@ mod tests {
         // untouched both when it has a system prompt and when it doesn't,
         // because Codex concatenates system+user into one positional prompt
         // and a foreign preamble would leak into the user-visible task.
-        let cmd_no_sys = build_codex_command("o3", None, "write docs");
+        let cmd_no_sys = build_codex_command("o3", None, "write docs", &[]);
         assert!(!cmd_no_sys.contains(PREAMBLE_MARKER));
-        let cmd_with_sys = build_codex_command("o3", Some("You are a writer"), "write docs");
+        let cmd_with_sys = build_codex_command("o3", Some("You are a writer"), "write docs", &[]);
         assert!(!cmd_with_sys.contains(PREAMBLE_MARKER));
     }
 
@@ -515,8 +565,97 @@ mod tests {
         // The preamble must not appear in the command (issue #234).
         // (Shell steps don't go through any build_*_command at all, so they
         // are covered by construction.)
-        let cmd = build_ollama_command("llama3", "write docs");
+        let cmd = build_ollama_command("llama3", "write docs", &[]);
         assert!(!cmd.contains(PREAMBLE_MARKER));
+    }
+
+    // --- #236: extra_args escape hatch ---
+
+    #[test]
+    fn extra_args_codex_injects_between_model_and_prompt() {
+        // Acceptance: codex receives the override flag splice between `-m MODEL`
+        // and the trailing positional prompt. The prompt MUST stay last so the
+        // CLI parses the trailing token as the user prompt.
+        let extra = vec!["-c".to_string(), "model_reasoning_effort=high".to_string()];
+        let cmd = build_codex_command("gpt-5.5", None, "write docs", &extra);
+
+        let m_pos = cmd.find("-m ").expect("-m flag missing");
+        let model_pos = cmd.find("'gpt-5.5'").expect("model token missing");
+        // -c is shell-escaped as '-c' since extras flow through shell_escape.
+        let c_pos = cmd.find("'-c'").expect("extra flag -c missing");
+        let kv_pos = cmd
+            .find("'model_reasoning_effort=high'")
+            .expect("extra value missing");
+        let prompt_pos = cmd.rfind("'write docs'").expect("prompt missing");
+
+        assert!(m_pos < model_pos, "got: {cmd}");
+        assert!(model_pos < c_pos, "extras must follow -m MODEL: {cmd}");
+        assert!(c_pos < kv_pos, "got: {cmd}");
+        assert!(kv_pos < prompt_pos, "prompt must stay last: {cmd}");
+    }
+
+    #[test]
+    fn extra_args_empty_is_regression_safe() {
+        // Acceptance: empty extras leave existing argv untouched -- the four
+        // build_*_command outputs must equal what they were before #236 when
+        // no extras are provided.
+        let claude = build_claude_command("claude-sonnet-4-5", None, "do work", &[]);
+        assert!(claude.contains("--system-prompt"));
+        assert!(claude.contains("'do work'"));
+        assert!(claude.trim_end().ends_with("'do work'"));
+
+        let codex = build_codex_command("o3", None, "do work", &[]);
+        assert!(codex.contains("-m 'o3'"));
+        assert!(codex.trim_end().ends_with("'do work'"));
+
+        let ollama = build_ollama_command("llama3", "do work", &[]);
+        // ollama: `<bin> run 'llama3' 'do work'` -- no extras between.
+        assert!(ollama.contains("run 'llama3' 'do work'"), "got: {ollama}");
+
+        let interactive =
+            build_claude_interactive_command("claude-sonnet-4-5", Some("persona"), &[]);
+        let argv: Vec<String> = interactive
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        // Last two args are `--system-prompt <combined>` -- no extras tacked on.
+        let last = argv.last().expect("argv empty");
+        assert!(last.contains("persona"), "argv: {argv:?}");
+    }
+
+    #[test]
+    fn extra_args_claude_cli_appends_before_prompt() {
+        // Acceptance: claude-cli receives extras after kuromaku-managed flags
+        // (system-prompt etc.) and immediately before the trailing user prompt.
+        let extra = vec!["--allowed-tools".to_string(), "Read".to_string()];
+        let cmd = build_claude_command("claude-sonnet-4-5", Some("persona"), "the task", &extra);
+
+        let sys_pos = cmd.find("--system-prompt").expect("system-prompt missing");
+        // Extras pass through shell_escape, so the literal token is wrapped.
+        let allowed_pos = cmd.find("'--allowed-tools'").expect("extra flag missing");
+        let read_pos = cmd.find("'Read'").expect("extra value missing");
+        let prompt_pos = cmd.rfind("'the task'").expect("user prompt missing");
+
+        assert!(
+            sys_pos < allowed_pos,
+            "extras must come after --system-prompt: {cmd}"
+        );
+        assert!(allowed_pos < read_pos, "got: {cmd}");
+        assert!(read_pos < prompt_pos, "user prompt must remain last: {cmd}");
+    }
+
+    #[test]
+    fn extra_args_ollama_appends_before_prompt() {
+        let extra = vec!["--keepalive".to_string(), "5m".to_string()];
+        let cmd = build_ollama_command("llama3", "do work", &extra);
+        let model_pos = cmd.find("'llama3'").expect("model missing");
+        let keep_pos = cmd.find("'--keepalive'").expect("extra missing");
+        let val_pos = cmd.find("'5m'").expect("extra value missing");
+        let prompt_pos = cmd.rfind("'do work'").expect("prompt missing");
+        assert!(model_pos < keep_pos, "got: {cmd}");
+        assert!(keep_pos < val_pos, "got: {cmd}");
+        assert!(val_pos < prompt_pos, "prompt must stay last: {cmd}");
     }
 
     #[test]

@@ -22,13 +22,41 @@ pub enum ConfigError {
 
 // --- Types ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Backend {
     Api,
     ClaudeCli,
     Codex,
     Ollama,
+}
+
+impl Backend {
+    /// Canonical kebab-case name as used in YAML (e.g. `claude-cli`,
+    /// `codex`). Mirrors the `#[serde(rename_all = "kebab-case")]`
+    /// deserialization mapping so error messages and the `extra_args` lookup
+    /// table stay consistent with the on-disk schema.
+    pub fn yaml_name(self) -> &'static str {
+        match self {
+            Backend::Api => "api",
+            Backend::ClaudeCli => "claude-cli",
+            Backend::Codex => "codex",
+            Backend::Ollama => "ollama",
+        }
+    }
+
+    /// Parse the YAML form back into a [`Backend`]. Returns `None` for any
+    /// other string, which the caller turns into a validation error with the
+    /// list of valid backend names.
+    pub fn from_yaml_name(s: &str) -> Option<Backend> {
+        match s {
+            "api" => Some(Backend::Api),
+            "claude-cli" => Some(Backend::ClaudeCli),
+            "codex" => Some(Backend::Codex),
+            "ollama" => Some(Backend::Ollama),
+            _ => None,
+        }
+    }
 }
 
 /// Where a step's output should be auto-posted as a GitHub comment.
@@ -154,6 +182,13 @@ pub struct RawStep {
     /// step's output as a PR or issue comment after the step succeeds.
     #[serde(default)]
     pub post_comment: Option<PostCommentTarget>,
+    /// Backend-keyed extra CLI arguments. Each entry is a list of literal
+    /// argv tokens (no shell parsing) that the runner splices into the
+    /// command for the matching backend (#236). String keys are validated
+    /// against [`Backend::from_yaml_name`] in [`validate_and_resolve`] so
+    /// typos surface at parse time.
+    #[serde(default)]
+    pub extra_args: HashMap<String, Vec<String>>,
     #[serde(flatten)]
     pub unknown: HashMap<String, serde_yaml::Value>,
 }
@@ -175,6 +210,11 @@ pub struct RawAgentFile {
     pub backend: Option<Backend>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Backend-keyed extra CLI arguments (#236). Same shape as the
+    /// step-level field; the runner picks the agent map only when the step
+    /// does not declare its own.
+    #[serde(default)]
+    pub extra_args: HashMap<String, Vec<String>>,
     #[serde(flatten)]
     pub unknown: HashMap<String, serde_yaml::Value>,
 }
@@ -217,6 +257,10 @@ pub struct Agent {
     pub rules: Vec<String>,
     pub skills: Vec<String>,
     pub env: HashMap<String, String>,
+    /// Backend-keyed extra CLI arguments (#236). Empty map = no overrides.
+    /// When a step does not declare its own `extra_args`, the runner uses
+    /// this map for whichever backend is effective for the step.
+    pub extra_args: HashMap<Backend, Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -253,6 +297,12 @@ pub struct Step {
     /// Conversation-step idle timeout in seconds. `None` means "use the
     /// Router default" (currently 600s -- see RouterConfig).
     pub turn_timeout: Option<u64>,
+    /// Backend-keyed extra CLI arguments (#236). Empty map = no step-level
+    /// overrides; the runner falls back to the agent's `extra_args`.
+    /// Resolution is replace-not-merge: a non-empty step map fully shadows
+    /// the agent map, even if the step map has no entry for the effective
+    /// backend.
+    pub extra_args: HashMap<Backend, Vec<String>>,
 }
 
 impl Step {
@@ -394,6 +444,7 @@ pub fn load_agent_file_with_seeds(
     warn_unknown_fields(&format!("agent file '{agent_id}'"), &raw.unknown);
 
     let model = resolve_agent_model(&raw, defaults, koto_config)?;
+    let extra_args = validate_extra_args(raw.extra_args, &format!("agent file '{agent_id}'"))?;
 
     Ok((
         Agent {
@@ -406,10 +457,33 @@ pub fn load_agent_file_with_seeds(
             rules: raw.rules,
             skills: raw.skills,
             env: raw.env,
+            extra_args,
         },
         seed_idx,
         source_sha256,
     ))
+}
+
+/// Convert a string-keyed `extra_args` map (raw YAML form) into a
+/// [`Backend`]-keyed map. Unknown keys produce a validation error that names
+/// the offending key and lists the supported backend names. Empty entries
+/// (`backend: []`) are kept as-is so callers can detect an explicit "clear
+/// extra_args for this backend" intent if a future feature wants it; they
+/// simply produce no argv tokens at command-build time.
+fn validate_extra_args(
+    raw: HashMap<String, Vec<String>>,
+    context: &str,
+) -> Result<HashMap<Backend, Vec<String>>, ConfigError> {
+    let mut out = HashMap::with_capacity(raw.len());
+    for (key, val) in raw {
+        let backend = Backend::from_yaml_name(&key).ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "unknown backend in extra_args: '{key}' (valid: claude-cli, codex, ollama, api) in {context}"
+            ))
+        })?;
+        out.insert(backend, val);
+    }
+    Ok(out)
 }
 
 /// Build the relative path for an agent ID, splitting on `/` so nested
@@ -676,6 +750,13 @@ fn validate_and_resolve(
                 }
             }
 
+            // #236: validate the backend keys on the step's extra_args before
+            // we commit to a Step. Done here -- not after the kind check --
+            // so the error mentions the step ID even when the field is set
+            // on a step that ends up being rejected for some other reason.
+            let step_extra_args =
+                validate_extra_args(s.extra_args.clone(), &format!("step '{id}'"))?;
+
             if let Some(run_command) = s.run {
                 // Shell step: reject fields that have no meaning for shell
                 // execution. We don't silently drop them -- the user almost
@@ -695,6 +776,11 @@ fn validate_and_resolve(
                         "step '{id}' uses 'run' and cannot set 'backend' -- shell steps don't call an LLM"
                     )));
                 }
+                if !s.extra_args.is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "step '{id}' uses 'run' and cannot set 'extra_args' -- shell steps don't call an LLM"
+                    )));
+                }
                 return Ok(Step {
                     id,
                     agent: String::new(),
@@ -710,6 +796,7 @@ fn validate_and_resolve(
                     agents: Vec::new(),
                     max_turns: None,
                     turn_timeout: None,
+                    extra_args: HashMap::new(),
                 });
             }
 
@@ -730,6 +817,7 @@ fn validate_and_resolve(
                     agents: Vec::new(),
                     max_turns: None,
                     turn_timeout: None,
+                    extra_args: step_extra_args,
                 });
             }
 
@@ -772,6 +860,7 @@ fn validate_and_resolve(
                 agents: Vec::new(),
                 max_turns: None,
                 turn_timeout: None,
+                extra_args: step_extra_args,
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -848,6 +937,15 @@ fn resolve_conversation_step(id: String, s: RawStep) -> Result<Step, ConfigError
             "conversation step '{id}' must not set 'backend:' -- backend is configured per agent in agents/<Name>.yaml"
         )));
     }
+    // Step-level extra_args on a conversation would be ambiguous: the step
+    // resolves to N agents that may use different backends. Per-agent
+    // extra_args (in the agent file) is the correct knob; reject the
+    // step-level form to avoid silently dropping user intent (#236).
+    if !s.extra_args.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "conversation step '{id}' must not set 'extra_args:' -- extra_args is configured per agent in agents/<Name>.yaml because conversation participants may use different backends"
+        )));
+    }
     if s.agents.len() < 2 {
         return Err(ConfigError::Validation(format!(
             "conversation step '{id}' requires at least 2 entries in 'agents:' (got {})",
@@ -905,6 +1003,7 @@ fn resolve_conversation_step(id: String, s: RawStep) -> Result<Step, ConfigError
         agents: s.agents,
         max_turns: Some(max_turns),
         turn_timeout: s.turn_timeout,
+        extra_args: HashMap::new(),
     })
 }
 
@@ -2367,6 +2466,168 @@ flow:
             debate.needs.contains(&"brief".to_string()),
             "input dependency must merge into needs: {:?}",
             debate.needs
+        );
+    }
+
+    // --- #236: extra_args (backend-keyed escape hatch) ---
+
+    #[test]
+    fn agent_yaml_parses_extra_args_map() {
+        // Acceptance: an agent's `extra_args:` block keyed by backend name
+        // round-trips into a Backend-keyed HashMap with the verbatim token list.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Babis.yaml"),
+            r#"
+name: Babis
+role: "Senior dev"
+backend: codex
+model: gpt-5.5
+extra_args:
+  codex: ["-c", "model_reasoning_effort=high"]
+  claude-cli: ["--allowed-tools", "Read"]
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "default".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let agent = load_agent_file(dir.path(), "Babis", &defaults, None).unwrap();
+
+        assert_eq!(agent.backend, Backend::Codex);
+        assert_eq!(
+            agent.extra_args.get(&Backend::Codex),
+            Some(&vec![
+                "-c".to_string(),
+                "model_reasoning_effort=high".to_string()
+            ])
+        );
+        assert_eq!(
+            agent.extra_args.get(&Backend::ClaudeCli),
+            Some(&vec!["--allowed-tools".to_string(), "Read".to_string()])
+        );
+        assert!(agent.extra_args.get(&Backend::Ollama).is_none());
+    }
+
+    #[test]
+    fn step_extra_args_overrides_agent_extra_args() {
+        // Acceptance: when a step declares its own extra_args, it REPLACES
+        // (no merge) the agent-level map for the matching backend. The runner
+        // chooses the step map when it is non-empty -- this test asserts the
+        // raw structure, the runner-level resolution is covered by
+        // resolve_extra_args usage in run_step_via_executor.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Babis.yaml"),
+            r#"
+name: Babis
+role: "Senior dev"
+backend: codex
+model: gpt-5.5
+extra_args:
+  codex: ["-c", "from_agent=true"]
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".kuro").join("flows").join("override.yaml"),
+            "",
+        )
+        .ok();
+
+        let yaml = r#"
+version: "1"
+name: t
+defaults:
+  model: gpt-5.5
+  backend: codex
+flow:
+  build:
+    agent: Babis
+    extra_args:
+      codex: ["-c", "from_step=true"]
+"#;
+        let flow = load_flow_from_str(yaml).unwrap();
+        let step = &flow.steps[0];
+        // Step extra_args carries the override.
+        assert_eq!(
+            step.extra_args.get(&Backend::Codex),
+            Some(&vec!["-c".to_string(), "from_step=true".to_string()])
+        );
+
+        // Agent extra_args is unaffected -- the override lives at step level only.
+        let defaults = Defaults {
+            model: "gpt-5.5".to_string(),
+            backend: Backend::Codex,
+        };
+        let agent = load_agent_file(dir.path(), "Babis", &defaults, None).unwrap();
+        assert_eq!(
+            agent.extra_args.get(&Backend::Codex),
+            Some(&vec!["-c".to_string(), "from_agent=true".to_string()])
+        );
+
+        // Sanity: the two maps are not equal -- replacement, not merge.
+        assert_ne!(step.extra_args, agent.extra_args);
+    }
+
+    #[test]
+    fn unknown_backend_key_in_extra_args_is_rejected() {
+        // Acceptance: an unknown backend key must surface a validation error
+        // that names the offending key and lists supported backends.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Bad.yaml"),
+            r#"
+name: Bad
+role: "broken"
+extra_args:
+  not-a-backend: ["--flag"]
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "default".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let err = load_agent_file(dir.path(), "Bad", &defaults, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not-a-backend"),
+            "error must name the offending key: {msg}"
+        );
+        assert!(
+            msg.contains("claude-cli")
+                && msg.contains("codex")
+                && msg.contains("ollama")
+                && msg.contains("api"),
+            "error must list supported backends: {msg}"
+        );
+
+        // Same check at the step level.
+        let step_yaml = r#"
+version: "1"
+name: t
+flow:
+  go:
+    agent: dev
+    extra_args:
+      bogus: ["--x"]
+"#;
+        let err = load_flow_from_str(step_yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("bogus"), "error must name key: {msg}");
+        assert!(
+            msg.contains("claude-cli"),
+            "error must list valid backends: {msg}"
         );
     }
 }

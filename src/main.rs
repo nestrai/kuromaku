@@ -203,6 +203,7 @@ async fn run_task(agent_names: &[String], task: &str) -> Result<()> {
             agents: Vec::new(),
             max_turns: None,
             turn_timeout: None,
+            extra_args: std::collections::HashMap::new(),
         });
     }
 
@@ -693,6 +694,7 @@ mod tests {
             agents: Vec::new(),
             max_turns: None,
             turn_timeout: None,
+            extra_args: std::collections::HashMap::new(),
         }
     }
 

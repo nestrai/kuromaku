@@ -196,6 +196,7 @@ flow:
                 agents: Vec::new(),
                 max_turns: None,
                 turn_timeout: None,
+                extra_args: std::collections::HashMap::new(),
             }],
             stack: crate::config::StackConfig {
                 backend: "local".to_string(),
