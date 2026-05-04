@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use indexmap::IndexMap;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::koto_config::{KOTO_CONFIG_FILE, KotoConfig, Seeds};
 
@@ -105,6 +105,18 @@ impl<'de> Deserialize<'de> for Version {
         }
 
         deserializer.deserialize_any(VersionVisitor)
+    }
+}
+
+impl Serialize for Version {
+    /// Serialize as the canonical string form. The on-disk schema accepts
+    /// `version: "1"` and `version: 1`, but the in-memory representation is
+    /// always a string -- so the round-trip output is always quoted.
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&self.0)
     }
 }
 
@@ -326,6 +338,102 @@ pub struct StackConfig {
     pub path: String,
 }
 
+// --- Graph flow schema (issue #237) ---
+
+/// On-disk flow shape. Either the original linear sequence (`flow:`) or the
+/// new state graph (`states:`). Returned by [`load_flow_any_from_str`] for
+/// callers that need to handle both shapes; the legacy
+/// [`load_flow_from_str`] still returns just [`FlowConfig`] (linear) so
+/// existing call sites do not need to switch in lockstep with the schema
+/// addition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flow {
+    Linear(FlowConfig),
+    Graph(GraphFlow),
+}
+
+/// State-graph flow definition.
+///
+/// Schema-only for now (issue #237): no runtime, no reachability/dead-end
+/// validator. The driver and validator that turn this into executable
+/// behaviour live in follow-up issues. Validation here covers structural
+/// references only -- `initial:` exists, every `edge.to:` exists, and each
+/// state has either outgoing edges or a `kind:`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphFlow {
+    pub version: Version,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// State ID where the graph starts. Must reference a key in
+    /// [`GraphFlow::states`]; the structural check fires in
+    /// [`validate_graph_flow`].
+    pub initial: String,
+    /// State definitions, keyed by state ID. Order is preserved so a
+    /// future Mermaid exporter can render states in declaration order.
+    pub states: IndexMap<String, GraphState>,
+}
+
+/// One node in the state graph.
+///
+/// A non-terminal state declares `edges:`. A terminal state declares
+/// `kind: final`. A human-handoff state declares `kind: human` (and may
+/// also declare `edges:` for the resume-* targets shown in the design
+/// doc). The validator rejects a state with neither edges nor kind --
+/// that shape would be a silent dead end at runtime.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphState {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<StateKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    /// Outgoing transitions, keyed by edge name. Optional because
+    /// `kind: final` states do not need any. Order is preserved so the
+    /// runtime (when it lands) can present choices to an agent in
+    /// declaration order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub edges: Option<IndexMap<String, GraphEdge>>,
+}
+
+/// Terminal-state discriminator. `final` ends the run; `human` hands off
+/// to a human operator. Both are accepted at the schema level here --
+/// runtime semantics for `human` (resume, abort) are owned by the driver
+/// issue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateKind {
+    Final,
+    Human,
+}
+
+/// One outgoing transition from a state. Both fields are required:
+/// `to:` so the runtime knows where to go, `description:` so the agent
+/// (or human) understands when to pick this edge. Missing either is a
+/// serde-level error.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GraphEdge {
+    pub to: String,
+    pub description: String,
+}
+
+/// Probe struct used by [`load_flow_any_from_str`] to decide which shape
+/// the YAML is in before committing to a full parse. Looking at just
+/// these two top-level fields lets us emit the "pick one" error before
+/// the stricter graph parser flags graph-only fields as unknown on a
+/// linear flow (or vice versa), giving the user a clearer message.
+#[derive(Deserialize)]
+struct FlowShapeProbe {
+    #[serde(default)]
+    flow: Option<serde_yaml::Value>,
+    #[serde(default)]
+    states: Option<serde_yaml::Value>,
+}
+
 // --- Constants ---
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-5";
@@ -374,6 +482,105 @@ pub fn load_flow_from_str_with_project(
         warn_unknown_fields("stack", &stack.unknown);
     }
     validate_and_resolve(raw, role_overrides, project_roles)
+}
+
+/// Load a flow YAML that may be either linear (`flow:`) or graph
+/// (`states:`) shaped (issue #237).
+///
+/// Dispatches on which top-level field is present:
+/// * `flow:` only -> [`Flow::Linear`] (delegates to [`load_flow_from_str`])
+/// * `states:` only -> [`Flow::Graph`] (delegates to [`load_graph_flow_from_str`])
+/// * both set -> hard error ("pick one"), per issue #237 acceptance criteria
+/// * neither set -> hard error naming both fields
+///
+/// New callers that want graph support use this entry. Existing call
+/// sites keep using [`load_flow_from_str`] until the runtime side of the
+/// graph schema lands.
+#[allow(dead_code)]
+pub fn load_flow_any_from_str(contents: &str) -> Result<Flow, ConfigError> {
+    let probe: FlowShapeProbe = serde_yaml::from_str(contents)?;
+    match (probe.flow.is_some(), probe.states.is_some()) {
+        (true, true) => Err(ConfigError::Validation(
+            "flow file declares both 'flow:' and 'states:' -- pick one (linear flow vs state graph)"
+                .to_string(),
+        )),
+        (false, false) => Err(ConfigError::Validation(
+            "flow file must declare either 'flow:' (linear) or 'states:' (state graph)"
+                .to_string(),
+        )),
+        (true, false) => Ok(Flow::Linear(load_flow_from_str(contents)?)),
+        (false, true) => Ok(Flow::Graph(load_graph_flow_from_str(contents)?)),
+    }
+}
+
+/// Load a graph-shaped flow YAML.
+///
+/// Schema-only validation (issue #237): version match, `initial:`
+/// references a known state, every `edge.to:` references a known state,
+/// and each state has at least one of `edges:` or `kind:`. Reachability
+/// and dead-end checks are deferred to the validator issue.
+#[allow(dead_code)]
+pub fn load_graph_flow_from_str(contents: &str) -> Result<GraphFlow, ConfigError> {
+    let raw: GraphFlow = serde_yaml::from_str(contents)?;
+    validate_graph_flow(&raw)?;
+    Ok(raw)
+}
+
+/// Structural validation for [`GraphFlow`].
+///
+/// Walks the state map twice: first to confirm `initial:` resolves, then
+/// per state to confirm every edge target resolves and the
+/// edges-or-kind requirement holds. Errors are written to name the
+/// offending state ID and field so the user can jump straight to the
+/// problem in the YAML.
+fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
+    if g.version.0 != "1" {
+        return Err(ConfigError::Validation(format!(
+            "unsupported version '{}', expected '1'",
+            g.version.0
+        )));
+    }
+
+    if !g.states.contains_key(&g.initial) {
+        return Err(ConfigError::Validation(format!(
+            "graph flow 'initial' references unknown state '{}' (known states: {})",
+            g.initial,
+            sorted_state_ids(&g.states).join(", ")
+        )));
+    }
+
+    for (id, state) in &g.states {
+        let has_edges = state.edges.as_ref().is_some_and(|e| !e.is_empty());
+        let has_kind = state.kind.is_some();
+        if !has_edges && !has_kind {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' has neither 'edges:' nor 'kind:' -- a state must declare at least one outgoing edge or be marked 'kind: final' / 'kind: human'"
+            )));
+        }
+        if let Some(edges) = &state.edges {
+            for (edge_name, edge) in edges {
+                if !g.states.contains_key(&edge.to) {
+                    return Err(ConfigError::Validation(format!(
+                        "graph state '{id}' edge '{edge_name}' targets unknown state '{}' (known states: {})",
+                        edge.to,
+                        sorted_state_ids(&g.states).join(", ")
+                    )));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Helper: produce a sorted list of state IDs for inclusion in error
+/// messages. Sorting keeps the error output stable across runs (IndexMap
+/// preserves insertion order, which is fine for users editing the YAML
+/// but unhelpful for diffable error messages).
+fn sorted_state_ids(states: &IndexMap<String, GraphState>) -> Vec<String> {
+    let mut keys: Vec<String> = states.keys().cloned().collect();
+    keys.sort();
+    keys
 }
 
 /// Parse just the role names from a flow YAML (for CLI arg partitioning).
@@ -2703,5 +2910,389 @@ flow:
             msg.contains("step 'go'"),
             "step-level error must name the step id: {msg}"
         );
+    }
+
+    // --- Graph flow schema tests (issue #237) ---
+
+    /// Reusable minimal-but-complete graph YAML covering every shape the
+    /// schema accepts: a non-terminal state with edges, a re-entrant edge,
+    /// a `kind: human` state with edges (the resume-* pattern from the
+    /// design doc), and a `kind: final` state with no edges.
+    const GRAPH_CONFIG: &str = r#"
+version: "1"
+name: example-graph
+prompt: |
+  Top-level instruction shared by all states.
+
+initial: start
+
+states:
+  start:
+    role: developer
+    task: |
+      Do the first thing.
+    edges:
+      ok:
+        to: middle
+        description: Things went well.
+      stuck:
+        to: aborted
+        description: Cannot proceed.
+
+  middle:
+    role: reviewer
+    task: |
+      Check the result.
+    edges:
+      approved:
+        to: done
+        description: Looks good.
+      rework:
+        to: start
+        description: Needs another round.
+
+  human_review:
+    kind: human
+    edges:
+      resume:
+        to: middle
+        description: Operator unblocks the review.
+      abort:
+        to: aborted
+        description: Operator aborts the run.
+
+  done:
+    kind: final
+
+  aborted:
+    kind: final
+"#;
+
+    #[test]
+    fn graph_minimal_parses() {
+        // Acceptance: adding `states:` instead of `flow:` parses into a
+        // graph variant of the flow config.
+        let flow = load_flow_any_from_str(GRAPH_CONFIG).unwrap();
+        let g = match flow {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph variant, got linear"),
+        };
+        assert_eq!(g.name, "example-graph");
+        assert_eq!(g.version.0, "1");
+        assert_eq!(g.initial, "start");
+        // Order is preserved from declaration order.
+        let ids: Vec<&str> = g.states.keys().map(String::as_str).collect();
+        assert_eq!(
+            ids,
+            vec!["start", "middle", "human_review", "done", "aborted"]
+        );
+
+        // Spot-check a regular state: edges parse with `to:` and
+        // `description:` populated.
+        let start = &g.states["start"];
+        assert_eq!(start.role.as_deref(), Some("developer"));
+        let edges = start.edges.as_ref().unwrap();
+        assert_eq!(edges["ok"].to, "middle");
+        assert_eq!(edges["ok"].description, "Things went well.");
+
+        // Final state has no edges, just kind.
+        let done = &g.states["done"];
+        assert_eq!(done.kind, Some(StateKind::Final));
+        assert!(done.edges.is_none());
+
+        // Human state carries kind AND edges (the design doc resume-*
+        // pattern).
+        let hr = &g.states["human_review"];
+        assert_eq!(hr.kind, Some(StateKind::Human));
+        assert!(hr.edges.is_some());
+    }
+
+    #[test]
+    fn graph_linear_via_polymorphic_loader() {
+        // Acceptance: the polymorphic loader still returns the linear
+        // shape unchanged when the YAML uses `flow:`. This anchors the
+        // "existing linear-flow tests still pass unchanged" guarantee at
+        // the new entry point as well as the legacy one.
+        let flow = load_flow_any_from_str(MINIMAL_CONFIG).unwrap();
+        match flow {
+            Flow::Linear(c) => {
+                assert_eq!(c.name, "minimal");
+                assert_eq!(c.steps.len(), 1);
+            }
+            Flow::Graph(_) => panic!("expected linear variant for `flow:` YAML"),
+        }
+    }
+
+    #[test]
+    fn graph_missing_initial_errors() {
+        // Acceptance: `initial:` is required when `states:` is present;
+        // the error message names the field.
+        let yaml = r#"
+version: "1"
+name: no-initial
+states:
+  done:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("initial"),
+            "error must name the missing 'initial' field: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_unknown_initial_target_errors() {
+        // Acceptance: `initial:` referencing an unknown state produces a
+        // structural error referencing the offending state-id and field.
+        let yaml = r#"
+version: "1"
+name: bad-initial
+initial: nowhere
+states:
+  done:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("initial") && msg.contains("'nowhere'"),
+            "error must name field and offending state-id: {msg}"
+        );
+        assert!(
+            msg.contains("done"),
+            "error must list the known states for orientation: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_edge_to_unknown_state_errors() {
+        // Acceptance: an edge `to:` referencing an unknown state produces
+        // a structural error referencing the offending state-id, edge
+        // name, and target.
+        let yaml = r#"
+version: "1"
+name: bad-edge
+initial: start
+states:
+  start:
+    role: developer
+    edges:
+      ok:
+        to: ghost
+        description: Goes nowhere real.
+  done:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("start") && msg.contains("'ok'") && msg.contains("'ghost'"),
+            "error must name source state, edge name, and target: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_mixed_flow_and_states_is_hard_error() {
+        // Acceptance: a flow file with both `flow:` and `states:` is a
+        // hard error -- "pick one".
+        let yaml = r#"
+version: "1"
+name: mixed
+initial: start
+flow:
+  whatever:
+    agent: dev
+states:
+  start:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("both") && msg.contains("'flow:'") && msg.contains("'states:'"),
+            "error must explicitly call out the conflict: {msg}"
+        );
+        assert!(
+            msg.contains("pick one"),
+            "error must direct the user to pick one shape: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_neither_flow_nor_states_errors() {
+        // Implied by the dispatch: a YAML that declares neither shape is
+        // not a valid flow file. Errors must name both fields so the
+        // user knows the choice they need to make.
+        let yaml = r#"
+version: "1"
+name: empty-shape
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'flow:'") && msg.contains("'states:'"),
+            "error must list both possible top-level shapes: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_state_without_edges_or_kind_errors() {
+        // Acceptance: each state has either `edges:` (non-final) or
+        // `kind: final` / `kind: human`. A state with neither is a
+        // silent dead end at runtime -- reject it at parse time.
+        let yaml = r#"
+version: "1"
+name: dangling-state
+initial: lonely
+states:
+  lonely:
+    role: developer
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("'lonely'"),
+            "error must name the offending state: {msg}"
+        );
+        assert!(
+            msg.contains("edges") && msg.contains("kind"),
+            "error must explain what is required (edges or kind): {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_edge_missing_to_is_serde_error() {
+        // The `to:` field is required by the GraphEdge serde derive;
+        // omitting it surfaces a parse error from serde, not a custom
+        // validation. We assert the error mentions `to` so the user can
+        // locate the omission.
+        let yaml = r#"
+version: "1"
+name: bad-edge
+initial: start
+states:
+  start:
+    edges:
+      ok:
+        description: Missing the target.
+  done:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("to"),
+            "serde error must mention the missing 'to' field: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_edge_missing_description_is_serde_error() {
+        // Same contract as the `to:` test: `description:` is required so
+        // the runtime can show the agent/human a meaningful menu of
+        // choices. Omission must fail at parse, not silently default.
+        let yaml = r#"
+version: "1"
+name: bad-edge
+initial: start
+states:
+  start:
+    edges:
+      ok:
+        to: done
+  done:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("description"),
+            "serde error must mention the missing 'description' field: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_unknown_field_is_rejected() {
+        // `deny_unknown_fields` on GraphFlow / GraphState / GraphEdge
+        // makes typos fail at parse time. We anchor that here so future
+        // edits do not silently relax the schema.
+        let yaml = r#"
+version: "1"
+name: typo
+initial: start
+states:
+  start:
+    role: developer
+    typo_field: oops
+    edges:
+      ok:
+        to: done
+        description: ok
+  done:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("typo_field"),
+            "deny_unknown_fields must surface the unknown key: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_unknown_kind_value_errors() {
+        // `kind:` is an enum (`final` | `human`); any other value must
+        // fail at parse time so a typo cannot silently disable the
+        // terminal-state semantics.
+        let yaml = r#"
+version: "1"
+name: bad-kind
+initial: done
+states:
+  done:
+    kind: end
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("end") || msg.contains("variant"),
+            "error must indicate the invalid kind value: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_unsupported_version_errors() {
+        // Same version policy as the linear loader: only "1" is
+        // accepted today. Mirrored here so the graph loader cannot
+        // silently drift to a different policy.
+        let yaml = r#"
+version: "2"
+name: future
+initial: done
+states:
+  done:
+    kind: final
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsupported version '2'"),
+            "error must name the unsupported version: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_round_trip_serde() {
+        // Acceptance: round-trip serde -- deserialize the canonical
+        // GRAPH_CONFIG to a GraphFlow, serialize it back to YAML,
+        // re-parse, and assert the structures are equal. Byte-equal
+        // YAML is intentionally NOT asserted (quoting/indent normalisation
+        // would make the test brittle without adding signal).
+        let parsed = load_graph_flow_from_str(GRAPH_CONFIG).unwrap();
+        let yaml = serde_yaml::to_string(&parsed).expect("serialize round-trip");
+        let reparsed = load_graph_flow_from_str(&yaml).expect("re-parse round-trip");
+        assert_eq!(parsed, reparsed);
     }
 }
