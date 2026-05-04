@@ -386,10 +386,13 @@ states:
 "#;
 
 #[test]
-fn max_steps_aborts_runaway_loop_with_clear_error() {
-    // AC4: max_steps=30 aborts a runaway loop with a clear error
-    // naming the last state. The graph above has no `final` state;
-    // the agent obediently bounces a <-> b until the driver gives up.
+fn per_state_visits_aborts_with_clear_error() {
+    // The per-state visit cap (DEFAULT_MAX_VISITS_PER_STATE = 5, see
+    // src/runner/graph.rs) trips before the global max_steps cap on a
+    // tight `a <-> b` ping-pong. The error must name the looping state
+    // and the cap value so the user can see what got stuck. The graph
+    // above has no `final` state; the agent obediently bounces a <-> b
+    // until the driver gives up.
     let project = make_project(&[("Dev", "dev")]);
     let flow = project.path().join("flow.yaml");
     std::fs::write(&flow, GRAPH_LOOP).unwrap();
@@ -419,22 +422,31 @@ esac
     );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("max_steps"),
-        "stderr must explain the cap; got:\n{stderr}"
+        stderr.contains("visited")
+            && stderr.contains("cap 5")
+            && stderr.contains("stuck in a loop"),
+        "stderr must name the per-state cap and the loop diagnosis; got:\n{stderr}"
     );
-    // The last state reached before the abort is one of the two loop
-    // states -- whichever the 31st step would have visited.
+    // The looping state named in the abort message is whichever side of
+    // the a <-> b ping-pong tripped the cap first. With start=`a`, that
+    // is `a` on its 6th entry, but keep both alternatives so the test
+    // does not encode driver entry-order beyond what the contract gives.
     assert!(
         stderr.contains("'a'") || stderr.contains("'b'"),
-        "stderr must name the last state; got:\n{stderr}"
+        "stderr must name the looping state; got:\n{stderr}"
     );
 
-    // Driver enforces 30 successful state visits before aborting; the
-    // shim must therefore have been called exactly 30 times.
+    // With cap=5 and a 2-state ping-pong starting at `a`, the abort
+    // fires when `a` is entered for the 6th time, *before* the agent
+    // runs. Sequence of agent invocations: a,b,a,b,a,b,a,b,a,b -> 10
+    // calls, then the 11th entry to `a` aborts.
     let n: u32 = std::fs::read_to_string(_shim_dir.path().join("calls"))
         .unwrap()
         .trim()
         .parse()
         .unwrap();
-    assert_eq!(n, 30, "max_steps must allow exactly 30 visits, got {n}");
+    assert_eq!(
+        n, 10,
+        "per-state cap (5) must abort on 6th entry to 'a'; expected 10 shim calls, got {n}"
+    );
 }
