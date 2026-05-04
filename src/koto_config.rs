@@ -266,6 +266,17 @@ impl Seeds {
     /// config (or the config file itself is absent). Single `.kuro/` seed,
     /// no eager existence check -- matches the pre-rename `.koto/` behavior
     /// against the new directory name.
+    ///
+    /// **Path contract**: the returned seed path is **relative** (`.kuro`).
+    /// Callers that pair this with the process CWD (runner, main, chat,
+    /// resolver) get the expected behavior because the rest of the project
+    /// config also resolves against the process CWD. Callers that have an
+    /// explicit `cwd: &Path` argument and pass it down to filesystem walks
+    /// (e.g. the MCP discovery tools in `src/mcp/discovery.rs`) **must**
+    /// rebase relative seed paths against that `cwd` -- otherwise the walks
+    /// fall through to the process CWD and silently leak (#293). The
+    /// canonical resolution helper for the discovery path is
+    /// `discover_seeds`/`rebase_seeds_for_cwd` in `src/mcp/discovery.rs`.
     pub fn default_local() -> Self {
         Self {
             seeds: vec![Seed {

@@ -39,7 +39,7 @@ use tracing::warn;
 use crate::config::{
     Backend, Defaults, RawAgentFile, load_agent_file_with_seeds, load_flow_from_str,
 };
-use crate::koto_config::{KOTO_DIR, KotoConfig, SeedSource, Seeds};
+use crate::koto_config::{KOTO_DIR, KotoConfig, Seed, SeedSource, Seeds};
 use crate::runner::load_guide_from_seeds;
 use crate::skills::resolve_skill;
 
@@ -53,11 +53,44 @@ const MAX_DESCRIPTION_CHARS: usize = 200;
 // --- Seed / config helpers ---
 
 fn discover_seeds(cwd: &Path) -> Result<Seeds, McpError> {
-    match KotoConfig::load_optional(cwd) {
-        Ok(Some(cfg)) => Ok(cfg.seeds),
-        Ok(None) => Ok(Seeds::default_local()),
-        Err(e) => Err(internal(format!("project config invalid: {}", e.message()))),
-    }
+    let seeds = match KotoConfig::load_optional(cwd) {
+        Ok(Some(cfg)) => cfg.seeds,
+        Ok(None) => Seeds::default_local(),
+        Err(e) => return Err(internal(format!("project config invalid: {}", e.message()))),
+    };
+    Ok(rebase_seeds_for_cwd(seeds, cwd))
+}
+
+/// Rebase any relative `Local` seed paths against `cwd`. Absolute paths and
+/// remote seeds pass through unchanged.
+///
+/// Why: [`Seeds::default_local`] returns a relative `.kuro` `PathBuf`, and a
+/// user-written project config can also carry relative `path:` entries.
+/// Without rebasing, downstream filesystem walks (`agents_dir.is_dir()`,
+/// `read_dir`) resolve those relative paths against the **process** CWD,
+/// not against the explicit `cwd` argument the MCP discovery tools receive.
+/// That is the bug behind issue #293: `do_list_agents(tmp.path())` would
+/// otherwise leak into the kuromaku repo's own `.kuro/agents/` directory
+/// when the tempdir has no `.kuro/` of its own.
+///
+/// We deliberately do not call [`std::path::Path::canonicalize`] here:
+/// canonicalize errors on missing paths, which would break the legitimate
+/// "no `.kuro/` yet" case. Path joining is infallible.
+fn rebase_seeds_for_cwd(seeds: Seeds, cwd: &Path) -> Seeds {
+    let rebased = seeds
+        .seeds
+        .into_iter()
+        .map(|seed| match seed.source {
+            SeedSource::Local { display, path } if path.is_relative() => Seed {
+                source: SeedSource::Local {
+                    display,
+                    path: cwd.join(path),
+                },
+            },
+            other => Seed { source: other },
+        })
+        .collect();
+    Seeds { seeds: rebased }
 }
 
 fn project_config(cwd: &Path) -> Option<KotoConfig> {
@@ -807,6 +840,106 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let v = do_list_agents(tmp.path()).unwrap();
         assert_eq!(v["agents"].as_array().unwrap().len(), 0);
+    }
+
+    // ---- discover_seeds / rebase_seeds_for_cwd (issue #293) ----
+
+    #[test]
+    fn discover_seeds_rebases_relative_default_against_cwd() {
+        // No project config in `cwd`: `discover_seeds` falls back to
+        // `Seeds::default_local()` which carries a relative `.kuro` path.
+        // The rebase must produce `cwd.join(".kuro")` so downstream
+        // filesystem walks operate on the explicit cwd, not the process CWD.
+        let tmp = TempDir::new().unwrap();
+        let seeds = discover_seeds(tmp.path()).unwrap();
+        assert_eq!(seeds.seeds.len(), 1);
+        match &seeds.seeds[0].source {
+            SeedSource::Local { path, .. } => {
+                assert_eq!(path, &tmp.path().join(".kuro"));
+                assert!(path.is_absolute(), "rebased seed must be absolute");
+            }
+            other => panic!("expected local seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebase_seeds_for_cwd_leaves_absolute_paths_untouched() {
+        // Regression guard: an absolute seed path (e.g. one written by the
+        // user as `path: /abs/path` and validated by `Seeds::from_raw_entries`
+        // with `expand_tilde`) must NOT be re-prefixed with `cwd`. Defends
+        // against an accidental double-join.
+        let tmp = TempDir::new().unwrap();
+        let abs = tmp.path().join("seed-abs");
+        let seeds = Seeds {
+            seeds: vec![Seed {
+                source: SeedSource::Local {
+                    display: abs.display().to_string(),
+                    path: abs.clone(),
+                },
+            }],
+        };
+        // `cwd` is a different directory entirely.
+        let other = TempDir::new().unwrap();
+        let rebased = rebase_seeds_for_cwd(seeds, other.path());
+        match &rebased.seeds[0].source {
+            SeedSource::Local { path, .. } => {
+                assert_eq!(path, &abs, "absolute path must pass through unchanged");
+            }
+            other => panic!("expected local seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rebase_seeds_for_cwd_passes_remote_seeds_through() {
+        // Remote seeds carry no path; they must round-trip identically.
+        let seeds = Seeds {
+            seeds: vec![Seed {
+                source: SeedSource::Remote {
+                    repo: "github.com/foo/bar".to_string(),
+                    ref_: Some("main".to_string()),
+                },
+            }],
+        };
+        let tmp = TempDir::new().unwrap();
+        let rebased = rebase_seeds_for_cwd(seeds, tmp.path());
+        match &rebased.seeds[0].source {
+            SeedSource::Remote { repo, ref_ } => {
+                assert_eq!(repo, "github.com/foo/bar");
+                assert_eq!(ref_.as_deref(), Some("main"));
+            }
+            other => panic!("expected remote seed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn do_list_agents_empty_with_relative_seed_in_project_config() {
+        // The user's `.kuro/config.yaml` writes a relative seed path
+        // (`path: .kuro`). The discovery layer must resolve it against the
+        // config's parent (`cwd`), not the process CWD.
+        //
+        // Note: `Seeds::from_raw_entries` performs an `exists()` existence
+        // check on the literal relative path, which resolves against the
+        // process CWD at validation time. During `cargo test` that CWD is
+        // the kuromaku repo root and `.kuro/` exists there, so validation
+        // passes. (That existence check is a separate latent issue, out of
+        // scope for #293.) The seed's `path` after validation is still
+        // relative (`PathBuf::from(".kuro")`), and `discover_seeds` rebases
+        // it -- which is the behavior under test.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        write(
+            &cwd.join(".kuro/config.yaml"),
+            "version: \"1\"\nseeds:\n  - path: .kuro\n",
+        );
+        // Tempdir has a `.kuro/` (because we wrote config.yaml into it) but
+        // no `.kuro/agents/`. After the rebase, enumeration walks
+        // `tmp/.kuro/agents` which does not exist -- expect zero agents.
+        let v = do_list_agents(cwd).unwrap();
+        assert_eq!(
+            v["agents"].as_array().unwrap().len(),
+            0,
+            "relative seed in project config must rebase against cwd, not process CWD; got {v}"
+        );
     }
 
     // ---- do_list_flows ----
