@@ -1033,6 +1033,7 @@ mod tests {
                 turns: None,
                 messages: None,
                 terminated_by: None,
+                graph_decision: None,
             },
         }];
 

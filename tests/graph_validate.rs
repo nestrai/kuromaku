@@ -268,15 +268,29 @@ fn run_dead_end_graph_refuses_before_spawn() {
 }
 
 #[test]
-fn run_graph_flow_refuses_to_start_with_clear_message() {
-    // AC: `kuro run <flow>` on a graph flow must not silently fall
-    // through to the linear loader. The pre-flight gate produces a
-    // graph-aware message, and -- critical for the issue -- no agent
-    // is spawned. We check the message here; the "no spawn" property
-    // is implicit: the runner returns Err before reaching the agent
-    // loader, so spawning a fake claude shim is unnecessary.
+fn run_graph_flow_routes_through_graph_runtime() {
+    // AC: `kuro run <flow>` on a graph flow must NOT silently fall
+    // through to the linear DAG loader. With the graph runtime in
+    // place (issue #240), the structural guarantee is that graph
+    // flows hit a dedicated execution branch. We prove this with a
+    // trivial graph whose initial state is already final: the linear
+    // loader would error on the missing `agents:` and `steps:` keys,
+    // while the graph runtime walks states, sees `kind: final`, and
+    // exits zero without spawning any agent.
+    const FINAL_ONLY_GRAPH: &str = r#"
+version: "1"
+name: final-only
+initial: done
+states:
+  done:
+    kind: final
+"#;
+
     let tmp = tempfile::tempdir().unwrap();
-    let flow = write_flow(tmp.path(), "clean.yaml", CLEAN_GRAPH);
+    let flow = write_flow(tmp.path(), "final-only.yaml", FINAL_ONLY_GRAPH);
+    // Isolate the run state so we don't pollute the developer's
+    // ~/.koto/stacks/ with throwaway test runs.
+    let home = tempfile::tempdir().unwrap();
 
     let out = Command::new(kuro_bin())
         .arg("run")
@@ -284,17 +298,28 @@ fn run_graph_flow_refuses_to_start_with_clear_message() {
         .arg(&flow)
         .arg("-t")
         .arg("ignored")
+        .env("HOME", home.path())
+        // Run from the tempdir so we don't pick up the kuromaku
+        // project's own .kuro/config.yaml (its seeds reference paths
+        // outside the test sandbox).
+        .current_dir(tmp.path())
         .output()
         .expect("spawn kuro run");
 
     assert!(
-        !out.status.success(),
-        "graph flow must not start (no runtime yet); status={:?}",
-        out.status
+        out.status.success(),
+        "graph runtime must accept a final-only graph; status={:?}, stdout={}, stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
     );
+    // The graph runtime announces itself with a flow-level banner
+    // and a `reached final state` line. The linear DAG loader would
+    // never produce these strings -- presence proves we routed
+    // through the graph branch.
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("graph flow") || stderr.contains("state-graph runtime"),
-        "stderr must explain the graph-flow situation; got:\n{stderr}"
+        stderr.contains("graph flow") && stderr.contains("reached final state"),
+        "stderr must show graph runtime markers; got:\n{stderr}"
     );
 }
