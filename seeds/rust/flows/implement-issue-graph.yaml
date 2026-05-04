@@ -1,0 +1,85 @@
+# Graph-flow prototype of `implement-issue.yaml`.
+#
+# Same intent as the linear flow (read an issue, implement it, review,
+# open a draft PR), but expressed as a state graph: each agent picks the
+# next state from a closed set of edges. The reviewer can route back to
+# `implement` or back to `design` depending on what they actually found,
+# instead of the linear PASS/FAIL split.
+#
+# Usage: kuro run implement-issue-graph id=42
+# See docs/graph-flows.md for when to pick `flow:` vs `states:`.
+version: "1"
+name: implement-issue-graph
+prompt: |
+  Implement issue #{{id}} in this repository. Follow the team's rules
+  and produce a draft PR at the end.
+
+initial: design
+
+states:
+  design:
+    role: architect
+    task: |
+      Read issue #{{id}} (`gh issue view {{id}} --comments`). Produce a
+      short design plan: affected files, interfaces, tests. Do not modify
+      code.
+    edges:
+      design_complete:
+        to: implement
+        description: Plan is complete, ready to implement.
+      blocked:
+        to: aborted
+        description: Cannot produce a design (missing context, ambiguity).
+
+  implement:
+    role: developer
+    task: |
+      Implement the design from the previous step. Conventional commits,
+      feature branch, never main. Add or update tests.
+    edges:
+      implementation_complete:
+        to: review
+        description: All design items implemented and committed.
+      design_problem:
+        to: design
+        description: Implementation revealed a design flaw, need to revisit.
+      blocked:
+        to: aborted
+        description: Cannot proceed safely.
+
+  review:
+    role: reviewer
+    task: |
+      Review the implementation against the issue's acceptance criteria.
+    edges:
+      approved:
+        to: create_pr
+        description: All acceptance criteria met, code quality acceptable.
+      changes_implementation:
+        to: implement
+        description: Code-level changes needed (naming, refactor, missing test).
+      changes_design:
+        to: design
+        description: Implementation revealed the design itself is wrong.
+      blocked:
+        to: aborted
+        description: Review cannot complete.
+
+  create_pr:
+    role: developer
+    task: |
+      Push the branch and open a draft PR with `Closes #{{id}}`. Output
+      the URL.
+    edges:
+      pr_created:
+        to: done
+        description: PR opened.
+      failed:
+        to: aborted
+        description: PR creation failed.
+
+  done:
+    kind: final
+
+  aborted:
+    kind: final
