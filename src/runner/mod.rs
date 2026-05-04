@@ -2355,6 +2355,37 @@ mod flow_api {
         // Read flow YAML once -- needed for role-name partitioning and for
         // the manifest's `flow_sha256`.
         let contents = std::fs::read_to_string(&path)?;
+
+        // Graph-flow pre-flight (issue #238). The runtime for state-graph
+        // flows does not exist yet; before the linear loader trips on a
+        // missing `flow:` field with a confusing serde error, probe the
+        // shape and:
+        //   * surface a graph-aware error if the flow is a graph,
+        //   * run the reachability/dead-end validator first so dead-ends
+        //     fail with a graph-aware message *before* any agent spawn.
+        // Acceptance criteria #5 from the issue: a dead-end graph must
+        // refuse to start before any agent is spawned.
+        if let Ok(config::Flow::Graph(g)) = config::load_flow_any_from_str(&contents) {
+            let report = config::validate_graph_reachability(&g);
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            for error in &report.errors {
+                eprintln!("error: {error}");
+            }
+            if !report.is_ok() {
+                return Err(eyre!(
+                    "graph flow '{}' has {} validation error(s); refusing to start",
+                    path.display(),
+                    report.errors.len()
+                ));
+            }
+            return Err(eyre!(
+                "graph flow '{}' validated, but the state-graph runtime is not implemented yet (only schema and validation are available; tracked in follow-up issues)",
+                path.display()
+            ));
+        }
+
         let role_names = config::parse_role_names(&contents)?;
 
         // Bare key=value args partition by role-name membership.
@@ -2748,9 +2779,9 @@ pub use flow_api::{
 // reach for these directly (only the test build does) -- silence the lint.
 #[allow(unused_imports)]
 pub(crate) use flow_api::{
-    apply_resolved_roles_to_steps, apply_role_agent_overrides, build_manifest, resolve_stack_path,
-    resolve_stack_path_for_flow_name, resolve_task, substitute_placeholders, substitute_vars,
-    verify_flow_step_ids,
+    apply_resolved_roles_to_steps, apply_role_agent_overrides, build_manifest, resolve_flow_path,
+    resolve_stack_path, resolve_stack_path_for_flow_name, resolve_task, substitute_placeholders,
+    substitute_vars, verify_flow_step_ids,
 };
 
 // Test-only re-export so in-tree consumers (notably the MCP session module)

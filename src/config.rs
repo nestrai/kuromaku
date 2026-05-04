@@ -583,6 +583,114 @@ fn sorted_state_ids(states: &IndexMap<String, GraphState>) -> Vec<String> {
     keys
 }
 
+// --- Graph reachability + dead-end validation (issue #238) ---
+
+/// Outcome of [`validate_graph_reachability`].
+///
+/// Errors and warnings are tracked separately because they have different
+/// blocking semantics: a dead-end leaves the runtime stuck with no
+/// transition to take and must block execution; an unreachable state is
+/// usually a sign of mid-edit work and is not a reason to refuse to run.
+/// Callers (CLI, runner pre-flight) decide how to format and where to
+/// route each list -- the validator does not print.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GraphValidationReport {
+    /// Hard errors. Non-empty means the flow must not run.
+    pub errors: Vec<String>,
+    /// Soft warnings. The flow may still run (or pass `kuro validate`)
+    /// but the user should know.
+    pub warnings: Vec<String>,
+}
+
+impl GraphValidationReport {
+    /// True when there are no hard errors. Warnings are allowed.
+    pub fn is_ok(&self) -> bool {
+        self.errors.is_empty()
+    }
+}
+
+/// Walk the graph from `initial:` to surface dead-ends and unreachable
+/// states (issue #238).
+///
+/// Schema-level checks (referenced by [`validate_graph_flow`]) must have
+/// passed before calling this -- typically via [`load_graph_flow_from_str`].
+/// That guarantees `initial:` and every `edge.to:` resolve, so this
+/// function can index `states` without re-checking.
+///
+/// The walk is a plain BFS (a [`Vec`] used as a stack would also work --
+/// only the visited-set semantics matter, not the traversal order). After
+/// the walk:
+///
+/// * Every non-terminal state with no outgoing edges becomes an *error*.
+///   Terminal kinds for this purpose are `kind: final` and `kind: human`
+///   (a human-handoff state may legitimately stop the run via operator
+///   abort).
+/// * Every state not reached from `initial:` becomes a *warning*. A
+///   common cause is mid-edit work where the wiring is not done yet --
+///   not a reason to block execution.
+///
+/// Self-loops (an edge whose `to:` is the same state) are allowed; the
+/// visited-set short-circuits naturally.
+pub fn validate_graph_reachability(g: &GraphFlow) -> GraphValidationReport {
+    let mut report = GraphValidationReport::default();
+
+    // BFS from `initial:`. The schema validator guarantees `initial:` and
+    // every `edge.to:` resolve, so we can deref-and-index without a
+    // contains_key probe.
+    let mut visited: HashSet<&str> = HashSet::new();
+    let mut frontier: Vec<&str> = Vec::new();
+    visited.insert(g.initial.as_str());
+    frontier.push(g.initial.as_str());
+    while let Some(id) = frontier.pop() {
+        let Some(state) = g.states.get(id) else {
+            // Defensive: schema check should make this unreachable, but
+            // an in-memory `GraphFlow` constructed without validation
+            // could still hit it. Skip rather than panic.
+            continue;
+        };
+        let Some(edges) = &state.edges else { continue };
+        for edge in edges.values() {
+            if visited.insert(edge.to.as_str()) {
+                frontier.push(edge.to.as_str());
+            }
+        }
+    }
+
+    // Dead-end detection. Walk every state (declaration order via
+    // IndexMap), not just the reachable ones, so the user sees every
+    // dead-end in one validation pass even if some are unreachable too.
+    // Iterating in declaration order keeps error output stable for tests
+    // and matches the user's mental model of the YAML file.
+    for (id, state) in &g.states {
+        let has_edges = state.edges.as_ref().is_some_and(|e| !e.is_empty());
+        let is_terminal = matches!(state.kind, Some(StateKind::Final) | Some(StateKind::Human));
+        if !has_edges && !is_terminal {
+            report.errors.push(format!(
+                "graph state '{id}' is a dead end: no outgoing edges and not 'kind: final' or 'kind: human'"
+            ));
+        }
+    }
+
+    // Unreachable detection. Sort lexically for stable output -- BFS
+    // visits in non-deterministic order (HashSet iteration), so we need
+    // an explicit sort here for diffable error messages.
+    let mut unreachable: Vec<&str> = g
+        .states
+        .keys()
+        .map(String::as_str)
+        .filter(|k| !visited.contains(k))
+        .collect();
+    unreachable.sort_unstable();
+    for id in unreachable {
+        report.warnings.push(format!(
+            "graph state '{id}' is unreachable from initial state '{}'",
+            g.initial
+        ));
+    }
+
+    report
+}
+
 /// Parse just the role names from a flow YAML (for CLI arg partitioning).
 pub fn parse_role_names(contents: &str) -> Result<HashSet<String>, ConfigError> {
     let raw: RawFlowConfig = serde_yaml::from_str(contents)?;
@@ -3294,5 +3402,289 @@ states:
         let yaml = serde_yaml::to_string(&parsed).expect("serialize round-trip");
         let reparsed = load_graph_flow_from_str(&yaml).expect("re-parse round-trip");
         assert_eq!(parsed, reparsed);
+    }
+
+    // --- Graph reachability + dead-end validator tests (issue #238) ---
+
+    /// Build a `GraphFlow` programmatically. Useful for the dead-end
+    /// test, which needs a state shape that the YAML schema validator
+    /// rejects (no edges and no kind) -- we cannot express it as a YAML
+    /// fixture and round-trip, so we construct it in memory.
+    fn graph(initial: &str, states: Vec<(&str, GraphState)>) -> GraphFlow {
+        let mut map: IndexMap<String, GraphState> = IndexMap::new();
+        for (id, state) in states {
+            map.insert(id.to_string(), state);
+        }
+        GraphFlow {
+            version: Version("1".to_string()),
+            name: "test".to_string(),
+            prompt: None,
+            initial: initial.to_string(),
+            states: map,
+        }
+    }
+
+    fn state_with_edges(edges: Vec<(&str, &str)>) -> GraphState {
+        let mut map: IndexMap<String, GraphEdge> = IndexMap::new();
+        for (name, to) in edges {
+            map.insert(
+                name.to_string(),
+                GraphEdge {
+                    to: to.to_string(),
+                    description: format!("go to {to}"),
+                },
+            );
+        }
+        GraphState {
+            kind: None,
+            role: Some("developer".to_string()),
+            task: None,
+            edges: Some(map),
+        }
+    }
+
+    fn state_final() -> GraphState {
+        GraphState {
+            kind: Some(StateKind::Final),
+            role: None,
+            task: None,
+            edges: None,
+        }
+    }
+
+    fn state_human(edges: Vec<(&str, &str)>) -> GraphState {
+        let mut s = state_with_edges(edges);
+        s.kind = Some(StateKind::Human);
+        s.role = None;
+        s
+    }
+
+    /// Acceptance: a graph where every state is either reachable + has
+    /// edges OR `kind: final` validates clean -- no errors, no warnings.
+    #[test]
+    fn validate_clean_graph() {
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("ok", "done")])),
+                ("done", state_final()),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(
+            report.is_ok(),
+            "expected ok, got errors: {:?}",
+            report.errors
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "expected no warnings, got: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Acceptance: a graph with a non-final state and zero outgoing
+    /// edges fails validation with a message naming the state. The YAML
+    /// schema rejects this shape, so the test constructs `GraphFlow`
+    /// programmatically -- the validator must still catch it as
+    /// defense-in-depth.
+    #[test]
+    fn validate_dead_end_state_errors() {
+        let stuck = GraphState {
+            kind: None,
+            role: Some("developer".to_string()),
+            task: None,
+            edges: None, // no kind, no edges -- dead end
+        };
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("go", "stuck")])),
+                ("stuck", stuck),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(!report.is_ok(), "expected dead-end error, got ok");
+        assert_eq!(report.errors.len(), 1, "errors: {:?}", report.errors);
+        assert!(
+            report.errors[0].contains("'stuck'"),
+            "error must name the dead-end state: {}",
+            report.errors[0]
+        );
+        assert!(
+            report.errors[0].contains("dead end"),
+            "error must classify the issue as a dead end: {}",
+            report.errors[0]
+        );
+    }
+
+    /// Acceptance: an unreachable state produces a warning but the
+    /// report still validates as ok (warnings only).
+    #[test]
+    fn validate_unreachable_state_warns_only() {
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("ok", "done")])),
+                ("done", state_final()),
+                ("orphan", state_with_edges(vec![("loop", "done")])),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(
+            report.is_ok(),
+            "unreachable-only must not error, got: {:?}",
+            report.errors
+        );
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        assert!(
+            report.warnings[0].contains("'orphan'"),
+            "warning must name the unreachable state: {}",
+            report.warnings[0]
+        );
+        assert!(
+            report.warnings[0].contains("'start'"),
+            "warning must name the initial state for context: {}",
+            report.warnings[0]
+        );
+    }
+
+    /// Acceptance: a self-loop edge (state pointing back to itself) is
+    /// allowed -- not a dead end and not flagged. Pins behavior so
+    /// future changes do not accidentally tighten this.
+    #[test]
+    fn validate_self_loop_edge_allowed() {
+        let g = graph(
+            "start",
+            vec![
+                (
+                    "start",
+                    state_with_edges(vec![("retry", "start"), ("done", "done")]),
+                ),
+                ("done", state_final()),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(
+            report.is_ok(),
+            "self-loop must not error, got: {:?}",
+            report.errors
+        );
+        assert!(
+            report.warnings.is_empty(),
+            "self-loop must not warn, got: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Acceptance: a graph that is just a single `kind: final` state
+    /// targeted by `initial:` validates clean. Trivial case but on the
+    /// acceptance list -- pin it so a future "must have at least one
+    /// edge" rule does not creep in.
+    #[test]
+    fn validate_single_final_state_only() {
+        let g = graph("done", vec![("done", state_final())]);
+        let report = validate_graph_reachability(&g);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Edge case: a `kind: human` state with no outgoing edges is
+    /// terminal-ish (operator may abort) and must NOT be flagged as a
+    /// dead end. Issue #238 explicitly lists `human` alongside `final`
+    /// as terminal for dead-end purposes.
+    #[test]
+    fn validate_human_state_without_edges_not_dead_end() {
+        let mut hr = state_final();
+        hr.kind = Some(StateKind::Human);
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("handoff", "operator")])),
+                ("operator", hr),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+    }
+
+    /// Edge case: a `kind: human` state WITH edges (the resume-* /
+    /// abort pattern from the design doc and seed fixture) validates
+    /// clean -- both reachable and not flagged.
+    #[test]
+    fn validate_human_state_with_resume_edges_clean() {
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("handoff", "operator")])),
+                ("operator", state_human(vec![("resume", "done")])),
+                ("done", state_final()),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert!(
+            report.warnings.is_empty(),
+            "warnings: {:?}",
+            report.warnings
+        );
+    }
+
+    /// Multiple dead-ends should all be reported in one pass so the
+    /// user can fix them together rather than playing whack-a-mole.
+    #[test]
+    fn validate_multiple_dead_ends_all_reported() {
+        let dead = GraphState {
+            kind: None,
+            role: Some("developer".to_string()),
+            task: None,
+            edges: None,
+        };
+        let g = graph(
+            "start",
+            vec![
+                (
+                    "start",
+                    state_with_edges(vec![("a", "first"), ("b", "second")]),
+                ),
+                ("first", dead.clone()),
+                ("second", dead),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert_eq!(report.errors.len(), 2, "errors: {:?}", report.errors);
+        // Declaration order: 'first' before 'second'.
+        assert!(report.errors[0].contains("'first'"));
+        assert!(report.errors[1].contains("'second'"));
+    }
+
+    /// Acceptance: the canonical GRAPH_CONFIG fixture (every shape:
+    /// non-terminal, re-entrant, human, two finals) validates clean.
+    /// Anchors that the existing schema fixture is also valid at the
+    /// graph-validation layer, not just the schema layer.
+    #[test]
+    fn validate_canonical_graph_fixture_clean() {
+        let g = load_graph_flow_from_str(GRAPH_CONFIG).unwrap();
+        let report = validate_graph_reachability(&g);
+        assert!(
+            report.is_ok(),
+            "canonical fixture must validate clean, errors: {:?}",
+            report.errors
+        );
+        // human_review is unreachable in the fixture (no edge points to
+        // it). That is a deliberate part of the fixture -- it shows the
+        // human-state shape, not a wired-up handoff. Pin the warning so
+        // a future fixture edit that wires it up updates this test too.
+        assert_eq!(
+            report.warnings.len(),
+            1,
+            "expected one unreachable warning for human_review, got: {:?}",
+            report.warnings
+        );
+        assert!(report.warnings[0].contains("'human_review'"));
     }
 }
