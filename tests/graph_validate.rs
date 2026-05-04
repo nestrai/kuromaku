@@ -42,27 +42,30 @@ states:
     kind: final
 "#;
 
-/// A graph YAML with a dead-end. Schema validation alone would reject
-/// `dead:` (no edges, no kind), so we use a `kind: human` state that
-/// has empty edges -- but the *real* dead-end is a separate state we
-/// reach via the start state. To express a true post-schema dead end
-/// we'd need to bypass the YAML parser; instead we lean on the linear
-/// runner's existing graph-shape check by giving the validator a graph
-/// that the schema parser will load but where one state lacks edges
-/// and is not terminal.
-///
-/// Trick: a `kind: human` state with empty edges parses cleanly (and
-/// is NOT a dead end -- terminal-ish). To get a true dead end we'd
-/// need a state with neither edges nor kind, which the schema rejects.
-/// So at the CLI level we cannot express a "schema-clean,
-/// validator-failing dead-end graph" without bypassing the parser.
-///
-/// Solution: the integration test for the dead-end exit code uses an
-/// *unknown initial state*, which the schema validator catches and
-/// `kuro validate` propagates as a non-zero exit. That covers AC4
-/// (non-zero exit on validation failure). The dead-end logic itself
-/// is exercised by the unit tests in `src/config.rs`, where we can
-/// construct the offending shape programmatically.
+/// A graph YAML with a real dead-end state: `dead:` has neither
+/// `edges:` nor a terminal `kind:`. The schema parser accepts this
+/// shape (the dead-end semantics live in the reachability validator,
+/// not the schema -- see `validate_graph_reachability`), so this YAML
+/// exercises AC5 of issue #238 end-to-end: `kuro run` must refuse to
+/// start with a graph-aware error naming the dead-end state.
+const DEAD_END_GRAPH: &str = r#"
+version: "1"
+name: dead-end
+initial: start
+states:
+  start:
+    role: developer
+    edges:
+      go:
+        to: dead
+        description: Walk into the dead end.
+  dead:
+    role: developer
+"#;
+
+/// A graph YAML the schema rejects up front (unknown initial state).
+/// Used to pin AC4: `kuro validate` exits non-zero on schema errors
+/// before reachability runs.
 const SCHEMA_INVALID_GRAPH: &str = r#"
 version: "1"
 name: bad-initial
@@ -177,13 +180,10 @@ fn validate_unreachable_only_exits_zero_with_warning_on_stderr() {
 
 #[test]
 fn validate_invalid_graph_exits_nonzero() {
-    // AC: validation failures cause non-zero exit. We use a
-    // schema-invalid `initial:` reference because schema-clean
-    // dead-ends cannot be expressed in YAML (the schema parser rejects
-    // a state with neither edges nor kind). The CLI surface we want to
-    // pin is "non-zero on validation failure"; that is exercised here
-    // and the dead-end path is covered by the unit tests on
-    // `validate_graph_reachability` directly.
+    // AC4: validation failures cause non-zero exit. Uses a
+    // schema-invalid `initial:` reference so the schema validator
+    // rejects the file before reachability runs. Dead-end YAML is
+    // covered separately by `validate_dead_end_graph_exits_nonzero`.
     let tmp = tempfile::tempdir().unwrap();
     let flow = write_flow(tmp.path(), "bad.yaml", SCHEMA_INVALID_GRAPH);
 
@@ -199,6 +199,71 @@ fn validate_invalid_graph_exits_nonzero() {
         out.status,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn validate_dead_end_graph_exits_nonzero() {
+    // AC5: a dead-end graph must fail validation end-to-end. The
+    // schema accepts the YAML (a state with neither edges nor a
+    // terminal kind is structurally valid); the reachability
+    // validator surfaces the dead-end as a hard error and `kuro
+    // validate` exits non-zero with a message naming the state.
+    let tmp = tempfile::tempdir().unwrap();
+    let flow = write_flow(tmp.path(), "dead.yaml", DEAD_END_GRAPH);
+
+    let out = Command::new(kuro_bin())
+        .arg("validate")
+        .arg(&flow)
+        .output()
+        .expect("spawn kuro validate");
+
+    assert!(
+        !out.status.success(),
+        "dead-end graph must exit non-zero; status={:?}, stdout={}, stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("'dead'") && stderr.contains("dead end"),
+        "stderr must name the dead-end state and classify it; got:\n{stderr}"
+    );
+}
+
+#[test]
+fn run_dead_end_graph_refuses_before_spawn() {
+    // AC5: `kuro run` on a graph with a dead-end state must refuse
+    // to start before any agent is spawned, with a graph-aware
+    // message naming the offending state. Covers the end-to-end
+    // path that the unit tests on `validate_graph_reachability`
+    // alone cannot prove.
+    let tmp = tempfile::tempdir().unwrap();
+    let flow = write_flow(tmp.path(), "dead.yaml", DEAD_END_GRAPH);
+
+    let out = Command::new(kuro_bin())
+        .arg("run")
+        .arg("--file")
+        .arg(&flow)
+        .arg("-t")
+        .arg("ignored")
+        .output()
+        .expect("spawn kuro run");
+
+    assert!(
+        !out.status.success(),
+        "dead-end graph must not start; status={:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("'dead'") && stderr.contains("dead end"),
+        "stderr must name the dead-end state and classify it; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("graph flow") && stderr.contains("refusing to start"),
+        "stderr must include the graph-aware refusal banner; got:\n{stderr}"
     );
 }
 

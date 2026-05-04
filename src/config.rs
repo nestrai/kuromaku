@@ -380,8 +380,10 @@ pub struct GraphFlow {
 /// A non-terminal state declares `edges:`. A terminal state declares
 /// `kind: final`. A human-handoff state declares `kind: human` (and may
 /// also declare `edges:` for the resume-* targets shown in the design
-/// doc). The validator rejects a state with neither edges nor kind --
-/// that shape would be a silent dead end at runtime.
+/// doc). A state with neither `edges:` nor a terminal `kind:` is a
+/// dead end -- this is caught by [`validate_graph_reachability`] as a
+/// hard error, not at the schema layer, so the dead-end branch is
+/// reachable from real YAML and AC5 can be verified end-to-end.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphState {
@@ -549,14 +551,14 @@ fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
         )));
     }
 
+    // Schema validation only checks structural references (initial and
+    // edge.to resolve to declared states). The "must have edges OR a
+    // terminal kind" rule is dead-end semantics and lives in
+    // [`validate_graph_reachability`] -- otherwise the schema and the
+    // reachability check duplicate the same rule, the dead-end branch
+    // in the reachability validator is unreachable from real YAML, and
+    // AC5 from issue #238 cannot be verified end-to-end.
     for (id, state) in &g.states {
-        let has_edges = state.edges.as_ref().is_some_and(|e| !e.is_empty());
-        let has_kind = state.kind.is_some();
-        if !has_edges && !has_kind {
-            return Err(ConfigError::Validation(format!(
-                "graph state '{id}' has neither 'edges:' nor 'kind:' -- a state must declare at least one outgoing edge or be marked 'kind: final' / 'kind: human'"
-            )));
-        }
         if let Some(edges) = &state.edges {
             for (edge_name, edge) in edges {
                 if !g.states.contains_key(&edge.to) {
@@ -3246,10 +3248,12 @@ name: empty-shape
     }
 
     #[test]
-    fn graph_state_without_edges_or_kind_errors() {
+    fn graph_state_without_edges_or_kind_is_dead_end() {
         // Acceptance: each state has either `edges:` (non-final) or
         // `kind: final` / `kind: human`. A state with neither is a
-        // silent dead end at runtime -- reject it at parse time.
+        // dead end. The schema parses such YAML successfully -- the
+        // dead-end semantics live in `validate_graph_reachability` so
+        // the check is exercised by real YAML (AC5 of issue #238).
         let yaml = r#"
 version: "1"
 name: dangling-state
@@ -3258,15 +3262,20 @@ states:
   lonely:
     role: developer
 "#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
-        let msg = err.to_string();
+        let flow = match load_flow_any_from_str(yaml).expect("schema must accept dead-end YAML") {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph flow"),
+        };
+        let report = validate_graph_reachability(&flow);
+        assert!(!report.is_ok(), "expected dead-end error, got ok");
+        let msg = &report.errors[0];
         assert!(
             msg.contains("'lonely'"),
             "error must name the offending state: {msg}"
         );
         assert!(
-            msg.contains("edges") && msg.contains("kind"),
-            "error must explain what is required (edges or kind): {msg}"
+            msg.contains("dead end"),
+            "error must classify the issue as a dead end: {msg}"
         );
     }
 
