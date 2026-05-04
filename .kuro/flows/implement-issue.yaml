@@ -1,0 +1,125 @@
+# Project-local override of the canonical implement-issue graph.
+# Adds a `steer_design` checkpoint where Babis (steering role) challenges
+# the architect's design plan before implementation starts.
+#
+# Topology:
+#   design (architect) --design_complete--> steer_design (steering)
+#   steer_design --approve--> implement
+#   steer_design --revise--> design
+#
+# Usage: kuro run implement-issue --var id=42
+version: "1"
+name: implement-issue
+prompt: |
+  Implement issue #{{vars.id}} in this repository. Follow the team's rules
+  and produce a draft PR at the end.
+
+initial: design
+
+states:
+  design:
+    role: architect
+    task: |
+      Read issue #{{vars.id}} (`gh issue view {{vars.id}} --comments`). Produce a
+      short design plan: affected files, interfaces, tests. Do not modify
+      code.
+    edges:
+      design_complete:
+        to: steer_design
+        description: Plan is complete, ready for steering review.
+      blocked:
+        to: aborted
+        description: Cannot produce a design (missing context, ambiguity).
+
+  steer_design:
+    role: steering
+    task: |
+      The team architect just produced a design plan for issue #{{vars.id}}.
+      Apply your challenger stance: naming audit, scope check, scalability
+      question, missing alternatives. Use your review format. Approve only
+      when the plan would survive a senior review without follow-up rounds.
+    edges:
+      approve:
+        to: implement
+        description: Plan holds up to scrutiny, ready to build.
+      revise:
+        to: design
+        description: Design needs another pass (naming, scope, missing alternatives).
+      blocked:
+        to: aborted
+        description: Cannot give a steering verdict (insufficient context).
+
+  implement:
+    role: developer
+    task: |
+      Implement the design from the previous step. Conventional commits,
+      feature branch, never main. Add or update tests.
+    edges:
+      implementation_complete:
+        to: review
+        description: All design items implemented and committed.
+      design_problem:
+        to: design
+        description: Implementation revealed a design flaw, need to revisit.
+      blocked:
+        to: aborted
+        description: Cannot proceed safely.
+
+  review:
+    role: reviewer
+    task: |
+      Review the implementation against the original issue's acceptance
+      criteria. Run `gh issue view {{vars.id}}` if you need the original
+      criteria -- do not rely solely on the implementer's restatement.
+
+      Use your role's review format. End with exactly:
+
+      ### Summary
+      - Blocking issues: [list or "none"]
+      - FINAL_VERDICT: PASS | FAIL
+
+      The `FINAL_VERDICT:` line must appear exactly once on its own
+      line. If the implementation solved the wrong problem, FAIL
+      regardless of code quality. Pick `approved` only when the verdict
+      is PASS.
+    edges:
+      approved:
+        to: pr
+        description: All acceptance criteria met, code quality acceptable.
+      changes_implementation:
+        to: implement
+        description: Code-level changes needed (naming, refactor, missing test).
+      changes_design:
+        to: design
+        description: Implementation revealed the design itself is wrong.
+      blocked:
+        to: aborted
+        description: Review cannot complete.
+
+  # Step id `pr` (not `create_pr`) so the `implement_issue` MCP tool's
+  # REQUIRED_STEP_IDS pre-flight matches both this graph and the linear
+  # seed (#268 keeps the verify check shape-agnostic; the tool still
+  # keys off the same name).
+  pr:
+    role: developer
+    task: |
+      Push the branch and open a draft PR with `Closes #{{vars.id}}`.
+      Output the PR URL on its own line so downstream tooling can
+      extract it.
+    edges:
+      pr_created:
+        to: done
+        description: PR opened.
+      failed:
+        to: aborted
+        description: PR creation failed.
+
+  # Terminal states. The schema currently has no `description:` on a state
+  # (issue #260), so the meaning is convention only:
+  #   done    -- happy-path exit: implementation reviewed and PR opened
+  #   aborted -- early exit because some step routed to `blocked` or `failed`
+  done:
+    kind: final
+
+  aborted:
+    kind: final

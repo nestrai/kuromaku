@@ -19,6 +19,8 @@ roles:
     agent: Bella
   architect:
     agent: Levi
+  steering:
+    agent: Babis
   facilitator:
     agent: Mika
   fetcher:
