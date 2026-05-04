@@ -50,6 +50,22 @@ use super::{
 /// integration test can reference the same constant the driver enforces.
 pub const DEFAULT_MAX_STEPS: usize = 30;
 
+/// Hard cap on how often a single state may be entered before the driver
+/// aborts with a "stuck in a loop" error.
+///
+/// The global `DEFAULT_MAX_STEPS` only catches runaway flows after dozens of
+/// transitions -- that is a coarse backstop. Ping-pong between two states
+/// (e.g. `design <-> steer_design`) reaches the global cap only after each
+/// state has been visited ~15 times, which wastes minutes of agent time on
+/// the wrong problem. A per-state cap catches the loop after a few rounds:
+/// if the same state is entered five times the agents are not converging
+/// and the run should fail loud rather than burn through the global budget.
+///
+/// The number is intentionally small. Production flows that legitimately
+/// need more rounds should mark themselves so explicitly via a future
+/// `runtime.max_visits_per_node:` YAML knob (out of scope for this fix).
+pub const DEFAULT_MAX_VISITS_PER_STATE: usize = 5;
+
 /// Build the deterministic edge-menu suffix appended to every state's task
 /// prompt.
 ///
@@ -143,6 +159,13 @@ pub async fn run_graph_flow(
     // graph runs as a sequence of isolated agents, each blind to what its
     // predecessors produced. `None` for the first iteration.
     let mut prior_state: Option<String> = None;
+    // Per-state visit counter. A loop between two states (the canonical
+    // failure mode is `design <-> steer_design` where the steerer keeps
+    // finding new issues) reaches `DEFAULT_MAX_STEPS` only after dozens of
+    // transitions, by which point the run has burned through minutes of
+    // agent time. Tracking visits per state lets us catch the loop after a
+    // few rounds and abort with a message that names the offending state.
+    let mut visits: HashMap<String, usize> = HashMap::new();
 
     loop {
         let state = graph.states.get(&current).ok_or_else(|| {
@@ -201,6 +224,22 @@ pub async fn run_graph_flow(
                 state: current.clone(),
                 reason: format!(
                     "max_steps ({DEFAULT_MAX_STEPS}) exceeded; last state was '{current}'"
+                ),
+            });
+        }
+
+        // Per-state visit cap. Increment on entry (counts the current
+        // visit) and abort if the same state has now been entered more than
+        // `DEFAULT_MAX_VISITS_PER_STATE` times. Catches design <-> steer
+        // ping-pong before it eats the global step budget. The error names
+        // the offending state and the cap so the user can see what looped.
+        let visit = visits.entry(current.clone()).or_insert(0);
+        *visit += 1;
+        if *visit > DEFAULT_MAX_VISITS_PER_STATE {
+            return Err(RunError::GraphRuntime {
+                state: current.clone(),
+                reason: format!(
+                    "state '{current}' visited {visit} times (cap {DEFAULT_MAX_VISITS_PER_STATE}); flow is stuck in a loop -- agents are not converging"
                 ),
             });
         }
