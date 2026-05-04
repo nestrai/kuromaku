@@ -161,6 +161,7 @@ mod tests {
             id: "test".to_string(),
             name: "Test".to_string(),
             title: None,
+            description: None,
             role: "test role".to_string(),
             model: "test-model".to_string(),
             backend,

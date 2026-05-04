@@ -888,6 +888,7 @@ mod tests {
             id: "Neo".to_string(),
             name: "Neo".to_string(),
             title: Some("Prompt Engineer".to_string()),
+            description: None,
             role: v["role"].as_str().unwrap().to_string(),
             model: "claude-sonnet-4-5".to_string(),
             backend: Backend::ClaudeCli,
