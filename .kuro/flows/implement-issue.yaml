@@ -1,11 +1,14 @@
 # Project-local override of the canonical implement-issue graph.
-# Adds a `steer_design` checkpoint where Babis (steering role) challenges
-# the architect's design plan before implementation starts.
+#
+# A steering checkpoint between design and implement was tried (Babis as
+# critic) but produced a design <-> steer_design ping-pong loop because the
+# critic had no convergence mechanism. Reintroduce only after either #284
+# (`once: true` edges) or #283 (multi-round critic convergence) lands.
 #
 # Topology:
-#   design (architect) --design_complete--> steer_design (steering)
-#   steer_design --approve--> implement
-#   steer_design --revise--> design
+#   design (architect) --design_complete--> implement (developer)
+#   implement --implementation_complete--> review (reviewer)
+#   review   --approved--> pr --pr_created--> done
 #
 # Usage: kuro run implement-issue --var id=42
 version: "1"
@@ -25,29 +28,11 @@ states:
       code.
     edges:
       design_complete:
-        to: steer_design
-        description: Plan is complete, ready for steering review.
+        to: implement
+        description: Plan is complete, ready to build.
       blocked:
         to: aborted
         description: Cannot produce a design (missing context, ambiguity).
-
-  steer_design:
-    role: steering
-    task: |
-      The team architect just produced a design plan for issue #{{vars.id}}.
-      Apply your challenger stance: naming audit, scope check, scalability
-      question, missing alternatives. Use your review format. Approve only
-      when the plan would survive a senior review without follow-up rounds.
-    edges:
-      approve:
-        to: implement
-        description: Plan holds up to scrutiny, ready to build.
-      revise:
-        to: design
-        description: Design needs another pass (naming, scope, missing alternatives).
-      blocked:
-        to: aborted
-        description: Cannot give a steering verdict (insufficient context).
 
   implement:
     role: developer
