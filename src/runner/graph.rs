@@ -32,7 +32,7 @@ use indexmap::IndexMap;
 
 use crate::config::{Agent, Backend, GraphEdge, GraphFlow, StateKind};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, OutputFormat};
-use crate::stack::{self, StepRecord};
+use crate::stack::{self, GraphDecision, StepRecord};
 
 use super::decision::{
     DecisionError, DecisionParseError, parse_agent_decision, validate_transition,
@@ -296,9 +296,28 @@ pub async fn run_graph_flow(
 
         let duration = attempt_start.elapsed();
 
+        // Resolve the next state BEFORE persisting the step record so the
+        // record can include the resolved target alongside the agent's
+        // raw decision -- audit consumers should not have to re-derive
+        // `next_state` from the edge map.
+        let next = edges
+            .get(&decision.transition)
+            .map(|e| e.to.clone())
+            .ok_or_else(|| RunError::GraphRuntime {
+                // validate_transition guarantees the key exists; this arm
+                // is defensive.
+                state: current.clone(),
+                reason: format!(
+                    "internal: transition '{}' missing from edge set",
+                    decision.transition
+                ),
+            })?;
+
         // Persist the per-step output. `raw_content` is the full agent reply
         // including the JSON envelope; we keep it verbatim so the audit
-        // trail shows exactly what was emitted.
+        // trail shows exactly what was emitted. `graph_decision` carries the
+        // structured transition data so `meta.yaml` is self-describing
+        // without parsing the content markdown.
         let record = StepRecord {
             step_id: current.clone(),
             kind: "graph".to_string(),
@@ -317,6 +336,11 @@ pub async fn run_graph_flow(
             turns: None,
             messages: None,
             terminated_by: None,
+            graph_decision: Some(GraphDecision {
+                transition: decision.transition.clone(),
+                reason: decision.reason.clone(),
+                next_state: next.clone(),
+            }),
         };
         stack::write_run_step(&ctx.run_path, step_num, &record, &raw_content).map_err(|e| {
             RunError::Stack {
@@ -324,19 +348,6 @@ pub async fn run_graph_flow(
                 source: e,
             }
         })?;
-
-        let next = edges
-            .get(&decision.transition)
-            .map(|e| e.to.clone())
-            .ok_or_else(|| RunError::GraphRuntime {
-                // validate_transition guarantees the key exists; this arm
-                // is defensive.
-                state: current.clone(),
-                reason: format!(
-                    "internal: transition '{}' missing from edge set",
-                    decision.transition
-                ),
-            })?;
 
         eprintln!(
             "graph: step {step_num} '{current}' --[{}]--> '{next}' ({}) reason: {}",

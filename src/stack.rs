@@ -156,6 +156,29 @@ pub struct StepRecord {
     /// `all_agents_closed`). `None` for non-conversation steps.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminated_by: Option<String>,
+    /// Decision recorded for `kind: graph` steps: which transition the agent
+    /// picked, the reason it gave, and the resulting next state. Lives on the
+    /// `StepRecord` so audit consumers (`kuro show-output`, the MCP
+    /// `show_output` tool, log parsers) can reconstruct the path through the
+    /// graph from `meta.yaml` alone, without re-parsing the markdown content
+    /// file. `None` for linear (`kind: llm` / `kind: shell`) and conversation
+    /// steps so existing audit output stays unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_decision: Option<GraphDecision>,
+}
+
+/// Per-step graph-transition record, written into `StepRecord::graph_decision`
+/// for `kind: graph` steps. Captures the structured decision the agent emitted
+/// (`transition`, `reason`) plus the resolved `next_state` so audit consumers
+/// do not need access to the original edge map to follow the run's path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GraphDecision {
+    /// Edge name the agent picked from the deterministic menu.
+    pub transition: String,
+    /// One- to two-sentence justification from the agent's JSON reply.
+    pub reason: String,
+    /// State ID the run jumped to after this transition.
+    pub next_state: String,
 }
 
 /// One row of conversation-step participant statistics.
@@ -586,6 +609,7 @@ mod tests {
             turns: None,
             messages: None,
             terminated_by: None,
+            graph_decision: None,
         }
     }
 

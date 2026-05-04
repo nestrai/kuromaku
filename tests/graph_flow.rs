@@ -241,6 +241,25 @@ esac
         body.contains("\"transition\": \"go\""),
         "start step content must contain agent's reply, got:\n{body}"
     );
+
+    // The transition decision is also persisted into the structured
+    // meta.yaml so audit consumers (kuro show-output, MCP show_output,
+    // log parsers) do not have to re-parse the markdown body. Both the
+    // edge name the agent picked and the resolved next state must be
+    // present.
+    let meta = std::fs::read_to_string(steps_dir.join("01-start.meta.yaml")).unwrap();
+    assert!(
+        meta.contains("graph_decision:"),
+        "01-start.meta.yaml must carry graph_decision block, got:\n{meta}"
+    );
+    assert!(
+        meta.contains("transition: go"),
+        "graph_decision must carry the picked transition, got:\n{meta}"
+    );
+    assert!(
+        meta.contains("next_state: middle"),
+        "graph_decision must carry the resolved next_state, got:\n{meta}"
+    );
 }
 
 #[test]

@@ -640,6 +640,7 @@ async fn run_shell_step(
         turns: None,
         messages: None,
         terminated_by: None,
+        graph_decision: None,
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &stdout).map_err(|e| {
         RunError::Stack {
@@ -1081,6 +1082,7 @@ async fn run_conversation_step(
         turns: Some(total_turns),
         messages: Some(total_messages),
         terminated_by: Some(terminated_by),
+        graph_decision: None,
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &transcript).map_err(|e| {
         RunError::Stack {
@@ -1406,6 +1408,7 @@ pub(crate) async fn run_steps_with_state(
             turns: None,
             messages: None,
             terminated_by: None,
+            graph_decision: None,
         };
 
         // Write the canonical content file plus the meta.yaml. Executor
@@ -3092,6 +3095,7 @@ mod tests {
                 turns: None,
                 messages: None,
                 terminated_by: None,
+                graph_decision: None,
             },
         }];
         let summary = build_summary(&results);
@@ -3646,6 +3650,7 @@ mod tests {
             turns: None,
             messages: None,
             terminated_by: None,
+            graph_decision: None,
         };
         stack::write_run_step(&ctx.run_path, 1, &rec, "PR diff goes here").unwrap();
 
@@ -3961,6 +3966,7 @@ mod tests {
             turns: Some(5),
             messages: Some(7),
             terminated_by: Some("convergence".to_string()),
+            graph_decision: None,
         };
         let yaml = serde_yaml::to_string(&convo).unwrap();
         assert!(
@@ -4006,6 +4012,7 @@ mod tests {
             turns: None,
             messages: None,
             terminated_by: None,
+            graph_decision: None,
         };
         let yaml = serde_yaml::to_string(&llm).unwrap();
         assert!(
