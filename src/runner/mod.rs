@@ -2039,6 +2039,10 @@ mod flow_api {
     /// `~/.koto/stacks/<project>/`. The `.koto/` home root is intentional
     /// (see comment trail in #176): a rename here would orphan existing
     /// users' run history without a migration path.
+    ///
+    /// The home root itself comes from [`crate::stack::stack_root`] so a
+    /// future relocation has one source of truth -- and so `kuro stack
+    /// purge` (#232) targets exactly the directory the runner writes to.
     pub(crate) fn resolve_stack_path(config_path: &str) -> PathBuf {
         if !config_path.is_empty() {
             return PathBuf::from(config_path);
@@ -2047,11 +2051,7 @@ mod flow_api {
             .ok()
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
             .unwrap_or_else(|| "default".to_string());
-        dirs::home_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join(".koto")
-            .join("stacks")
-            .join(project)
+        crate::stack::stack_root().join(project)
     }
 
     /// Resolve the stack directory for a named flow, honoring the flow's

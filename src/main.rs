@@ -141,6 +141,43 @@ enum Command {
         #[arg(long)]
         verbose: bool,
     },
+    /// Inspect or remove persistent stack data (#232).
+    ///
+    /// Parent for stack-management subcommands. Today only `purge` lives
+    /// here; future siblings (`kuro stack list`, `kuro stack show`) plug
+    /// in without polluting the top-level namespace.
+    Stack {
+        #[command(subcommand)]
+        action: StackAction,
+    },
+}
+
+/// Subcommands under `kuro stack`. Kept separate from [`Command`] so the
+/// stack-management surface stays self-contained -- adding a sibling does
+/// not touch the root parser.
+#[derive(Subcommand)]
+enum StackAction {
+    /// Permanently delete all stack data for a project (GDPR Art. 17).
+    ///
+    /// The project is named explicitly -- `kuro stack purge` will not
+    /// derive it from the cwd, since the typical erasure use case is
+    /// targeting a project that is no longer the active directory.
+    Purge {
+        /// Project name as it appears under `~/.koto/stacks/`. Must be a
+        /// single path segment (no `/`, `..`, or leading `.`).
+        project: String,
+
+        /// Print what would be deleted (run count, file count, byte size)
+        /// and exit without touching disk.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt. Required for non-interactive use
+        /// -- without it, the command refuses to proceed when stdin is
+        /// not a TTY.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -174,9 +211,84 @@ async fn main() -> Result<()> {
             println!("kuro status: not yet implemented");
         }
         Command::Mcp { verbose } => mcp::run(verbose).await?,
+        Command::Stack { action } => match action {
+            StackAction::Purge {
+                project,
+                dry_run,
+                yes,
+            } => cmd_stack_purge(&project, dry_run, yes)?,
+        },
     }
 
     Ok(())
+}
+
+/// Implementation of `kuro stack purge <project>`.
+///
+/// The library does the dangerous work (validation, canonical containment,
+/// directory removal). This function is responsible for: rendering the
+/// preview, gating on `--yes` / TTY, and translating `StackError` into a
+/// user-facing exit. Splitting the work this way keeps `src/stack.rs`
+/// usable from non-CLI callers (a future MCP tool, scripted use) without
+/// dragging confirmation logic along.
+fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
+    let root = stack::stack_root();
+    // `plan_purge` runs the full validation chain (string shape,
+    // containment) and returns the same diagnostics `purge_project` would
+    // -- so dry-run and live mode behave identically up to the deletion.
+    let report = stack::plan_purge(&root, project).map_err(format_purge_error)?;
+
+    eprintln!(
+        "stack '{}': {} run(s), {} file(s), {} byte(s) at {}",
+        report.project,
+        report.run_count,
+        report.file_count,
+        report.byte_size,
+        report.path.display()
+    );
+
+    if dry_run {
+        eprintln!("dry-run: nothing was deleted");
+        return Ok(());
+    }
+
+    if !yes {
+        use std::io::{IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            return Err(eyre!(
+                "refusing to purge non-interactively without --yes\n\nhint: pass --yes to confirm, or run with a TTY attached"
+            ));
+        }
+        eprint!(
+            "Permanently delete {} run(s) from {}? [y/N] ",
+            report.run_count,
+            report.path.display()
+        );
+        std::io::stderr().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin()
+            .read_line(&mut answer)
+            .map_err(|e| eyre!("failed to read confirmation: {e}"))?;
+        let trimmed = answer.trim().to_ascii_lowercase();
+        if trimmed != "y" && trimmed != "yes" {
+            return Err(eyre!("aborted"));
+        }
+    }
+
+    let report = stack::purge_project(&root, project).map_err(format_purge_error)?;
+    eprintln!(
+        "deleted '{}': {} run(s), {} file(s), {} byte(s)",
+        report.project, report.run_count, report.file_count, report.byte_size
+    );
+    Ok(())
+}
+
+/// Translate a `StackError` from the purge surface into a `color_eyre`
+/// report whose text matches what we want users to see. The library error
+/// already carries the project name and the path; we keep it terse so the
+/// CLI banner does not double-print context.
+fn format_purge_error(err: stack::StackError) -> color_eyre::eyre::Report {
+    eyre!("{err}")
 }
 
 /// Parse `key=value` pairs from trailing CLI args. Stays in main.rs because
