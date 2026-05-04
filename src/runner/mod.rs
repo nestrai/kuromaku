@@ -2,6 +2,15 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+// Submodules.
+//
+// `decision` is the standalone parser+validator for the JSON object an agent
+// emits at the end of a graph-flow state-step. It is consumed by the graph
+// runtime driver (issue #240). Marked `#[allow(dead_code)]` until the driver
+// lands, to keep the build warning-free in the meantime.
+#[allow(dead_code)]
+pub mod decision;
+
 use crate::config::{Agent, Backend, Step};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, OutputFormat};
 use crate::koto_config::Seeds;
