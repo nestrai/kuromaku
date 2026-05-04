@@ -624,7 +624,6 @@ async fn run_shell_step(
     let started_at = step_started_at.to_rfc3339();
     let record = StepRecord {
         step_id: step.id.clone(),
-        kind: "shell".to_string(),
         agent: None,
         model_requested: None,
         model_actual: None,
@@ -636,11 +635,7 @@ async fn run_shell_step(
         exit_code: 0,
         input_steps: step.input.clone(),
         output_file: content_filename.clone(),
-        participants: Vec::new(),
-        turns: None,
-        messages: None,
-        terminated_by: None,
-        graph_decision: None,
+        data: stack::StepKindData::Shell,
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &stdout).map_err(|e| {
         RunError::Stack {
@@ -1058,13 +1053,13 @@ async fn run_conversation_step(
     let started_at = step_started_at.to_rfc3339();
     let record = StepRecord {
         step_id: step.id.clone(),
-        kind: "conversation".to_string(),
         // No single agent for a conversation; leave None so the audit
-        // schema reflects "many agents" via the participants list below.
+        // schema reflects "many agents" via the participants list inside
+        // `data`.
         agent: None,
         model_requested: None,
         model_actual: None,
-        // Step-type discrimination lives in `kind: "conversation"`. The
+        // Step-type discrimination lives in `data: Conversation`. The
         // backend label sticks to the documented vocabulary
         // (api/claude-cli/codex/ollama/shell), so audit consumers don't
         // see a value that's missing from the schema. Conversation steps
@@ -1078,11 +1073,12 @@ async fn run_conversation_step(
         exit_code: 0,
         input_steps: step.input.clone(),
         output_file: content_filename.clone(),
-        participants: participants_stats,
-        turns: Some(total_turns),
-        messages: Some(total_messages),
-        terminated_by: Some(terminated_by),
-        graph_decision: None,
+        data: stack::StepKindData::Conversation {
+            participants: participants_stats,
+            turns: total_turns,
+            messages: total_messages,
+            terminated_by,
+        },
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &transcript).map_err(|e| {
         RunError::Stack {
@@ -1392,7 +1388,6 @@ pub(crate) async fn run_steps_with_state(
         // id; the field exists so audits stay schema-stable when one does.
         let record = StepRecord {
             step_id: step.id.clone(),
-            kind: "llm".to_string(),
             agent: Some(agent.name.clone()),
             model_requested: Some(effective_model.to_string()),
             model_actual: Some(effective_model.to_string()),
@@ -1404,11 +1399,7 @@ pub(crate) async fn run_steps_with_state(
             exit_code: 0,
             input_steps: step.input.clone(),
             output_file: content_filename.clone(),
-            participants: Vec::new(),
-            turns: None,
-            messages: None,
-            terminated_by: None,
-            graph_decision: None,
+            data: stack::StepKindData::Llm,
         };
 
         // Write the canonical content file plus the meta.yaml. Executor
@@ -3121,7 +3112,6 @@ mod tests {
             print_output: false,
             record: StepRecord {
                 step_id: "design".to_string(),
-                kind: "llm".to_string(),
                 agent: Some("Levi".to_string()),
                 model_requested: Some("claude-sonnet-4-5".to_string()),
                 model_actual: Some("claude-sonnet-4-5".to_string()),
@@ -3133,11 +3123,7 @@ mod tests {
                 exit_code: 0,
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
-                participants: Vec::new(),
-                turns: None,
-                messages: None,
-                terminated_by: None,
-                graph_decision: None,
+                data: stack::StepKindData::Llm,
             },
         }];
         let summary = build_summary(&results);
@@ -3592,7 +3578,8 @@ mod tests {
         let body = stack::read_run_step_content(&ctx.run_path, "greet").unwrap();
         assert_eq!(body, "hello-from-shell");
         // Per-step metadata records that this was a shell step.
-        assert_eq!(result.record.kind, "shell");
+        assert_eq!(result.record.data.kind_str(), "shell");
+        assert!(matches!(result.record.data, stack::StepKindData::Shell));
         assert_eq!(result.record.backend, "shell");
         assert!(result.record.agent.is_none());
     }
@@ -3684,7 +3671,6 @@ mod tests {
         let ctx = shell_test_ctx(dir.path().to_path_buf());
         let rec = stack::StepRecord {
             step_id: "fetch".to_string(),
-            kind: "shell".to_string(),
             agent: None,
             model_requested: None,
             model_actual: None,
@@ -3696,11 +3682,7 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: stack::step_content_filename(1, "fetch", "txt"),
-            participants: Vec::new(),
-            turns: None,
-            messages: None,
-            terminated_by: None,
-            graph_decision: None,
+            data: stack::StepKindData::Shell,
         };
         stack::write_run_step(&ctx.run_path, 1, &rec, "PR diff goes here").unwrap();
 
@@ -3772,7 +3754,7 @@ mod tests {
         let meta = std::fs::read_to_string(steps_dir.join("01-fetch.meta.yaml")).unwrap();
         let parsed: stack::StepRecord = serde_yaml::from_str(&meta).unwrap();
         assert_eq!(parsed.step_id, "fetch");
-        assert_eq!(parsed.kind, "shell");
+        assert_eq!(parsed.data.kind_str(), "shell");
         assert_eq!(parsed.output_file, "01-fetch.txt");
 
         // The summary's output_file is `<run_id>/steps/NN-<id>.<ext>` so
@@ -3983,7 +3965,6 @@ mod tests {
         // steps stay backward-compatible (no `participants:` key emitted).
         let convo = stack::StepRecord {
             step_id: "debate".to_string(),
-            kind: "conversation".to_string(),
             agent: None,
             model_requested: None,
             model_actual: None,
@@ -3995,28 +3976,29 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: "01-debate.md".to_string(),
-            participants: vec![
-                stack::ParticipantStat {
-                    agent: "Levi".to_string(),
-                    model: "claude-sonnet-4-5".to_string(),
-                    turns: 3,
-                    tokens_in: None,
-                    tokens_out: None,
-                },
-                stack::ParticipantStat {
-                    agent: "Mika".to_string(),
-                    model: "claude-opus-4-5".to_string(),
-                    turns: 2,
-                    tokens_in: None,
-                    tokens_out: None,
-                },
-            ],
             // Conversation summary fields (#172): aggregate turns, total
             // messages logged, termination reason. Asserted below.
-            turns: Some(5),
-            messages: Some(7),
-            terminated_by: Some("convergence".to_string()),
-            graph_decision: None,
+            data: stack::StepKindData::Conversation {
+                participants: vec![
+                    stack::ParticipantStat {
+                        agent: "Levi".to_string(),
+                        model: "claude-sonnet-4-5".to_string(),
+                        turns: 3,
+                        tokens_in: None,
+                        tokens_out: None,
+                    },
+                    stack::ParticipantStat {
+                        agent: "Mika".to_string(),
+                        model: "claude-opus-4-5".to_string(),
+                        turns: 2,
+                        tokens_in: None,
+                        tokens_out: None,
+                    },
+                ],
+                turns: 5,
+                messages: 7,
+                terminated_by: "convergence".to_string(),
+            },
         };
         let yaml = serde_yaml::to_string(&convo).unwrap();
         assert!(
@@ -4046,7 +4028,6 @@ mod tests {
         // Non-conversation step has no participants key (skip_serializing_if).
         let llm = stack::StepRecord {
             step_id: "design".to_string(),
-            kind: "llm".to_string(),
             agent: Some("Levi".to_string()),
             model_requested: Some("claude-sonnet-4-5".to_string()),
             model_actual: Some("claude-sonnet-4-5".to_string()),
@@ -4058,11 +4039,7 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: "01-design.md".to_string(),
-            participants: vec![],
-            turns: None,
-            messages: None,
-            terminated_by: None,
-            graph_decision: None,
+            data: stack::StepKindData::Llm,
         };
         let yaml = serde_yaml::to_string(&llm).unwrap();
         assert!(

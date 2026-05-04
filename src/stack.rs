@@ -94,12 +94,16 @@ pub fn init_run_layout(run_path: &Path) -> Result<(), StackError> {
 /// Per-step metadata, serialised as `NN-<step-id>.meta.yaml` next to the
 /// content file. Captures everything needed to reconstruct what ran without
 /// re-parsing the content.
+///
+/// Variant-specific fields (conversation participants, graph decision) live
+/// inside [`StepKindData`], flattened into the on-disk shape so the YAML
+/// keeps the pre-#255 layout: a top-level `type: <kind>` line plus sibling
+/// fields. Internal-tagging is the only serde representation that preserves
+/// existing `meta.yaml` files; adjacent or external tagging would force a
+/// rewrite of every saved run. Issue #255 carries the full reasoning.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
     pub step_id: String,
-    /// `"llm"` for agent steps, `"shell"` for `run:` steps.
-    #[serde(rename = "type")]
-    pub kind: String,
     /// LLM steps: agent name. Shell steps: empty string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
@@ -127,44 +131,74 @@ pub struct StepRecord {
     /// (e.g. `01-fetch.md`). The `steps/` segment is mandated by the spec
     /// (issue #31) and added by readers/writers, not stored here.
     pub output_file: String,
-    /// Per-agent breakdown for `kind: conversation` steps (issue #170
-    /// acceptance criterion: "list of agents, turns taken, tokens per
-    /// agent"). Empty for non-conversation steps; `skip_serializing_if`
-    /// keeps `meta.yaml` for agent/shell steps unchanged so existing audit
-    /// consumers stay backward compatible.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub participants: Vec<ParticipantStat>,
-    /// Total agent turns for `kind: conversation` steps (issue #172
-    /// manifest summary: matches the sum of `participants[].turns`). Kept
-    /// as a separate field so audit consumers do not have to re-aggregate
-    /// the participants vector for the headline number. `None` for
-    /// non-conversation steps so existing meta.yaml output stays
-    /// unchanged.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub turns: Option<u32>,
-    /// Total messages written to the audit log for `kind: conversation`
-    /// steps (issue #172). The count comes from the
-    /// [`MessageLogWriter`](crate::messaging::audit::MessageLogWriter), so
-    /// it reflects what was actually flushed to disk -- a write failure
-    /// would not inflate it.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub messages: Option<u32>,
-    /// Termination reason for `kind: conversation` steps, rendered via
-    /// [`TerminationReason::Display`](crate::messaging::router::TerminationReason)
-    /// so the on-disk string stays frozen across variant renames
-    /// (`max_turns`, `convergence`, `timeout`, `human_closed`,
-    /// `all_agents_closed`). `None` for non-conversation steps.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub terminated_by: Option<String>,
-    /// Decision recorded for `kind: graph` steps: which transition the agent
-    /// picked, the reason it gave, and the resulting next state. Lives on the
-    /// `StepRecord` so audit consumers (`kuro show-output`, the MCP
-    /// `show_output` tool, log parsers) can reconstruct the path through the
-    /// graph from `meta.yaml` alone, without re-parsing the markdown content
-    /// file. `None` for linear (`kind: llm` / `kind: shell`) and conversation
-    /// steps so existing audit output stays unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub graph_decision: Option<GraphDecision>,
+    /// Step kind plus its variant-specific payload. Flattened into the
+    /// top-level YAML map so the on-disk layout reads as a single record
+    /// (`type: llm` plus sibling fields), not a nested object.
+    #[serde(flatten)]
+    pub data: StepKindData,
+}
+
+/// Step-kind discriminator with variant-specific payloads.
+///
+/// Internal-tagged on `type` so the serialised shape matches what pre-#255
+/// stacks already have on disk: `type: llm`, `type: shell`,
+/// `type: conversation` (plus participants/turns/messages/terminated_by),
+/// `type: graph` (plus graph_decision). Unknown sibling fields on the
+/// flattened parent are ignored by serde, so legacy files that still carry
+/// `terminated_by: null`/`graph_decision: null` next to `type: llm` keep
+/// loading without a migration tool.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StepKindData {
+    /// Single-agent LLM step (`agent` + `task`).
+    Llm,
+    /// Shell step (`run:`).
+    Shell,
+    /// Multi-agent conversation step (#170, #172).
+    Conversation {
+        /// Per-agent breakdown -- "list of agents, turns taken, tokens per
+        /// agent" (#170 acceptance criterion). Stays a `Vec` rather than a
+        /// non-empty type because a 0-participant conversation is still
+        /// representable on disk for forward-compat with edge cases.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        participants: Vec<ParticipantStat>,
+        /// Total agent turns -- sum of `participants[].turns`. Kept as a
+        /// dedicated field so audit consumers do not have to re-aggregate.
+        turns: u32,
+        /// Total messages flushed to the audit log by
+        /// [`MessageLogWriter`](crate::messaging::audit::MessageLogWriter).
+        /// A failed flush would not inflate this count.
+        messages: u32,
+        /// Termination reason rendered via
+        /// [`TerminationReason::Display`](crate::messaging::router::TerminationReason)
+        /// so the on-disk string stays frozen against variant renames.
+        terminated_by: String,
+    },
+    /// Graph-state step: agent picked a transition, the runner resolved
+    /// the next state. Both pieces are captured so audit consumers can
+    /// reconstruct the path without parsing the content markdown.
+    Graph { graph_decision: GraphDecision },
+}
+
+impl StepKindData {
+    /// Stable wire string for the kind discriminator. Used by code that
+    /// needs to branch on the kind (UI summaries, tests asserting which
+    /// kind a step has) without matching on the enum directly.
+    ///
+    /// `#[allow(dead_code)]` because the binary-crate dead_code lint flags
+    /// pub helpers that no production caller uses today; the method exists
+    /// for audit consumers (`kuro show-output`, MCP `show_output`) and for
+    /// tests, and keeping it on the public surface avoids adding a back-
+    /// channel match on the enum from every call site.
+    #[allow(dead_code)]
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Llm => "llm",
+            Self::Shell => "shell",
+            Self::Conversation { .. } => "conversation",
+            Self::Graph { .. } => "graph",
+        }
+    }
 }
 
 /// Per-step graph-transition record, written into `StepRecord::graph_decision`
@@ -187,7 +221,7 @@ pub struct GraphDecision {
 /// agent definition (model). Tokens are an `Option` because per-agent token
 /// accounting is not yet wired through the messaging Router; recording
 /// `None` is honest about that gap, recording `0` would lie.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ParticipantStat {
     /// Agent ID, matching the entry in the step's `agents:` list.
     pub agent: String,
@@ -600,7 +634,6 @@ mod tests {
     fn record(step_num: usize, step_id: &str, ext: &str) -> StepRecord {
         StepRecord {
             step_id: step_id.to_string(),
-            kind: "llm".to_string(),
             agent: Some("Levi".to_string()),
             model_requested: Some("claude-sonnet-4-5".to_string()),
             model_actual: Some("claude-sonnet-4-5".to_string()),
@@ -612,11 +645,7 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: step_content_filename(step_num, step_id, ext),
-            participants: Vec::new(),
-            turns: None,
-            messages: None,
-            terminated_by: None,
-            graph_decision: None,
+            data: StepKindData::Llm,
         }
     }
 
@@ -967,6 +996,198 @@ mod tests {
         assert_eq!(RunStatus::Done.as_str(), "done");
         assert_eq!(RunStatus::Failed.as_str(), "failed");
         assert_eq!(RunStatus::NotFound.as_str(), "not_found");
+    }
+
+    // --- StepKindData / tagged-enum refactor (issue #255) ---
+
+    #[test]
+    fn llm_record_omits_variant_fields() {
+        // Llm and Shell are unit variants -- nothing besides `type:` should
+        // appear in the YAML for them. Audit consumers stay backward-
+        // compatible because pre-#255 meta.yaml for llm/shell steps already
+        // omitted these keys via skip_serializing_if.
+        let yaml = serde_yaml::to_string(&record(1, "design", "md")).unwrap();
+        assert!(yaml.contains("type: llm"), "missing type tag: {yaml}");
+        for forbidden in [
+            "participants:",
+            "turns:",
+            "messages:",
+            "terminated_by:",
+            "graph_decision:",
+        ] {
+            assert!(
+                !yaml.contains(forbidden),
+                "llm step must not carry {forbidden}: {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_record_omits_variant_fields() {
+        let mut rec = record(1, "fetch", "txt");
+        rec.data = StepKindData::Shell;
+        rec.agent = None;
+        rec.model_requested = None;
+        rec.model_actual = None;
+        rec.backend = "shell".to_string();
+        let yaml = serde_yaml::to_string(&rec).unwrap();
+        assert!(yaml.contains("type: shell"), "missing type tag: {yaml}");
+        for forbidden in [
+            "participants:",
+            "turns:",
+            "messages:",
+            "terminated_by:",
+            "graph_decision:",
+        ] {
+            assert!(
+                !yaml.contains(forbidden),
+                "shell step must not carry {forbidden}: {yaml}"
+            );
+        }
+    }
+
+    #[test]
+    fn conversation_record_roundtrips_required_fields() {
+        // Variant fields are required *within* Conversation -- the type
+        // system now forbids a half-built conversation record. Make sure
+        // they all roundtrip through YAML.
+        let mut rec = record(1, "debate", "md");
+        rec.data = StepKindData::Conversation {
+            participants: vec![ParticipantStat {
+                agent: "Levi".to_string(),
+                model: "claude-sonnet-4-5".to_string(),
+                turns: 3,
+                tokens_in: None,
+                tokens_out: None,
+            }],
+            turns: 5,
+            messages: 7,
+            terminated_by: "convergence".to_string(),
+        };
+        let yaml = serde_yaml::to_string(&rec).unwrap();
+        let parsed: StepRecord = serde_yaml::from_str(&yaml).unwrap();
+        match parsed.data {
+            StepKindData::Conversation {
+                participants,
+                turns,
+                messages,
+                terminated_by,
+            } => {
+                assert_eq!(participants.len(), 1);
+                assert_eq!(participants[0].agent, "Levi");
+                assert_eq!(turns, 5);
+                assert_eq!(messages, 7);
+                assert_eq!(terminated_by, "convergence");
+            }
+            other => panic!("expected Conversation, got {other:?}"),
+        }
+        assert!(yaml.contains("type: conversation"), "missing tag: {yaml}");
+    }
+
+    #[test]
+    fn graph_record_roundtrips_decision() {
+        let mut rec = record(1, "design", "md");
+        rec.data = StepKindData::Graph {
+            graph_decision: GraphDecision {
+                transition: "go".to_string(),
+                reason: "ready".to_string(),
+                next_state: "review".to_string(),
+            },
+        };
+        let yaml = serde_yaml::to_string(&rec).unwrap();
+        assert!(yaml.contains("type: graph"), "missing type tag: {yaml}");
+        assert!(
+            yaml.contains("graph_decision:"),
+            "missing graph_decision block: {yaml}"
+        );
+        assert!(yaml.contains("transition: go"));
+        assert!(yaml.contains("next_state: review"));
+
+        let parsed: StepRecord = serde_yaml::from_str(&yaml).unwrap();
+        match parsed.data {
+            StepKindData::Graph { graph_decision } => {
+                assert_eq!(graph_decision.transition, "go");
+                assert_eq!(graph_decision.next_state, "review");
+            }
+            other => panic!("expected Graph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_meta_yaml_with_null_variant_fields_loads() {
+        // Pre-#255 meta.yaml for llm/shell steps did not actually emit the
+        // variant fields (skip_serializing_if). But callers that built a
+        // YAML by hand (third-party tools, fixture scripts) might have left
+        // explicit `participants: []` / `terminated_by: null` next to
+        // `type: llm`. The flattened internal-tagged enum must ignore them
+        // so we don't break those consumers.
+        let legacy = r#"
+step_id: design
+type: llm
+agent: Levi
+model_requested: claude-sonnet-4-5
+backend: claude-cli
+duration_ms: 1234
+started_at: 2026-04-29T10:00:00Z
+exit_code: 0
+output_file: 01-design.md
+participants: []
+turns: null
+messages: null
+terminated_by: null
+graph_decision: null
+"#;
+        let parsed: StepRecord = serde_yaml::from_str(legacy).unwrap();
+        assert_eq!(parsed.step_id, "design");
+        assert_eq!(parsed.data, StepKindData::Llm);
+    }
+
+    #[test]
+    fn meta_yaml_unknown_fields_ignored() {
+        // Forward-compat: a future kuromaku version might add a new
+        // sibling field. Older readers should not blow up on it. serde's
+        // default (unknown fields ignored) gives us this for free; the
+        // test pins it so a future `deny_unknown_fields` would surface
+        // the breaking change here.
+        let yaml_with_unknown = r#"
+step_id: design
+type: llm
+backend: claude-cli
+duration_ms: 1
+started_at: 2026-04-29T10:00:00Z
+exit_code: 0
+output_file: 01-design.md
+foo_future_field: 42
+"#;
+        let parsed: StepRecord = serde_yaml::from_str(yaml_with_unknown).unwrap();
+        assert_eq!(parsed.data, StepKindData::Llm);
+    }
+
+    #[test]
+    fn step_kind_data_kind_str_is_stable() {
+        assert_eq!(StepKindData::Llm.kind_str(), "llm");
+        assert_eq!(StepKindData::Shell.kind_str(), "shell");
+        assert_eq!(
+            StepKindData::Conversation {
+                participants: vec![],
+                turns: 0,
+                messages: 0,
+                terminated_by: "convergence".to_string(),
+            }
+            .kind_str(),
+            "conversation"
+        );
+        assert_eq!(
+            StepKindData::Graph {
+                graph_decision: GraphDecision {
+                    transition: "go".to_string(),
+                    reason: String::new(),
+                    next_state: "next".to_string(),
+                },
+            }
+            .kind_str(),
+            "graph"
+        );
     }
 
     #[test]

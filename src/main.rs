@@ -1017,7 +1017,6 @@ mod tests {
             print_output: false,
             record: StepRecord {
                 step_id: "design".to_string(),
-                kind: "llm".to_string(),
                 agent: Some("Sage".to_string()),
                 model_requested: Some("claude-sonnet-4-5".to_string()),
                 model_actual: Some("claude-sonnet-4-5".to_string()),
@@ -1029,11 +1028,7 @@ mod tests {
                 exit_code: 0,
                 input_steps: vec![],
                 output_file: "01-design.md".to_string(),
-                participants: Vec::new(),
-                turns: None,
-                messages: None,
-                terminated_by: None,
-                graph_decision: None,
+                data: crate::stack::StepKindData::Llm,
             },
         }];
 

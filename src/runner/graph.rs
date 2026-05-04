@@ -442,7 +442,6 @@ pub async fn run_graph_flow(
         // without parsing the content markdown.
         let record = StepRecord {
             step_id: current.clone(),
-            kind: "graph".to_string(),
             agent: Some(agent.name.clone()),
             model_requested: Some(agent.model.clone()),
             model_actual: Some(agent.model.clone()),
@@ -454,15 +453,13 @@ pub async fn run_graph_flow(
             exit_code: 0,
             input_steps: prior_state.iter().cloned().collect(),
             output_file: content_filename.clone(),
-            participants: Vec::new(),
-            turns: None,
-            messages: None,
-            terminated_by: None,
-            graph_decision: Some(GraphDecision {
-                transition: decision.transition.clone(),
-                reason: decision.reason.clone(),
-                next_state: next.clone(),
-            }),
+            data: stack::StepKindData::Graph {
+                graph_decision: GraphDecision {
+                    transition: decision.transition.clone(),
+                    reason: decision.reason.clone(),
+                    next_state: next.clone(),
+                },
+            },
         };
         stack::write_run_step(&ctx.run_path, step_num, &record, &raw_content).map_err(|e| {
             RunError::Stack {

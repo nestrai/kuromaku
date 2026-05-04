@@ -249,6 +249,14 @@ esac
     // edge name the agent picked and the resolved next state must be
     // present.
     let meta = std::fs::read_to_string(steps_dir.join("01-start.meta.yaml")).unwrap();
+    // Tagged-enum refactor (#255): the discriminator is `type: graph`,
+    // emitted by serde's internal tagging on `StepKindData::Graph`. Pin it
+    // so a future move to adjacent/external tagging surfaces the wire
+    // break here before it lands in saved runs.
+    assert!(
+        meta.contains("type: graph"),
+        "01-start.meta.yaml must declare type: graph, got:\n{meta}"
+    );
     assert!(
         meta.contains("graph_decision:"),
         "01-start.meta.yaml must carry graph_decision block, got:\n{meta}"

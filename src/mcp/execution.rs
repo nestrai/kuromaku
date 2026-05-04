@@ -395,7 +395,7 @@ fn render_outputs(outputs: &RunOutputs, step_filter: Option<&str>) -> Value {
 mod tests {
     use super::*;
     use crate::stack::{
-        ParticipantStat, STEPS_SUBDIR, StepRecord, ensure_dir, step_meta_filename, write_run_step,
+        STEPS_SUBDIR, StepKindData, StepRecord, ensure_dir, step_meta_filename, write_run_step,
     };
     use std::fs;
     use tempfile::TempDir;
@@ -464,7 +464,6 @@ mod tests {
     fn record_for(step_num: usize, step_id: &str, ext: &str) -> StepRecord {
         StepRecord {
             step_id: step_id.to_string(),
-            kind: "llm".to_string(),
             agent: Some("Levi".to_string()),
             model_requested: Some("claude-sonnet-4-5".to_string()),
             model_actual: Some("claude-sonnet-4-5".to_string()),
@@ -476,11 +475,7 @@ mod tests {
             exit_code: 0,
             input_steps: vec![],
             output_file: format!("{step_num:02}-{step_id}.{ext}"),
-            participants: Vec::<ParticipantStat>::new(),
-            turns: None,
-            messages: None,
-            terminated_by: None,
-            graph_decision: None,
+            data: StepKindData::Llm,
         }
     }
 
