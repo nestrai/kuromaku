@@ -113,6 +113,17 @@ enum Command {
         #[arg(long = "include-project-context")]
         include_project_context: bool,
     },
+    /// Validate a flow's structure (schema + graph reachability/dead-ends).
+    ///
+    /// Exits non-zero on hard errors (e.g. dead-end states); exits zero
+    /// on warnings only (e.g. unreachable states). Warnings and errors
+    /// route to stderr; stdout stays clean for machine-readable use.
+    Validate {
+        /// Flow name (looked up in seeds under `flows/<name>.yaml`) or a
+        /// path to a flow YAML file. Path is tried first; falls back to
+        /// the seed-based lookup if the value is not an existing file.
+        flow: String,
+    },
     /// Fetch skills from remote sources pinned in .kuro/skills.lock
     Pull,
     /// Stop the agent team
@@ -154,6 +165,7 @@ async fn main() -> Result<()> {
             agent,
             include_project_context,
         } => chat::run_chat(&agent, include_project_context).await?,
+        Command::Validate { flow } => run_validate(&flow)?,
         Command::Pull => run_pull()?,
         Command::Down => {
             println!("kuro down: not yet implemented");
@@ -391,6 +403,75 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Implementation of `kuro validate <flow>`.
+///
+/// Resolves the flow argument by trying it as a file path first and
+/// falling back to a seed-based name lookup (mirrors `kuro run`'s
+/// resolution so the two commands accept the same value). Loads the
+/// YAML through the polymorphic [`config::load_flow_any_from_str`]:
+///
+/// * Linear flows pass through schema validation only -- there is no
+///   graph layer to walk. A successful parse is reported as ok.
+/// * Graph flows additionally run [`config::validate_graph_reachability`],
+///   which surfaces dead-ends (errors) and unreachable states (warnings).
+///
+/// Output discipline (issue #238):
+/// * stdout receives only the success summary, so callers can grep or
+///   pipe stdout for machine-readable use.
+/// * stderr receives every warning and every error, prefixed with
+///   `warning:` / `error:` so the source is unambiguous.
+/// * Non-zero exit on any hard error; zero exit on warnings only.
+fn run_validate(flow: &str) -> Result<()> {
+    let path = if Path::new(flow).is_file() {
+        PathBuf::from(flow)
+    } else {
+        // Fall back to the seed-based name lookup. Same resolver
+        // `kuro run` uses, so the two commands accept identical values.
+        let koto_config = KotoConfig::load_optional(Path::new("."))?;
+        let seeds = koto_config
+            .as_ref()
+            .map(|c| c.seeds.clone())
+            .unwrap_or_else(Seeds::default_local);
+        runner::resolve_flow_path(&FlowSource::Name(flow.to_string()), &seeds)?
+    };
+
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|e| eyre!("failed to read flow '{}': {e}", path.display()))?;
+
+    let parsed = config::load_flow_any_from_str(&contents)?;
+
+    match parsed {
+        config::Flow::Linear(_) => {
+            // Linear flows have no graph layer to walk; a successful
+            // parse already validated everything we know how to check.
+            println!("ok: {} validates (linear flow)", path.display());
+            Ok(())
+        }
+        config::Flow::Graph(g) => {
+            let report = config::validate_graph_reachability(&g);
+            // Warnings first, errors second -- reading order matches
+            // severity (lighter to heavier) so the worst news is the
+            // last thing the user sees before the prompt returns.
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
+            for error in &report.errors {
+                eprintln!("error: {error}");
+            }
+            if report.is_ok() {
+                println!("ok: {} validates (graph flow)", path.display());
+                Ok(())
+            } else {
+                Err(eyre!(
+                    "validation failed: {} error(s) in {}",
+                    report.errors.len(),
+                    path.display()
+                ))
+            }
+        }
+    }
 }
 
 fn run_pull() -> Result<()> {
