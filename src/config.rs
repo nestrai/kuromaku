@@ -210,6 +210,9 @@ pub struct RawStep {
 pub struct RawAgentFile {
     pub name: String,
     pub title: Option<String>,
+    /// Optional 1-2 sentence summary above the role. Documentation only --
+    /// the runner does not consume it. Issue #267.
+    pub description: Option<String>,
     pub role: String,
     #[serde(default)]
     pub rules: Vec<String>,
@@ -263,6 +266,10 @@ pub struct Agent {
     pub id: String,
     pub name: String,
     pub title: Option<String>,
+    /// Optional 1-2 sentence summary of the agent. Documentation only --
+    /// the runner does not inject this anywhere. Tools (list-agents, future
+    /// TUI/web UI) can surface it. See issue #267.
+    pub description: Option<String>,
     pub role: String,
     pub model: String,
     pub backend: Backend,
@@ -768,6 +775,7 @@ pub fn load_agent_file_with_seeds(
             id: agent_id.to_string(),
             name: raw.name,
             title: raw.title,
+            description: raw.description,
             role: raw.role,
             model,
             backend: raw.backend.unwrap_or(defaults.backend),
@@ -1690,6 +1698,62 @@ env:
         assert_eq!(agent.model, "claude-sonnet-4-5");
         assert_eq!(agent.backend, Backend::ClaudeCli);
         assert_eq!(agent.env.get("CARGO_TERM_COLOR").unwrap(), "always");
+        // No description in this file -- field stays None (issue #267).
+        assert_eq!(agent.description, None);
+    }
+
+    #[test]
+    fn load_agent_file_accepts_description() {
+        // Issue #267: agent files may carry an optional `description:` field
+        // for documentation. It must round-trip through serde and not trigger
+        // the unknown-field warning. The runner does not act on it.
+        let dir = tempfile::tempdir().unwrap();
+        let agents_dir = dir.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        std::fs::write(
+            agents_dir.join("Levi.yaml"),
+            r#"
+name: Levi
+description: "Senior systems architect. Surveys boundaries and module seams."
+role: "You design module boundaries before code is written."
+"#,
+        )
+        .unwrap();
+
+        let defaults = Defaults {
+            model: "default-model".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let agent = load_agent_file(dir.path(), "Levi", &defaults, None).unwrap();
+        assert_eq!(
+            agent.description.as_deref(),
+            Some("Senior systems architect. Surveys boundaries and module seams.")
+        );
+        // Sanity: the rest of the file still loads as before.
+        assert_eq!(agent.name, "Levi");
+        assert_eq!(
+            agent.role,
+            "You design module boundaries before code is written."
+        );
+    }
+
+    #[test]
+    fn raw_agent_file_does_not_warn_on_description() {
+        // Guard the "no warning" behavior at the parse layer: if the
+        // serde-flatten unknown map ever ends up containing `description`
+        // again (e.g. someone removes the field), this test catches it
+        // without depending on stderr capture.
+        let yaml = r#"
+name: Levi
+description: "A short summary."
+role: "Some role."
+"#;
+        let raw: RawAgentFile = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(raw.description.as_deref(), Some("A short summary."));
+        assert!(
+            !raw.unknown.contains_key("description"),
+            "description must be a known field, not collected by serde-flatten"
+        );
     }
 
     #[test]
