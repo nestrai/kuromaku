@@ -107,6 +107,73 @@ linear. Reach for `states:` when the user has been manually deciding
 between two follow-up flows after each run -- that is the case the
 graph shape was added for.
 
+## Splitting prompts into files
+
+Both flow shapes accept `prompt_file:` (top-level) and `task_file:`
+(per state on graph flows, per step on linear flows). The path is
+resolved relative to the directory of the flow YAML, so a graph that
+lives at `.kuro/flows/implement-issue.yaml` reads
+`.kuro/flows/prompts/design.md` for `task_file: prompts/design.md`.
+
+```yaml
+# .kuro/flows/implement-issue.yaml
+version: "1"
+name: implement-issue
+prompt_file: prompts/implement-issue.md   # top-level
+initial: design
+states:
+  design:
+    role: architect
+    task_file: prompts/design.md          # per-state
+    edges:
+      design_complete: { to: implement, description: ... }
+  implement:
+    role: developer
+    task_file: prompts/implement.md
+    edges:
+      implementation_complete: { to: done, description: ... }
+  done:
+    kind: final
+    description: Happy-path exit.
+```
+
+```
+.kuro/flows/
+  implement-issue.yaml
+  prompts/
+    implement-issue.md
+    design.md
+    implement.md
+```
+
+Resolution rules:
+
+- **Sibling paths only.** The reference must resolve to a file under
+  the flow YAML's directory. Absolute paths and any reference whose
+  components include `..` are rejected before any I/O. Symlinks that
+  point outside the flow directory are rejected after canonicalize.
+- **Mutual exclusion.** Setting both `task:` and `task_file:` on the
+  same state (or both `prompt:` and `prompt_file:` at the top level)
+  is a validation error -- pick one. The error names the offending
+  flow path, state/step ID, and the field pair.
+- **Variable substitution still applies.** `{{vars.X}}` placeholders
+  inside a loaded prompt file get the same substitution pass as
+  inline `task:` strings. The file is read first, then substituted.
+- **Missing files are validation errors.** `kuro validate` reports
+  missing prompt files with the flow path and state/step ID, exits
+  non-zero, and writes the error to stderr -- the same channel as
+  the graph reachability and dead-end errors.
+
+When to split:
+
+- The inline `task:` is more than a paragraph and pushes the graph
+  topology off-screen.
+- Two states share the bulk of their prompt -- a shared file plus a
+  small inline tail beats copy-pasting the whole prompt twice.
+- The prompt is iterated on during a flow's lifetime and a focused
+  diff in `prompts/<state>.md` reads better than a diff buried in
+  the YAML.
+
 ## See also
 
 - `seeds/rust/flows/implement-issue.yaml` -- the canonical example

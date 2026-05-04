@@ -437,10 +437,12 @@ fn run_validate(flow: &str) -> Result<()> {
         runner::resolve_flow_path(&FlowSource::Name(flow.to_string()), &seeds)?
     };
 
-    let contents = std::fs::read_to_string(&path)
-        .map_err(|e| eyre!("failed to read flow '{}': {e}", path.display()))?;
-
-    let parsed = config::load_flow_any_from_str(&contents)?;
+    // Path-aware loader (#258) so `prompt_file:` / `task_file:` references
+    // resolve against the flow's directory. Missing files surface as
+    // validation errors that name the flow path and the offending state
+    // ID, which is the channel `kuro validate` uses to report them.
+    let parsed = config::load_flow_any_from_path(&path)
+        .map_err(|e| eyre!("failed to load flow '{}': {e}", path.display()))?;
 
     match parsed {
         config::Flow::Linear(_) => {

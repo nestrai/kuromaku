@@ -2020,8 +2020,12 @@ mod flow_api {
             .map(|c| c.seeds.clone())
             .unwrap_or_else(Seeds::default_local);
         let path = resolve_flow_path(&FlowSource::Name(name.to_string()), &seeds)?;
-        let contents = std::fs::read_to_string(&path)?;
-        let flow_config = config::load_flow_from_str(&contents)?;
+        // #258: path-aware loader so a flow with `prompt_file:` /
+        // `task_file:` resolves consistently with the runner. The stack
+        // path itself does not depend on prompt content; using the same
+        // entry point everywhere keeps "what counts as a valid flow"
+        // identical across the binary.
+        let flow_config = config::load_flow_from_path(&path)?;
         Ok(resolve_stack_path(&flow_config.stack.path))
     }
 
@@ -2048,8 +2052,12 @@ mod flow_api {
             .map(|c| c.seeds.clone())
             .unwrap_or_else(Seeds::default_local);
         let path = resolve_flow_path(&FlowSource::Name(flow_name.to_string()), &seeds)?;
-        let contents = std::fs::read_to_string(&path)?;
-        let has_id: Box<dyn Fn(&str) -> bool> = match config::load_flow_any_from_str(&contents)? {
+        // #258: path-aware loader so flows with `prompt_file:` /
+        // `task_file:` references load consistently across entry
+        // points. Step-id verification does not read task content, but
+        // a flow with broken external prompts should fail here too --
+        // not silently succeed only to blow up at execute time.
+        let has_id: Box<dyn Fn(&str) -> bool> = match config::load_flow_any_from_path(&path)? {
             config::Flow::Linear(flow_config) => {
                 let ids: Vec<String> = flow_config.steps.iter().map(|s| s.id.clone()).collect();
                 Box::new(move |id| ids.iter().any(|s| s == id))
@@ -2394,7 +2402,11 @@ mod flow_api {
         //     fail with a graph-aware message *before* any agent spawn.
         // Acceptance criteria #5 from the issue: a dead-end graph must
         // refuse to start before any agent is spawned.
-        match config::load_flow_any_from_str(&contents) {
+        // #258: path-aware so graph flows with `prompt_file:` /
+        // `task_file:` arrive fully resolved at
+        // `execute_graph_flow_setup`. The linear branch falls through
+        // to the path-aware loader below.
+        match config::load_flow_any_from_path(&path) {
             Ok(config::Flow::Graph(g)) => {
                 let report = config::validate_graph_reachability(&g);
                 for warning in &report.warnings {
@@ -2492,8 +2504,16 @@ mod flow_api {
                     .collect()
             })
             .unwrap_or_default();
-        let mut flow_config = config::load_flow_from_str_with_project(
+        // #258: path-aware variant so per-step `task_file:` and the
+        // top-level `prompt_file:` resolve against the flow's
+        // directory. After this returns, every `step.task` and the
+        // flow `prompt:` already carry the file contents and the
+        // subsequent `substitute_vars` pass treats them identically
+        // to inline strings.
+        let mut flow_config = config::load_flow_from_str_with_project_at(
             &contents,
+            config::flow_base_dir_for(&path),
+            &path.display().to_string(),
             &legacy_role_overrides,
             &project_roles,
         )?;
@@ -2803,6 +2823,22 @@ mod flow_api {
 
         // ---- Var substitution in graph prompt + per-state tasks --------
         let mut graph = graph;
+        // #258 invariant: external-prompt resolution must run before
+        // we get here. The path-aware loader (`load_flow_any_from_path`)
+        // is the only entry point that calls this function, and it
+        // resolves `prompt_file:` / `task_file:` before returning. The
+        // debug_assert is a single safety net at the runtime boundary
+        // so a future caller that bypasses the path-aware loader
+        // tripps the check in tests instead of silently feeding the
+        // runtime an unresolved flow.
+        debug_assert!(
+            graph.prompt_file.is_none(),
+            "graph.prompt_file should be resolved before execute_graph_flow_setup"
+        );
+        debug_assert!(
+            graph.states.values().all(|s| s.task_file.is_none()),
+            "every state's task_file should be resolved before execute_graph_flow_setup"
+        );
         if let Some(prompt) = graph.prompt.as_mut() {
             *prompt = super::flow_api::substitute_vars(prompt, &effective_vars)?;
         }

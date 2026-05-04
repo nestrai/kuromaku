@@ -303,6 +303,12 @@ fn enumerate_flows(seeds: &Seeds) -> Vec<DiscoveredFlow> {
                     continue;
                 }
             };
+            // #258 deliberately stays on the string-only loader: this
+            // discovery loop only reads `name` / `description` / step
+            // IDs to build the seed listing. It must keep listing flows
+            // even when a sibling `task_file:` is missing -- a broken
+            // prompt link is the runner's problem, not a reason to
+            // hide the flow from `kuro` and the MCP `list_flows` tool.
             let flow = match load_flow_from_str(&contents) {
                 Ok(f) => f,
                 Err(e) => {
