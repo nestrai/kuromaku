@@ -1,15 +1,15 @@
-# Graph-flow prototype of `implement-issue.yaml`.
+# Graph-flow for the issue-to-PR loop.
 #
-# Same intent as the linear flow (read an issue, implement it, review,
-# open a draft PR), but expressed as a state graph: each agent picks the
-# next state from a closed set of edges. The reviewer can route back to
-# `implement` or back to `design` depending on what they actually found,
-# instead of the linear PASS/FAIL split.
+# Read an issue, implement it, review, open a draft PR -- expressed as a
+# state graph: each agent picks the next state from a closed set of
+# edges. The reviewer can route back to `implement` or back to `design`
+# depending on what they actually found, instead of a linear PASS/FAIL
+# split.
 #
-# Usage: kuro run implement-issue-graph --var id=42
+# Usage: kuro run implement-issue --var id=42
 # See docs/graph-flows.md for when to pick `flow:` vs `states:`.
 version: "1"
-name: implement-issue-graph
+name: implement-issue
 prompt: |
   Implement issue #{{vars.id}} in this repository. Follow the team's rules
   and produce a draft PR at the end.
