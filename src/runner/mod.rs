@@ -1843,6 +1843,10 @@ mod flow_api {
     static PLACEHOLDER_RE: LazyLock<regex_lite::Regex> =
         LazyLock::new(|| regex_lite::Regex::new(r"\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap());
 
+    static ROLES_RE: LazyLock<regex_lite::Regex> = LazyLock::new(|| {
+        regex_lite::Regex::new(r"\{\{roles\.([a-zA-Z_][a-zA-Z0-9_]*)\}\}").unwrap()
+    });
+
     /// Replace `{{vars.<key>}}` placeholders. Mirrors the helper that lived
     /// in `main.rs` -- moved here so callers without the CLI binary can
     /// reuse it. Errors list every missing key in one message.
@@ -1864,6 +1868,48 @@ mod flow_api {
             return Err(eyre!(
                 "missing vars: {}\n\nhint: define them in {KOTO_CONFIG_FILE} or pass --var key=value",
                 missing.join(", ")
+            ));
+        }
+        Ok(result.into_owned())
+    }
+
+    /// Replace `{{roles.<name>}}` placeholders with the agent ID bound to
+    /// that role (issue #259). The `roles` map is the cascade-resolved
+    /// `role -> agent_id` table the runner has already built (linear:
+    /// `flow_config.roles` after `apply_role_agent_overrides`; graph: a
+    /// freshly built map from project config + CLI overrides + per-state
+    /// `role:` declarations).
+    ///
+    /// Errors collect every unknown role referenced in `text` into a
+    /// single message, naming `context` (e.g. `state 'steer_design'`,
+    /// `flow prompt`, `step 'design'`) so the operator can find the bad
+    /// placeholder without grepping the whole flow.
+    pub(crate) fn substitute_roles(
+        text: &str,
+        roles: &HashMap<String, String>,
+        context: &str,
+    ) -> Result<String> {
+        let mut missing: Vec<String> = Vec::new();
+        let result = ROLES_RE.replace_all(text, |caps: &regex_lite::Captures<'_>| {
+            let role = &caps[1];
+            match roles.get(role) {
+                Some(agent_id) => agent_id.clone(),
+                None => {
+                    if !missing.iter().any(|r| r == role) {
+                        missing.push(role.to_string());
+                    }
+                    caps[0].to_string()
+                }
+            }
+        });
+        if !missing.is_empty() {
+            // Match the wording the issue's AC2 spells out: the operator
+            // sees which role is unbound and where the placeholder lives.
+            let plural = if missing.len() == 1 { "role" } else { "roles" };
+            return Err(eyre!(
+                "unknown {plural} referenced in {context}: {}\n\nhint: bind the role in {KOTO_CONFIG_FILE} (`roles:` map) or pass --role {}=<agent>",
+                missing.join(", "),
+                missing[0]
             ));
         }
         Ok(result.into_owned())
@@ -2518,17 +2564,38 @@ mod flow_api {
             &project_roles,
         )?;
 
-        // ---- 4. Var substitution in flow + per-step task/run -----------
+        // ---- 4a. Validate + apply role cascade BEFORE substitution -----
+        // Issue #259: `{{roles.<name>}}` substitution needs the final
+        // role -> agent map. Running the cascade first writes the
+        // CLI/project/flow-resolved agent into `flow_config.roles`, which
+        // `substitute_roles` below reads from. Validate first so a bad
+        // `--role` argument errors with the resolver's typed error
+        // before any substitution work happens.
+        let koto_dir = Path::new(KOTO_DIR);
+        validate_role_overrides(&spec.role_overrides, &flow_config, koto_config.as_ref())
+            .map_err(|e| eyre!("{e}"))?;
+        apply_role_agent_overrides(&mut flow_config, koto_config.as_ref(), &spec.role_overrides);
+
+        // ---- 4b. Var + role substitution in flow + per-step task/run ---
+        // Order: vars first (they may appear inside any string), roles
+        // second (so a `{{roles.X}}` placeholder cannot accidentally be
+        // produced by var expansion). Both run before any agent spawns
+        // so AC2 holds: an unknown role aborts the run before work starts.
         if let Some(ref mut prompt) = flow_config.prompt {
             *prompt = substitute_vars(prompt, &effective_vars)?;
+            *prompt = substitute_roles(prompt, &flow_config.roles, "flow prompt")?;
         }
         for step in flow_config.steps.iter_mut() {
             if let Some(task_str) = step.task.as_mut() {
                 *task_str = substitute_vars(task_str, &effective_vars)?;
+                let ctx = format!("step '{}'", step.id);
+                *task_str = substitute_roles(task_str, &flow_config.roles, &ctx)?;
             }
             if let Some(run_str) = step.run.as_mut() {
                 *run_str = substitute_vars(run_str, &effective_vars)?;
                 *run_str = substitute_placeholders(run_str, &effective_vars)?;
+                let ctx = format!("step '{}'", step.id);
+                *run_str = substitute_roles(run_str, &flow_config.roles, &ctx)?;
             }
         }
         let task_with_vars = spec
@@ -2536,8 +2603,12 @@ mod flow_api {
             .as_deref()
             .map(|t| substitute_vars(t, &effective_vars))
             .transpose()?;
+        let task_with_roles = task_with_vars
+            .as_deref()
+            .map(|t| substitute_roles(t, &flow_config.roles, "-t task"))
+            .transpose()?;
         let resolved_task = resolve_task(
-            task_with_vars.as_deref(),
+            task_with_roles.as_deref(),
             &flow_config.prompt,
             &template_vars,
         )?;
@@ -2546,12 +2617,6 @@ mod flow_api {
             FlowSource::Name(n) => n.clone(),
             _ => flow_config.name.clone(),
         };
-
-        // ---- 5. Validate role overrides + apply agent cascade ----------
-        let koto_dir = Path::new(KOTO_DIR);
-        validate_role_overrides(&spec.role_overrides, &flow_config, koto_config.as_ref())
-            .map_err(|e| eyre!("{e}"))?;
-        apply_role_agent_overrides(&mut flow_config, koto_config.as_ref(), &spec.role_overrides);
 
         // ---- 6. Load agents and resolve roles --------------------------
         let (agents, agent_origins, agent_hashes) =
@@ -2839,32 +2904,17 @@ mod flow_api {
             graph.states.values().all(|s| s.task_file.is_none()),
             "every state's task_file should be resolved before execute_graph_flow_setup"
         );
-        if let Some(prompt) = graph.prompt.as_mut() {
-            *prompt = super::flow_api::substitute_vars(prompt, &effective_vars)?;
-        }
-        for state in graph.states.values_mut() {
-            if let Some(task) = state.task.as_mut() {
-                *task = super::flow_api::substitute_vars(task, &effective_vars)?;
-            }
-        }
-
-        // ---- Resolve top-level task (CLI -t > graph.prompt) ------------
-        let task_with_vars = spec
-            .task
-            .as_deref()
-            .map(|t| super::flow_api::substitute_vars(t, &effective_vars))
-            .transpose()?;
-        let resolved_task = match (task_with_vars, graph.prompt.clone()) {
-            (Some(t), _) => t,
-            (None, Some(p)) => p,
-            (None, None) => String::new(),
-        };
-
         // ---- Resolve role -> agent_id for every non-terminal state -----
         // Final and human states are skipped (no agent runs there). A
         // non-terminal state with no role:, or a role with no binding,
         // aborts the setup with a clear error before any agent file is
         // touched.
+        //
+        // Issue #259: this used to live AFTER var substitution, but the
+        // new `{{roles.<name>}}` substitution needs the resolved map up
+        // front. Doing it first does not change the validation contract
+        // (the same checks fire, in the same order from the operator's
+        // perspective) and lets `substitute_roles` reuse the same map.
         let project_roles = koto_config.map(|c| &c.roles);
         let mut state_to_agent: HashMap<String, String> = HashMap::new();
         for (state_id, state) in &graph.states {
@@ -2888,6 +2938,68 @@ mod flow_api {
                     })?;
             state_to_agent.insert(state_id.clone(), agent_id);
         }
+
+        // ---- Build role -> agent_id map for {{roles.X}} substitution --
+        // Issue #259. Three sources, in the same precedence as the
+        // resolver cascade (CLI override > project config > state's
+        // role binding picked up via `state_to_agent`). Roles bound only
+        // in the project config are included even when no state uses
+        // them, so a top-level prompt can reference any role the project
+        // declares without forcing a dummy state.
+        let mut roles_map: HashMap<String, String> = HashMap::new();
+        if let Some(pr) = project_roles {
+            for (role_name, kr) in pr {
+                roles_map.insert(role_name.clone(), kr.agent.clone());
+            }
+        }
+        for (state_id, agent_id) in &state_to_agent {
+            // state_to_agent is keyed by state_id, but the cascade-resolved
+            // value already reflects per-state role + CLI overrides. Look
+            // up the role name from the state to key the map by role.
+            if let Some(state) = graph.states.get(state_id)
+                && let Some(role_name) = state.role.as_deref()
+            {
+                roles_map.insert(role_name.to_string(), agent_id.clone());
+            }
+        }
+        for ov in &spec.role_overrides {
+            if let crate::resolver::RoleOverride::Agent { role, agent } = ov {
+                roles_map.insert(role.clone(), agent.clone());
+            }
+        }
+
+        // ---- Var + role substitution in graph prompt + per-state tasks -
+        // Order: vars first (general namespace), then roles (so a role
+        // value cannot be re-interpreted as a placeholder). Both happen
+        // pre-spawn so AC2 holds: an unknown role in any prompt aborts
+        // the setup before agents launch.
+        if let Some(prompt) = graph.prompt.as_mut() {
+            *prompt = super::flow_api::substitute_vars(prompt, &effective_vars)?;
+            *prompt = super::flow_api::substitute_roles(prompt, &roles_map, "graph prompt")?;
+        }
+        for (state_id, state) in graph.states.iter_mut() {
+            if let Some(task) = state.task.as_mut() {
+                *task = super::flow_api::substitute_vars(task, &effective_vars)?;
+                let ctx = format!("state '{state_id}'");
+                *task = super::flow_api::substitute_roles(task, &roles_map, &ctx)?;
+            }
+        }
+
+        // ---- Resolve top-level task (CLI -t > graph.prompt) ------------
+        let task_with_vars = spec
+            .task
+            .as_deref()
+            .map(|t| super::flow_api::substitute_vars(t, &effective_vars))
+            .transpose()?;
+        let task_with_roles = task_with_vars
+            .as_deref()
+            .map(|t| super::flow_api::substitute_roles(t, &roles_map, "-t task"))
+            .transpose()?;
+        let resolved_task = match (task_with_roles, graph.prompt.clone()) {
+            (Some(t), _) => t,
+            (None, Some(p)) => p,
+            (None, None) => String::new(),
+        };
 
         // ---- Load each unique agent ------------------------------------
         // The graph format does not declare `defaults:`, so we use the
@@ -3099,7 +3211,7 @@ pub use flow_api::{
 pub(crate) use flow_api::{
     apply_resolved_roles_to_steps, apply_role_agent_overrides, build_manifest, resolve_flow_path,
     resolve_stack_path, resolve_stack_path_for_flow_name, resolve_task, substitute_placeholders,
-    substitute_vars, verify_flow_step_ids,
+    substitute_roles, substitute_vars, verify_flow_step_ids,
 };
 
 // Test-only re-export so in-tree consumers (notably the MCP session module)
@@ -4229,5 +4341,145 @@ mod tests {
             rx.recv().await.is_none(),
             "channel must close on EOF so the router can terminate cleanly"
         );
+    }
+
+    // --- {{roles.X}} substitution (issue #259) -------------------------
+
+    fn roles_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn substitute_roles_replaces_namespaced_placeholders() {
+        let roles = roles_map(&[("architect", "Levi"), ("developer", "Kai")]);
+        let result = substitute_roles(
+            "{{roles.architect}} just produced a design plan; {{roles.developer}} will implement.",
+            &roles,
+            "flow prompt",
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            "Levi just produced a design plan; Kai will implement."
+        );
+    }
+
+    #[test]
+    fn substitute_roles_repeated_placeholder_replaces_all() {
+        let roles = roles_map(&[("architect", "Levi")]);
+        let result = substitute_roles(
+            "{{roles.architect}} and again {{roles.architect}}",
+            &roles,
+            "flow prompt",
+        )
+        .unwrap();
+        assert_eq!(result, "Levi and again Levi");
+    }
+
+    #[test]
+    fn substitute_roles_leaves_vars_namespace_alone() {
+        // The vars regex and the roles regex are siblings -- neither must
+        // touch the other's namespace.
+        let roles = roles_map(&[("architect", "Levi")]);
+        let result =
+            substitute_roles("Issue {{vars.id}} for {{roles.architect}}", &roles, "ctx").unwrap();
+        assert_eq!(result, "Issue {{vars.id}} for Levi");
+    }
+
+    #[test]
+    fn substitute_roles_no_placeholders_passes_through() {
+        let roles = roles_map(&[("architect", "Levi")]);
+        let result = substitute_roles("plain text without placeholders", &roles, "ctx").unwrap();
+        assert_eq!(result, "plain text without placeholders");
+    }
+
+    #[test]
+    fn substitute_roles_unknown_role_errors_with_clear_message() {
+        // AC2: unknown role aborts before any agent runs. The error must
+        // name the role and the context (state / step / prompt).
+        let roles = roles_map(&[("architect", "Levi")]);
+        let err = substitute_roles(
+            "{{roles.reviewer}} should weigh in",
+            &roles,
+            "state 'review'",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown role"), "got: {msg}");
+        assert!(msg.contains("reviewer"), "got: {msg}");
+        assert!(msg.contains("state 'review'"), "got: {msg}");
+        // Operator hint surfaces the fix path.
+        assert!(msg.contains("--role"), "got: {msg}");
+    }
+
+    #[test]
+    fn substitute_roles_collects_multiple_unknown_roles() {
+        // One pass, one error -- mirrors substitute_vars' behavior so
+        // operators do not have to fix-and-rerun in a loop.
+        let roles = roles_map(&[("architect", "Levi")]);
+        let err = substitute_roles(
+            "{{roles.foo}} and {{roles.bar}} and {{roles.architect}}",
+            &roles,
+            "flow prompt",
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("foo"), "got: {msg}");
+        assert!(msg.contains("bar"), "got: {msg}");
+        // The known role does not get reported as missing.
+        assert!(!msg.contains("architect"), "got: {msg}");
+        assert!(msg.contains("roles"), "got: {msg}");
+    }
+
+    #[test]
+    fn substitute_roles_honors_cli_role_override_via_apply_cascade() {
+        // Cascade integration: --role architect=Vera must beat the
+        // project-config binding `architect: Levi` so `{{roles.architect}}`
+        // substitutes Vera. Mirrors the order the linear path uses --
+        // apply_role_agent_overrides first, substitute second.
+        use crate::config::{Defaults, FlowConfig, StackConfig};
+        use crate::resolver::RoleOverride;
+
+        let mut flow = FlowConfig {
+            version: "1".to_string(),
+            name: "test".to_string(),
+            prompt: Some("{{roles.architect}} kicks off".to_string()),
+            defaults: Defaults {
+                model: "claude-sonnet-4-5".to_string(),
+                backend: Backend::ClaudeCli,
+            },
+            // Project-config binding -- the loader writes this into
+            // flow_config.roles before the runner gets it.
+            roles: roles_map(&[("architect", "Levi")]),
+            steps: Vec::new(),
+            stack: StackConfig {
+                backend: "local".to_string(),
+                path: "/tmp/test-stack".to_string(),
+            },
+        };
+        let overrides = vec![RoleOverride::Agent {
+            role: "architect".to_string(),
+            agent: "Vera".to_string(),
+        }];
+
+        apply_role_agent_overrides(&mut flow, None, &overrides);
+        let prompt = flow.prompt.as_deref().unwrap();
+        let substituted = substitute_roles(prompt, &flow.roles, "flow prompt").unwrap();
+
+        assert_eq!(substituted, "Vera kicks off");
+    }
+
+    #[test]
+    fn substitute_roles_ignores_dotted_non_role_namespaces() {
+        // `{{agents.X.model}}` is explicitly out of scope for #259. The
+        // helper must leave it untouched so a future namespace can land
+        // without colliding.
+        let roles = roles_map(&[("architect", "Levi")]);
+        let result =
+            substitute_roles("{{agents.Levi.model}} {{roles.architect}}", &roles, "ctx").unwrap();
+        assert_eq!(result, "{{agents.Levi.model}} Levi");
     }
 }

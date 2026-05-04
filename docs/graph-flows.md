@@ -159,6 +159,8 @@ Resolution rules:
 - **Variable substitution still applies.** `{{vars.X}}` placeholders
   inside a loaded prompt file get the same substitution pass as
   inline `task:` strings. The file is read first, then substituted.
+  `{{roles.X}}` (see below) resolves the same way regardless of
+  whether the prompt was inline or loaded from a sibling file.
 - **Missing files are validation errors.** `kuro validate` reports
   missing prompt files with the flow path and state/step ID, exits
   non-zero, and writes the error to stderr -- the same channel as
@@ -173,6 +175,44 @@ When to split:
 - The prompt is iterated on during a flow's lifetime and a focused
   diff in `prompts/<state>.md` reads better than a diff buried in
   the YAML.
+
+## Role-bound names: `{{roles.<role>}}`
+
+Prompts often need to reference *another* role's agent by name --
+"Levi just produced a design plan, Kai will implement it" reads
+better than "the team architect produced something the developer
+will pick up". Hard-coding the agent name in the flow file works
+until a project remaps the role. Use the `roles` namespace instead:
+
+```yaml
+states:
+  steer_design:
+    role: steering
+    task: |
+      {{roles.architect}} just produced a design plan for issue
+      #{{vars.id}}. Decide the next step.
+```
+
+`{{roles.architect}}` substitutes to whatever agent the cascade
+binds to the `architect` role at run time:
+
+1. CLI `--role architect=<agent>` (highest precedence)
+2. Project config `roles.architect.agent` in `.kuro/config.yaml`
+3. Flow-file `roles:` default (linear flows only -- graph flows
+   declare `role:` per state, no flow-file default)
+
+If no layer binds the role, the run aborts before any agent
+spawns with a clear error: `unknown role 'architect' referenced
+in state 'steer_design'`. Substitution happens after `{{vars.X}}`
+in both linear and graph flows, and applies to the top-level
+`prompt:` and every per-step / per-state `task:`.
+
+Out of scope (do not rely on these working):
+
+- `{{roles.<role>.model}}` and other agent metadata -- only the
+  agent name is exposed.
+- `{{agents.<id>...}}` -- a different namespace, not implemented.
+- Conditional / loop templating -- there is no Jinja-style logic.
 
 ## See also
 
