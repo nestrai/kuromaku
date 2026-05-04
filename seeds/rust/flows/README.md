@@ -7,8 +7,8 @@ flows used day-to-day live in the external seeds repo at
 
 ## Flows in this directory
 
-- `implement-issue-graph.yaml` -- graph flow (`states:` / edges). Drives
-  the same issue-to-PR loop as the linear `implement-issue.yaml` in the
+- `implement-issue.yaml` -- graph flow (`states:` / edges). Drives the
+  same issue-to-PR loop as the linear `implement-issue.yaml` in the
   external seeds repo, but lets the reviewer route back to `design` or
   `implement` depending on what they actually found instead of a single
   PASS/FAIL gate.

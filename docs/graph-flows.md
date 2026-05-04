@@ -33,7 +33,7 @@ Use a linear flow when:
 
 ```yaml
 version: "1"
-name: implement-issue-graph
+name: implement-issue
 initial: design
 states:
   design:
@@ -109,7 +109,7 @@ graph shape was added for.
 
 ## See also
 
-- `seeds/rust/flows/implement-issue-graph.yaml` -- the canonical example
+- `seeds/rust/flows/implement-issue.yaml` -- the canonical example
   shipped with the binary.
 - `docs/decisions/0006-event-state-machines/` -- the decision record
   motivating graph flows.
