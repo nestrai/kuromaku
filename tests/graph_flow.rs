@@ -161,6 +161,7 @@ states:
         description: Move to the final state.
   done:
     kind: final
+    description: Three-state graph reached its terminal state.
 "#;
 
 #[test]
