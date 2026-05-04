@@ -53,13 +53,20 @@ pub const DEFAULT_MAX_STEPS: usize = 30;
 /// Build the deterministic edge-menu suffix appended to every state's task
 /// prompt.
 ///
-/// Format mirrors the issue spec verbatim (kept as a single owned `String`
-/// rather than a `format_args!` chain so tests can assert on the exact
-/// rendering).
+/// The earlier wording ("Reply only with the JSON object") forced agents to
+/// collapse the entire artifact into the JSON `reason` field, which then
+/// made downstream states (steer / review / implement) operate on routing
+/// metadata instead of a real design / review / patch artifact. The current
+/// wording asks the agent to produce the artifact as the main reply and
+/// append the routing JSON as the last line; [`parse_agent_decision`]
+/// already accepts JSON embedded in surrounding prose so the parser does
+/// not need to change. The downstream context-handoff (see [`run_graph_flow`])
+/// reads the saved file verbatim, so prose + JSON survives intact across
+/// the next state's prompt.
 pub fn build_menu(state_id: &str, edges: &IndexMap<String, GraphEdge>) -> String {
     let mut s = String::new();
     s.push_str(&format!(
-        "You are at state `{state_id}`. After completing the task above, choose exactly one transition by replying with a JSON object:\n\n",
+        "You are at state `{state_id}`. Complete the task above as your main reply -- produce the full artifact (design plan, review, code summary, etc.) so the next agent in the graph can build on your work. After the artifact, end your reply with a single JSON object choosing one transition:\n\n",
     ));
     s.push_str(
         "{\"transition\": \"<edge-name>\", \"reason\": \"<one to two sentences explaining why>\"}\n\n",
@@ -69,7 +76,7 @@ pub fn build_menu(state_id: &str, edges: &IndexMap<String, GraphEdge>) -> String
         s.push_str(&format!("- `{name}`: {}\n", edge.description));
     }
     s.push('\n');
-    s.push_str("Reply only with the JSON object. Do not invent transitions that are not listed.");
+    s.push_str("The JSON object must appear exactly once, on its own line at the end of your reply. Pick one of the transitions listed -- do not invent new ones.");
     s
 }
 
@@ -131,6 +138,11 @@ pub async fn run_graph_flow(
     let mut results: Vec<StepRunResult> = Vec::new();
     let mut current = graph.initial.clone();
     let mut step_num: usize = 0;
+    // Track the state the runtime just transitioned out of so the next
+    // agent's prompt can include that step's artifact. Without this the
+    // graph runs as a sequence of isolated agents, each blind to what its
+    // predecessors produced. `None` for the first iteration.
+    let mut prior_state: Option<String> = None;
 
     loop {
         let state = graph.states.get(&current).ok_or_else(|| {
@@ -227,11 +239,39 @@ pub async fn run_graph_flow(
         };
         ui::print_step_banner(step_num, DEFAULT_MAX_STEPS, &step_info);
 
+        // Read the prior state's persisted artifact so the next agent can
+        // build on it. Without this the graph runs as a chain of strangers --
+        // a steering agent reviewing nothing, an implementer reading no
+        // design plan. Linear flows declare this explicitly via `step.input`;
+        // graph flows always thread the immediately-prior state's artifact.
+        // If the file is unreadable for any reason (corruption, race, etc.),
+        // we fail loud rather than silently dropping context.
+        let prior_context: Option<(String, String)> = match &prior_state {
+            Some(prev_id) => {
+                let body = stack::read_run_step_content(&ctx.run_path, prev_id).map_err(|e| {
+                    RunError::Stack {
+                        step: current.clone(),
+                        source: e,
+                    }
+                })?;
+                ui::print_context_injection(prev_id, prev_id, "");
+                Some((prev_id.clone(), body))
+            }
+            None => None,
+        };
+
         // Build the user prompt: top-level prompt (from ctx.task), per-state
-        // task, then the deterministic edge menu. ctx.task is already var-
-        // substituted by the caller.
+        // task, prior-state context (if any), then the deterministic edge menu.
+        // ctx.task is already var-substituted by the caller.
         let menu = build_menu(&current, edges);
-        let base_prompt = build_state_user_prompt(&ctx.task, state.task.as_deref(), &menu);
+        let base_prompt = build_state_user_prompt(
+            &ctx.task,
+            state.task.as_deref(),
+            prior_context
+                .as_ref()
+                .map(|(id, body)| (id.as_str(), body.as_str())),
+            &menu,
+        );
         let system_prompt =
             build_system_prompt(agent, &ctx.guide, &ctx.rules_cache, &ctx.skills_cache);
 
@@ -373,7 +413,7 @@ pub async fn run_graph_flow(
             duration_ms: duration.as_millis(),
             started_at: started_at.to_rfc3339(),
             exit_code: 0,
-            input_steps: Vec::new(),
+            input_steps: prior_state.iter().cloned().collect(),
             output_file: content_filename.clone(),
             participants: Vec::new(),
             turns: None,
@@ -412,14 +452,28 @@ pub async fn run_graph_flow(
             record,
         });
 
+        // Remember the state we just ran so the next iteration can splice
+        // its artifact into the next agent's prompt. Done before reassigning
+        // `current` so `current` still names the just-completed state.
+        prior_state = Some(current.clone());
         current = next;
     }
 }
 
 /// Build the user-facing prompt for a single state visit:
 /// flow-level prompt (carried via `ctx.task`) + per-state `task:` (if any) +
-/// the deterministic edge menu.
-fn build_state_user_prompt(flow_prompt: &str, state_task: Option<&str>, menu: &str) -> String {
+/// optional prior-state context + the deterministic edge menu.
+///
+/// `prior_context` is `(state_id, body)` for the immediately-preceding state
+/// in this run. The framing wrapper mirrors the linear runner's
+/// `build_user_prompt` so agents see a consistent context envelope across
+/// flow shapes.
+fn build_state_user_prompt(
+    flow_prompt: &str,
+    state_task: Option<&str>,
+    prior_context: Option<(&str, &str)>,
+    menu: &str,
+) -> String {
     let mut out = flow_prompt.to_string();
     if let Some(t) = state_task {
         if !out.is_empty() {
@@ -427,6 +481,14 @@ fn build_state_user_prompt(flow_prompt: &str, state_task: Option<&str>, menu: &s
         }
         out.push_str("Your task: ");
         out.push_str(t);
+    }
+    if let Some((prev_id, body)) = prior_context {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(&format!(
+            "Context from previous state '{prev_id}':\n\n--- Output from state '{prev_id}' ---\n{body}\n---\n\nIMPORTANT: The above is the artifact the previous agent produced. Read it as the input to your task. Build on it -- do not repeat or rephrase what is already covered.",
+        ));
     }
     if !out.is_empty() {
         out.push_str("\n\n");
@@ -549,7 +611,8 @@ mod tests {
         ));
         assert!(s.contains("- `approved`: All checks pass."));
         assert!(s.contains("- `rework`: Tests are red."));
-        assert!(s.contains("Reply only with the JSON object."));
+        assert!(s.contains("produce the full artifact"));
+        assert!(s.contains("appear exactly once"));
     }
 
     #[test]
@@ -571,19 +634,42 @@ mod tests {
 
     #[test]
     fn build_state_user_prompt_with_flow_task_state_task_and_menu() {
-        let out =
-            build_state_user_prompt("flow goal here", Some("review the patch"), "MENU GOES HERE");
+        let out = build_state_user_prompt(
+            "flow goal here",
+            Some("review the patch"),
+            None,
+            "MENU GOES HERE",
+        );
         assert!(out.starts_with("flow goal here"));
         assert!(out.contains("Your task: review the patch"));
         assert!(out.ends_with("MENU GOES HERE"));
+        assert!(!out.contains("Context from previous state"));
     }
 
     #[test]
     fn build_state_user_prompt_with_only_flow_and_menu() {
-        let out = build_state_user_prompt("flow goal", None, "MENU");
+        let out = build_state_user_prompt("flow goal", None, None, "MENU");
         assert!(out.starts_with("flow goal"));
         assert!(out.ends_with("MENU"));
         assert!(!out.contains("Your task:"));
+        assert!(!out.contains("Context from previous state"));
+    }
+
+    #[test]
+    fn build_state_user_prompt_includes_prior_state_artifact() {
+        // The next agent must see the previous state's artifact, otherwise
+        // graph runs collapse into a chain of strangers each blind to what
+        // came before.
+        let out = build_state_user_prompt(
+            "flow goal",
+            Some("steer the design"),
+            Some(("design", "the design plan body")),
+            "MENU",
+        );
+        assert!(out.contains("Context from previous state 'design'"));
+        assert!(out.contains("the design plan body"));
+        assert!(out.contains("Build on it"));
+        assert!(out.ends_with("MENU"));
     }
 
     #[test]
