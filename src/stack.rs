@@ -261,6 +261,13 @@ pub struct Manifest {
     pub resources: Vec<ResourceRecord>,
     pub roles: Vec<RoleResolution>,
     pub steps: Vec<StepRecord>,
+    /// Terminal state ID for graph runs (e.g. `"done"`, `"aborted"`).
+    /// `None` for linear flows so audit consumers can tell graph and
+    /// linear runs apart structurally without re-parsing the flow file.
+    /// Populated by the graph driver before the run loop exits; absent
+    /// from runs that aborted via the retry budget or max-steps cap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_state: Option<String>,
 }
 
 /// Compute the SHA-256 of arbitrary bytes, returned as a lowercase hex string.
@@ -764,6 +771,7 @@ mod tests {
                 seed_origin: Some(".kuro".to_string()),
             }],
             steps: vec![record(1, "design", "md")],
+            final_state: None,
         };
         write_manifest(&run_path, &manifest).unwrap();
 
@@ -773,6 +781,53 @@ mod tests {
         assert_eq!(parsed.flow_sha256.len(), 64);
         assert_eq!(parsed.steps.len(), 1);
         assert_eq!(parsed.roles[0].agent, "Sage");
+        // Linear-flow manifests must leave `final_state` absent on disk so
+        // downstream readers can use the field as a structural signal that
+        // a run was a graph run.
+        assert!(parsed.final_state.is_none());
+        assert!(
+            !yaml.contains("final_state"),
+            "final_state must skip-serialise when None, got:\n{yaml}"
+        );
+    }
+
+    #[test]
+    fn manifest_roundtrips_final_state_for_graph_runs() {
+        // Graph runs populate `final_state` with the terminal state ID
+        // (`done`, `aborted`, or whatever `kind: final` state the run
+        // reached). The field must roundtrip through YAML so audit
+        // consumers (`kuro show-output`, MCP `show_output`) can read it
+        // back without parsing stderr.
+        let dir = tempfile::tempdir().unwrap();
+        let run_path = dir.path().join("run");
+        let manifest = Manifest {
+            version: 1,
+            run_id: "graph-20260504-100000".to_string(),
+            flow_name: "implement-issue".to_string(),
+            flow_path: ".kuro/flows/implement-issue.yaml".to_string(),
+            flow_sha256: sha256_hex(b"contents"),
+            started_at: "2026-05-04T10:00:00Z".to_string(),
+            finished_at: "2026-05-04T10:05:00Z".to_string(),
+            duration_ms: 300_000,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+            cost: None,
+            vars: indexmap::IndexMap::new(),
+            seeds: vec![],
+            resources: vec![],
+            roles: vec![],
+            steps: vec![],
+            final_state: Some("done".to_string()),
+        };
+        write_manifest(&run_path, &manifest).unwrap();
+
+        let yaml = std::fs::read_to_string(run_path.join("manifest.yaml")).unwrap();
+        assert!(
+            yaml.contains("final_state: done"),
+            "final_state must serialise when Some, got:\n{yaml}"
+        );
+        let parsed: Manifest = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.final_state.as_deref(), Some("done"));
     }
 
     // --- read_run ---

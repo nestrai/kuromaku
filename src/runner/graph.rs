@@ -92,6 +92,24 @@ fn unknown_edge_retry_note(picked: &str, allowed: &[String]) -> String {
     )
 }
 
+/// Outcome of a successful graph-flow run.
+///
+/// Carries both the per-step results (for the manifest's `steps:` and the
+/// summary table) and the terminal state ID the run ended in. The terminal
+/// state lives on this struct rather than on a `StepRunResult` because the
+/// final state has no step record -- the driver does not run an agent for
+/// `kind: final` states (see the early return in [`run_graph_flow`]).
+///
+/// Audit consumers (`kuro show-output`, the MCP `show_output` tool, log
+/// parsers) want to know which `kind: final` state was reached -- that is
+/// what tells `done` apart from `aborted`. Surfacing it here lets the
+/// caller (`runner::execute_flow`) thread it into the manifest's
+/// `final_state` field per issue #257.
+pub struct GraphRunOutcome {
+    pub steps: Vec<StepRunResult>,
+    pub final_state: String,
+}
+
 /// Drive a graph flow from `initial:` to a `kind: final` state.
 ///
 /// `state_to_agent` maps every non-terminal, non-human state ID to the
@@ -103,7 +121,7 @@ pub async fn run_graph_flow(
     agents_by_id: &HashMap<String, Agent>,
     state_to_agent: &HashMap<String, String>,
     ctx: &RunContext,
-) -> Result<Vec<StepRunResult>, RunError> {
+) -> Result<GraphRunOutcome, RunError> {
     stack::init_run_layout(&ctx.run_path).map_err(|e| RunError::Stack {
         step: "<run-init>".to_string(),
         source: e,
@@ -130,7 +148,13 @@ pub async fn run_graph_flow(
         // toward step_num so a `start -> final` graph runs exactly one step.
         if matches!(state.kind, Some(StateKind::Final)) {
             ui::print_graph_final(&current);
-            return Ok(results);
+            // Hand the terminal state ID back to the caller so it can land
+            // in the run's `manifest.yaml` (issue #257). Audit consumers
+            // pull it from there to tell `done` apart from `aborted`.
+            return Ok(GraphRunOutcome {
+                steps: results,
+                final_state: current,
+            });
         }
 
         // Human-handoff is accepted at the schema level but the prototype
