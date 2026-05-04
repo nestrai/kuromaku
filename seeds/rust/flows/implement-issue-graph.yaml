@@ -6,12 +6,12 @@
 # `implement` or back to `design` depending on what they actually found,
 # instead of the linear PASS/FAIL split.
 #
-# Usage: kuro run implement-issue-graph id=42
+# Usage: kuro run implement-issue-graph --var id=42
 # See docs/graph-flows.md for when to pick `flow:` vs `states:`.
 version: "1"
 name: implement-issue-graph
 prompt: |
-  Implement issue #{{id}} in this repository. Follow the team's rules
+  Implement issue #{{vars.id}} in this repository. Follow the team's rules
   and produce a draft PR at the end.
 
 initial: design
@@ -20,7 +20,7 @@ states:
   design:
     role: architect
     task: |
-      Read issue #{{id}} (`gh issue view {{id}} --comments`). Produce a
+      Read issue #{{vars.id}} (`gh issue view {{vars.id}} --comments`). Produce a
       short design plan: affected files, interfaces, tests. Do not modify
       code.
     edges:
@@ -68,7 +68,7 @@ states:
   create_pr:
     role: developer
     task: |
-      Push the branch and open a draft PR with `Closes #{{id}}`. Output
+      Push the branch and open a draft PR with `Closes #{{vars.id}}`. Output
       the URL.
     edges:
       pr_created:
