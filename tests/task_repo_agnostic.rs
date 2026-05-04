@@ -115,7 +115,11 @@ mod fake_claude {
         (shim, fake_claude, argv_log)
     }
 
-    fn run_kuro_task(project: &Path, fake_claude: &Path, extra_args: &[&str]) -> std::process::Output {
+    fn run_kuro_task(
+        project: &Path,
+        fake_claude: &Path,
+        extra_args: &[&str],
+    ) -> std::process::Output {
         let bin = env!("CARGO_BIN_EXE_kuro");
         let mut cmd = Command::new(bin);
         cmd.args(["task", "--agent", "Test", "-t", "hello"])

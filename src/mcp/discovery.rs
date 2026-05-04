@@ -995,9 +995,7 @@ mod tests {
         // to the regression test.
         let v = do_load_agent(cwd, "Neo", true).unwrap();
         assert!(
-            v["guide"]
-                .as_str()
-                .is_some_and(|s| s.contains("kuromaku")),
+            v["guide"].as_str().is_some_and(|s| s.contains("kuromaku")),
             "include_guide:true must inject the cwd Guide; got: {v}"
         );
     }

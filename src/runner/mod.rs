@@ -5,11 +5,13 @@ use std::time::Instant;
 // Submodules.
 //
 // `decision` is the standalone parser+validator for the JSON object an agent
-// emits at the end of a graph-flow state-step. It is consumed by the graph
-// runtime driver (issue #240). Marked `#[allow(dead_code)]` until the driver
-// lands, to keep the build warning-free in the meantime.
-#[allow(dead_code)]
+// emits at the end of a graph-flow state-step. Consumed by `graph::run_graph_flow`
+// (issue #240).
 pub mod decision;
+// `graph` is the state-machine driver that walks a `Flow::Graph` from
+// `initial:` to a `kind: final` state, asking the assigned agent to pick an
+// outgoing edge per visit (issue #240).
+pub mod graph;
 
 use crate::config::{Agent, Backend, Step};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, OutputFormat};
@@ -168,6 +170,13 @@ pub enum RunError {
         agent: String,
         source: executor::transport::TransportError,
     },
+
+    /// State-graph runtime error (issue #240). Surfaced by the graph driver
+    /// for malformed/unknown-edge double-failures, max_steps overflow, and
+    /// unsupported state kinds in the prototype runtime. The `state` field
+    /// is the offending state ID so the user can locate it in the YAML.
+    #[error("graph runtime error at state '{state}': {reason}")]
+    GraphRuntime { state: String, reason: String },
 }
 
 /// Result of running a single step, used for the summary table and the run
@@ -206,7 +215,7 @@ fn shell_output_filename(step_num: usize, step_id: &str) -> String {
 }
 
 /// Output filename for LLM steps inside a run directory: `NN-<step_id>.md`.
-fn llm_output_filename(step_num: usize, step_id: &str) -> String {
+pub(crate) fn llm_output_filename(step_num: usize, step_id: &str) -> String {
     stack::step_content_filename(step_num, step_id, "md")
 }
 
@@ -1486,7 +1495,7 @@ pub(crate) async fn run_steps_with_state(
     Ok(results)
 }
 
-fn format_duration(d: std::time::Duration) -> String {
+pub(crate) fn format_duration(d: std::time::Duration) -> String {
     let secs = d.as_secs();
     if secs >= 60 {
         format!("{}m{:02}s", secs / 60, secs % 60)
@@ -2381,10 +2390,20 @@ mod flow_api {
                         report.errors.len()
                     ));
                 }
-                return Err(eyre!(
-                    "graph flow '{}' validated, but the state-graph runtime is not implemented yet (only schema and validation are available; tracked in follow-up issues)",
-                    path.display()
-                ));
+                // Hand off to the graph-flow setup. Returns a `RunHandle`
+                // exactly like the linear path so callers (CLI, MCP) await
+                // both flow shapes through the same surface.
+                return execute_graph_flow_setup(
+                    g,
+                    spec,
+                    koto_config.as_ref(),
+                    &seeds,
+                    &effective_vars,
+                    path,
+                    contents,
+                    flow_start,
+                )
+                .await;
             }
             Ok(config::Flow::Linear(_)) => {}
             Err(e) => return Err(e.into()),
@@ -2726,6 +2745,220 @@ mod flow_api {
         } else {
             format!("{}.{:01}s", secs, d.subsec_millis() / 100)
         }
+    }
+
+    /// Set up a graph-flow run and spawn the driver task (issue #240).
+    ///
+    /// The shape mirrors the linear setup in [`execute_flow`]: synchronous
+    /// resolution + agent loading happens here, then a tokio task takes
+    /// over to drive the state machine and write the manifest. Any
+    /// configuration error returned from this function fails the run
+    /// before a `RunHandle` is produced -- consistent with the linear
+    /// path's "fast-fail on bad config" promise.
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_graph_flow_setup(
+        graph: config::GraphFlow,
+        spec: ExecuteFlowSpec,
+        koto_config: Option<&crate::koto_config::KotoConfig>,
+        seeds: &Seeds,
+        cli_vars: &HashMap<String, String>,
+        flow_path: PathBuf,
+        flow_contents: String,
+        flow_start: Instant,
+    ) -> Result<RunHandle> {
+        use crate::config::{Defaults, StateKind, load_agent_file_with_seeds};
+        use std::sync::Arc;
+
+        // ---- Effective vars: project + CLI override --------------------
+        // Mirrors the linear path so `{{vars.X}}` placeholders in the
+        // graph's `prompt:` and per-state `task:` substitute identically.
+        let mut effective_vars = cli_vars.clone();
+        for (k, v) in &spec.vars {
+            effective_vars.insert(k.clone(), v.clone());
+        }
+
+        // ---- Var substitution in graph prompt + per-state tasks --------
+        let mut graph = graph;
+        if let Some(prompt) = graph.prompt.as_mut() {
+            *prompt = super::flow_api::substitute_vars(prompt, &effective_vars)?;
+        }
+        for state in graph.states.values_mut() {
+            if let Some(task) = state.task.as_mut() {
+                *task = super::flow_api::substitute_vars(task, &effective_vars)?;
+            }
+        }
+
+        // ---- Resolve top-level task (CLI -t > graph.prompt) ------------
+        let task_with_vars = spec
+            .task
+            .as_deref()
+            .map(|t| super::flow_api::substitute_vars(t, &effective_vars))
+            .transpose()?;
+        let resolved_task = match (task_with_vars, graph.prompt.clone()) {
+            (Some(t), _) => t,
+            (None, Some(p)) => p,
+            (None, None) => String::new(),
+        };
+
+        // ---- Resolve role -> agent_id for every non-terminal state -----
+        // Final and human states are skipped (no agent runs there). A
+        // non-terminal state with no role:, or a role with no binding,
+        // aborts the setup with a clear error before any agent file is
+        // touched.
+        let project_roles = koto_config.map(|c| &c.roles);
+        let mut state_to_agent: HashMap<String, String> = HashMap::new();
+        for (state_id, state) in &graph.states {
+            match state.kind {
+                Some(StateKind::Final) => continue,
+                Some(StateKind::Human) => continue,
+                None => {}
+            }
+            let role_name = state.role.as_deref().ok_or_else(|| {
+                eyre!(
+                    "graph state '{state_id}' is non-terminal but has no `role:` -- declare a role or mark the state as `kind: final`"
+                )
+            })?;
+            let project_role = project_roles.and_then(|m| m.get(role_name));
+            let agent_id =
+                resolver::resolve_role_agent(role_name, None, project_role, &spec.role_overrides)
+                    .ok_or_else(|| {
+                        eyre!(
+                            "graph state '{state_id}' uses role '{role_name}' but no agent is bound -- set a project-config role or pass --role {role_name}=<agent>"
+                        )
+                    })?;
+            state_to_agent.insert(state_id.clone(), agent_id);
+        }
+
+        // ---- Load each unique agent ------------------------------------
+        // The graph format does not declare `defaults:`, so we use the
+        // crate-wide implicit defaults (claude-sonnet-4-5 / claude-cli)
+        // when the agent file does not pin its own. Project-config tiers
+        // are honoured because `load_agent_file_with_seeds` consults
+        // `koto_config` for tier resolution.
+        let defaults = Defaults {
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let mut agents_by_id: HashMap<String, config::Agent> = HashMap::new();
+        let mut agent_origins: HashMap<String, usize> = HashMap::new();
+        let mut agent_hashes: HashMap<String, String> = HashMap::new();
+        for agent_id in state_to_agent.values() {
+            if agents_by_id.contains_key(agent_id) {
+                continue;
+            }
+            let (agent, origin, sha) =
+                load_agent_file_with_seeds(seeds, agent_id, &defaults, koto_config)?;
+            agent_origins.insert(agent_id.clone(), origin);
+            agent_hashes.insert(agent_id.clone(), sha);
+            agents_by_id.insert(agent_id.clone(), agent);
+        }
+
+        // ---- Guide / rules cache (skills are not declared on graph yet)
+        let agents_vec: Vec<config::Agent> = agents_by_id.values().cloned().collect();
+        let guide = super::load_guide_from_seeds(seeds).map_err(|e| eyre!("{e}"))?;
+        let rules_cache = super::load_rules_for_agents_with_seeds(&agents_vec, seeds)
+            .map_err(|e| eyre!("{e}"))?;
+
+        // ---- RunContext + on-disk run layout ---------------------------
+        // Graph flows do not declare a `stack:` block in v1, so we fall
+        // back to the implicit per-project stack root. Same algorithm the
+        // linear runner uses when its `stack.path` is empty.
+        let stack_path = resolve_stack_path("");
+        let ctx = RunContext::new(
+            graph.name.clone(),
+            resolved_task,
+            stack_path,
+            guide,
+            rules_cache,
+            HashMap::new(),
+            effective_vars.clone(),
+        );
+        stack::init_run_layout(&ctx.run_path)
+            .map_err(|e| eyre!("failed to create run dir: {e}"))?;
+
+        // Run banner so the user sees which graph started running. The
+        // linear path emits a richer banner (counts, agents); for the
+        // graph prototype we keep it minimal until the dedicated UI
+        // hooks land.
+        eprintln!(
+            "graph flow '{}' starting (states: {}, agents: {})",
+            graph.name,
+            graph.states.len(),
+            agents_by_id.len()
+        );
+
+        // ---- Spawn driver task -----------------------------------------
+        let state = Arc::new(RunState::default());
+        let task_state = Arc::clone(&state);
+        let run_id = ctx.run_id.clone();
+        let run_path = ctx.run_path.clone();
+        let stack_path_for_handle = ctx.stack_path.clone();
+        let flow_name_for_handle = graph.name.clone();
+        let flow_name = graph.name.clone();
+        // Clone the seeds list so the spawned task owns its copy --
+        // tokio::spawn requires `'static` futures, and the caller's
+        // borrow does not satisfy that.
+        let seeds_owned = seeds.clone();
+
+        let join: JoinHandle<Result<FlowResult>> = tokio::spawn(async move {
+            // The state arc carries cancellation; honour it before
+            // spawning the first agent so a caller that flipped the flag
+            // between handle creation and task start does not pay for
+            // a wasted state-step.
+            if task_state.is_cancelled() {
+                return Err(eyre!("run cancelled before graph driver started"));
+            }
+            let results =
+                super::graph::run_graph_flow(&graph, &agents_by_id, &state_to_agent, &ctx).await?;
+            let total_elapsed = flow_start.elapsed();
+
+            // Manifest: reuse the linear builder so `kuro show-output`
+            // and `read_run` see the same shape regardless of flow
+            // type. Resolved roles are empty for graph flows in this
+            // prototype -- a richer audit lands with the role/state
+            // resolution pass.
+            let manifest = build_manifest(
+                &ctx,
+                &flow_name,
+                &flow_path,
+                &flow_contents,
+                &seeds_owned,
+                &agents_vec,
+                &agent_origins,
+                &agent_hashes,
+                &[],
+                &effective_vars,
+                &results,
+                total_elapsed,
+            );
+            stack::write_manifest(&ctx.run_path, &manifest)
+                .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
+
+            eprintln!(
+                "graph flow '{flow_name}' done in {} ({} state(s) visited)",
+                format_elapsed(total_elapsed),
+                results.len()
+            );
+
+            Ok(FlowResult {
+                run_id: ctx.run_id.clone(),
+                run_path: ctx.run_path.clone(),
+                stack_path: ctx.stack_path.clone(),
+                flow_name,
+                manifest,
+                step_results: results,
+                total_elapsed,
+            })
+        });
+
+        Ok(RunHandle {
+            run_id,
+            run_path,
+            stack_path: stack_path_for_handle,
+            flow_name: flow_name_for_handle,
+            state,
+            join,
+        })
     }
 
     /// Test-only constructors for the in-tree MCP session module. We do not
