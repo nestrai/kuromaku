@@ -2365,25 +2365,29 @@ mod flow_api {
         //     fail with a graph-aware message *before* any agent spawn.
         // Acceptance criteria #5 from the issue: a dead-end graph must
         // refuse to start before any agent is spawned.
-        if let Ok(config::Flow::Graph(g)) = config::load_flow_any_from_str(&contents) {
-            let report = config::validate_graph_reachability(&g);
-            for warning in &report.warnings {
-                eprintln!("warning: {warning}");
-            }
-            for error in &report.errors {
-                eprintln!("error: {error}");
-            }
-            if !report.is_ok() {
+        match config::load_flow_any_from_str(&contents) {
+            Ok(config::Flow::Graph(g)) => {
+                let report = config::validate_graph_reachability(&g);
+                for warning in &report.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                for error in &report.errors {
+                    eprintln!("error: {error}");
+                }
+                if !report.is_ok() {
+                    return Err(eyre!(
+                        "graph flow '{}' has {} validation error(s); refusing to start",
+                        path.display(),
+                        report.errors.len()
+                    ));
+                }
                 return Err(eyre!(
-                    "graph flow '{}' has {} validation error(s); refusing to start",
-                    path.display(),
-                    report.errors.len()
+                    "graph flow '{}' validated, but the state-graph runtime is not implemented yet (only schema and validation are available; tracked in follow-up issues)",
+                    path.display()
                 ));
             }
-            return Err(eyre!(
-                "graph flow '{}' validated, but the state-graph runtime is not implemented yet (only schema and validation are available; tracked in follow-up issues)",
-                path.display()
-            ));
+            Ok(config::Flow::Linear(_)) => {}
+            Err(e) => return Err(e.into()),
         }
 
         let role_names = config::parse_role_names(&contents)?;
