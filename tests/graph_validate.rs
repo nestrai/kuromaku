@@ -40,6 +40,7 @@ states:
         description: Looks good.
   done:
     kind: final
+    description: Happy-path exit.
 "#;
 
 /// A graph YAML with a real dead-end state: `dead:` has neither
@@ -88,6 +89,7 @@ states:
         description: Done.
   done:
     kind: final
+    description: Happy-path exit.
   orphan:
     role: reviewer
     edges:
@@ -284,6 +286,7 @@ initial: done
 states:
   done:
     kind: final
+    description: Trivial single-state graph for the routing smoke test.
 "#;
 
     let tmp = tempfile::tempdir().unwrap();

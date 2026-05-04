@@ -391,6 +391,14 @@ pub struct GraphFlow {
 /// dead end -- this is caught by [`validate_graph_reachability`] as a
 /// hard error, not at the schema layer, so the dead-end branch is
 /// reachable from real YAML and AC5 can be verified end-to-end.
+///
+/// `description:` is optional and free-form: it carries human intent
+/// for the state ("happy-path exit", "early abort", "design gets
+/// challenged") so a reader does not have to infer meaning from the
+/// state name or trace incoming edges. [`validate_graph_reachability`]
+/// emits a warning (not an error) when a terminal state -- where intent
+/// matters most for audit consumers and operators -- has no description.
+/// A future Mermaid exporter renders the description as the node label.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphState {
@@ -400,6 +408,11 @@ pub struct GraphState {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// Free-form intent for this state. Optional everywhere; a soft
+    /// warning surfaces when a terminal state omits it (see
+    /// [`validate_graph_reachability`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Outgoing transitions, keyed by edge name. Optional because
     /// `kind: final` states do not need any. Order is preserved so the
     /// runtime (when it lands) can present choices to an agent in
@@ -670,12 +683,36 @@ pub fn validate_graph_reachability(g: &GraphFlow) -> GraphValidationReport {
     // dead-end in one validation pass even if some are unreachable too.
     // Iterating in declaration order keeps error output stable for tests
     // and matches the user's mental model of the YAML file.
+    //
+    // The same pass also flags terminal states (`kind: final` or
+    // `kind: human`) without a `description:` as a soft warning. Issue
+    // #260: at the terminal, intent matters most -- audit consumers
+    // (#257 records `final_state:` in the manifest) and human operators
+    // need to read the YAML and tell `done` apart from `aborted`
+    // without guessing from the name. Non-terminal states are not
+    // warned about: descriptions are optional everywhere, but the
+    // payoff is concentrated at the terminals, and warning on every
+    // node would flood existing flows with low-signal noise.
     for (id, state) in &g.states {
         let has_edges = state.edges.as_ref().is_some_and(|e| !e.is_empty());
         let is_terminal = matches!(state.kind, Some(StateKind::Final) | Some(StateKind::Human));
         if !has_edges && !is_terminal {
             report.errors.push(format!(
                 "graph state '{id}' is a dead end: no outgoing edges and not 'kind: final' or 'kind: human'"
+            ));
+        }
+        if is_terminal && state.description.is_none() {
+            report.warnings.push(format!(
+                "graph state '{id}' is terminal ('kind: {}') but has no `description:` -- intent should be visible at the terminal",
+                match state.kind {
+                    Some(StateKind::Final) => "final",
+                    Some(StateKind::Human) => "human",
+                    // Unreachable: `is_terminal` was true, so `kind` is
+                    // one of the two arms above. Fall back to a stable
+                    // string rather than panic if a future variant slips
+                    // in without updating this match.
+                    _ => "?",
+                }
             ));
         }
     }
@@ -3127,6 +3164,7 @@ states:
 
   human_review:
     kind: human
+    description: Operator picks the next move when automation cannot.
     edges:
       resume:
         to: middle
@@ -3137,9 +3175,11 @@ states:
 
   done:
     kind: final
+    description: Happy-path exit -- review approved.
 
   aborted:
     kind: final
+    description: Early exit -- aborted from `start` or `human_review`.
 "#;
 
     #[test]
@@ -3512,15 +3552,33 @@ states:
             kind: None,
             role: Some("developer".to_string()),
             task: None,
+            description: None,
             edges: Some(map),
         }
     }
 
+    /// Helper terminal state with a non-empty description -- the default
+    /// for tests that want a clean (no-warning) terminal. Tests that
+    /// intentionally exercise the missing-description warning use
+    /// [`state_final_no_description`].
     fn state_final() -> GraphState {
         GraphState {
             kind: Some(StateKind::Final),
             role: None,
             task: None,
+            description: Some("Test terminal state.".to_string()),
+            edges: None,
+        }
+    }
+
+    /// Bare terminal state (no description) for tests that want to
+    /// trigger the missing-description warning rule from issue #260.
+    fn state_final_no_description() -> GraphState {
+        GraphState {
+            kind: Some(StateKind::Final),
+            role: None,
+            task: None,
+            description: None,
             edges: None,
         }
     }
@@ -3529,6 +3587,10 @@ states:
         let mut s = state_with_edges(edges);
         s.kind = Some(StateKind::Human);
         s.role = None;
+        // Terminal kinds (`final` and `human`) carry a description by
+        // default in the test helpers so existing "must be clean"
+        // assertions do not trip on the issue #260 warning rule.
+        s.description = Some("Test human-handoff state.".to_string());
         s
     }
 
@@ -3567,6 +3629,7 @@ states:
             kind: None,
             role: Some("developer".to_string()),
             task: None,
+            description: None,
             edges: None, // no kind, no edges -- dead end
         };
         let g = graph(
@@ -3715,6 +3778,7 @@ states:
             kind: None,
             role: Some("developer".to_string()),
             task: None,
+            description: None,
             edges: None,
         };
         let g = graph(
@@ -3759,5 +3823,237 @@ states:
             report.warnings
         );
         assert!(report.warnings[0].contains("'human_review'"));
+    }
+
+    // --- GraphState description schema + validation tests (issue #260) ---
+
+    /// AC1/AC3: `description:` parses as `Option<String>` on every
+    /// state shape (terminal final, terminal human, non-terminal) when
+    /// present. Spot-checks each shape so a regression in the field's
+    /// serde wiring on any one of them is caught.
+    #[test]
+    fn graph_state_description_parses_when_present() {
+        let yaml = r#"
+version: "1"
+name: described
+initial: start
+states:
+  start:
+    role: developer
+    description: Kicks the work off.
+    edges:
+      ok:
+        to: done
+        description: Looks good.
+      handoff:
+        to: ask_human
+        description: Need a person.
+  ask_human:
+    kind: human
+    description: Operator decides what to do next.
+  done:
+    kind: final
+    description: Happy-path exit.
+"#;
+        let g = load_graph_flow_from_str(yaml).expect("must parse");
+        assert_eq!(
+            g.states["start"].description.as_deref(),
+            Some("Kicks the work off.")
+        );
+        assert_eq!(
+            g.states["ask_human"].description.as_deref(),
+            Some("Operator decides what to do next.")
+        );
+        assert_eq!(
+            g.states["done"].description.as_deref(),
+            Some("Happy-path exit.")
+        );
+    }
+
+    /// AC3: omitting `description:` everywhere stays valid -- the field
+    /// is optional, so existing flows from before #260 keep parsing.
+    #[test]
+    fn graph_state_description_optional_everywhere() {
+        let yaml = r#"
+version: "1"
+name: bare
+initial: start
+states:
+  start:
+    role: developer
+    edges:
+      ok:
+        to: done
+        description: Looks good.
+  done:
+    kind: final
+"#;
+        let g = load_graph_flow_from_str(yaml).expect("must parse without description");
+        assert!(g.states["start"].description.is_none());
+        assert!(g.states["done"].description.is_none());
+    }
+
+    /// AC2: `deny_unknown_fields` is retained -- a typoed field name on
+    /// `GraphState` must still fail at parse time, including when other
+    /// `description:` siblings are present. This pins the schema's
+    /// strictness so a future relaxation has to be explicit.
+    #[test]
+    fn graph_state_description_does_not_relax_deny_unknown_fields() {
+        let yaml = r#"
+version: "1"
+name: typo
+initial: start
+states:
+  start:
+    role: developer
+    description: ok
+    descriptionn: oops  # typo: extra n
+    edges:
+      ok:
+        to: done
+        description: ok
+  done:
+    kind: final
+    description: done
+"#;
+        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("descriptionn"),
+            "deny_unknown_fields must still flag the typo: {msg}"
+        );
+    }
+
+    /// AC4: a terminal `kind: final` state with no description produces
+    /// a warning (not an error) naming the state and the kind. The
+    /// flow still validates as ok -- warnings do not block.
+    #[test]
+    fn validate_terminal_final_without_description_warns() {
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("ok", "done")])),
+                ("done", state_final_no_description()),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(
+            report.is_ok(),
+            "missing description must be a warning, not an error; got errors: {:?}",
+            report.errors
+        );
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        let w = &report.warnings[0];
+        assert!(w.contains("'done'"), "warning must name the state: {w}");
+        assert!(
+            w.contains("kind: final"),
+            "warning must name the terminal kind: {w}"
+        );
+        assert!(
+            w.contains("description"),
+            "warning must mention `description`: {w}"
+        );
+    }
+
+    /// AC4: a terminal `kind: human` state with no description also
+    /// warns. The "intent should be visible at the terminal" rule from
+    /// the issue applies to both terminal kinds, not just `final`.
+    #[test]
+    fn validate_terminal_human_without_description_warns() {
+        let mut bare_human = state_final_no_description();
+        bare_human.kind = Some(StateKind::Human);
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("ok", "operator")])),
+                ("operator", bare_human),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
+        assert!(report.warnings[0].contains("'operator'"));
+        assert!(report.warnings[0].contains("kind: human"));
+    }
+
+    /// AC4 (boundary): a non-terminal state with no description does
+    /// NOT warn. The rule is scoped to terminals because that is where
+    /// `done` vs `aborted` confusion bites; warning on every state
+    /// would flood existing flows with low-signal noise.
+    #[test]
+    fn validate_non_terminal_without_description_does_not_warn() {
+        let g = graph(
+            "start",
+            // `start` has no description and is non-terminal.
+            // `done` carries a description so it does not warn either.
+            vec![
+                ("start", state_with_edges(vec![("ok", "done")])),
+                ("done", state_final()),
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert!(
+            report.warnings.is_empty(),
+            "non-terminal states must not warn for missing description; got: {:?}",
+            report.warnings
+        );
+    }
+
+    /// AC4 (positive case): a terminal state WITH a description does
+    /// not warn. Pins the bypass so a future change to the warning
+    /// rule cannot accidentally fire on well-formed YAML.
+    #[test]
+    fn validate_terminal_with_description_does_not_warn() {
+        let g = graph(
+            "start",
+            vec![
+                ("start", state_with_edges(vec![("ok", "done")])),
+                ("done", state_final()), // helper carries a description
+            ],
+        );
+        let report = validate_graph_reachability(&g);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert!(
+            report.warnings.is_empty(),
+            "terminal with description must not warn: {:?}",
+            report.warnings
+        );
+    }
+
+    /// `description:` round-trips through serde: deserialize, serialize,
+    /// re-deserialize, and assert the field survives both directions.
+    /// Mirrors `graph_round_trip_serde` for the new field so an
+    /// accidental `skip_serializing` cannot silently drop user content.
+    #[test]
+    fn graph_state_description_round_trips_via_serde() {
+        let yaml = r#"
+version: "1"
+name: rt
+initial: start
+states:
+  start:
+    role: developer
+    description: Kicks off.
+    edges:
+      ok:
+        to: done
+        description: Done.
+  done:
+    kind: final
+    description: All good.
+"#;
+        let parsed = load_graph_flow_from_str(yaml).unwrap();
+        let serialized = serde_yaml::to_string(&parsed).expect("serialize");
+        let reparsed = load_graph_flow_from_str(&serialized).expect("re-parse");
+        assert_eq!(parsed, reparsed);
+        assert_eq!(
+            reparsed.states["start"].description.as_deref(),
+            Some("Kicks off.")
+        );
+        assert_eq!(
+            reparsed.states["done"].description.as_deref(),
+            Some("All good.")
+        );
     }
 }

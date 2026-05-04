@@ -80,6 +80,8 @@ states:
 
   done:
     kind: final
+    description: Happy-path exit -- implementation reviewed and a draft PR is open.
 
   aborted:
     kind: final
+    description: Early exit because a step could not proceed safely (missing context, design flaw it cannot resolve, PR push failed).

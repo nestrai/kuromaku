@@ -49,9 +49,30 @@ states:
       implementation_complete: { to: review,  description: ... }
       design_problem:          { to: design,  description: ... }
       blocked:                 { to: aborted, description: ... }
-  done:    { kind: final }
-  aborted: { kind: final }
+  done:
+    kind: final
+    description: Happy-path exit -- implementation reviewed and PR opened.
+  aborted:
+    kind: final
+    description: Early exit because a step could not proceed safely.
 ```
+
+### `description:` on states
+
+States accept an optional `description:` field. It is free-form text
+that documents *intent* -- what the state means in the flow, not what
+the agent should do (that is `task:`).
+
+`description:` is optional everywhere, but `kuro validate` warns when a
+terminal state (`kind: final` or `kind: human`) omits it. Audit
+consumers (#257 records the resolved `final_state:` in the manifest)
+and human operators have to tell `done` apart from `aborted` without
+guessing from the name -- the warning nudges flow authors to make that
+intent visible. Non-terminal states do not warn; descriptions there
+are still encouraged for graphs that grow past five or six nodes, but
+the validator stays quiet to avoid flooding existing flows.
+
+A future Mermaid exporter renders the description as the node label.
 
 A graph flow is a state machine. The runtime starts at `initial:`,
 shows the agent the outgoing edges of the current state, and the agent
