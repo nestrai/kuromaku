@@ -194,18 +194,12 @@ esac
         std::fs::read_to_string(&log).unwrap_or_default()
     );
 
-    // The driver's terminal log line names the final state -- the
-    // strongest signal that the graph walked all the way through.
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("reached final state 'done'"),
-        "expected driver to reach final state 'done', got stderr:\n{stderr}"
-    );
-
     // Manifest must have been written and reference all four agent-bearing
     // states in declaration order. Final states (`done`, `aborted`) are not
-    // expected to appear because the driver does not persist a step record
-    // for them.
+    // expected to appear in `steps:` because the driver does not persist a
+    // step record for them; instead, the terminal state lands in the
+    // top-level `final_state:` field (issue #257) so audit consumers can
+    // tell `done` apart from `aborted` without grepping stderr.
     let manifest = read_manifest(home.path(), &project_name);
     for state in ["design", "implement", "review", "create_pr"] {
         assert!(
@@ -213,6 +207,10 @@ esac
             "manifest must reference state '{state}', got:\n{manifest}"
         );
     }
+    assert!(
+        manifest.contains("final_state: done"),
+        "happy path must record `final_state: done` in the manifest, got:\n{manifest}"
+    );
 }
 
 #[test]
@@ -222,6 +220,12 @@ fn blocked_at_design_lands_at_aborted() {
     // (design -> aborted) so we know the second terminal kind also
     // works end-to-end.
     let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
     let flow = seed_flow_path();
 
     let (_shim_dir, shim, log) = install_shim(
@@ -248,9 +252,13 @@ esac
         std::fs::read_to_string(&log).unwrap_or_default()
     );
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The blocked path lands at the second terminal kind (`aborted`); the
+    // manifest's `final_state:` field is the structural signal -- audit
+    // consumers (#257) read it to tell the two terminal kinds apart
+    // without parsing stderr.
+    let manifest = read_manifest(home.path(), &project_name);
     assert!(
-        stderr.contains("reached final state 'aborted'"),
-        "expected driver to reach final state 'aborted', got stderr:\n{stderr}"
+        manifest.contains("final_state: aborted"),
+        "blocked path must record `final_state: aborted` in the manifest, got:\n{manifest}"
     );
 }

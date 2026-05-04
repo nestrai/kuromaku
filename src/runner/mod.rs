@@ -2214,6 +2214,7 @@ mod flow_api {
         vars: &HashMap<String, String>,
         results: &[StepRunResult],
         total_elapsed: Duration,
+        final_state: Option<&str>,
     ) -> Manifest {
         let finished_at = chrono::Utc::now();
 
@@ -2335,6 +2336,7 @@ mod flow_api {
             resources,
             roles: role_records,
             steps: results.iter().map(|r| r.record.clone()).collect(),
+            final_state: final_state.map(str::to_string),
         }
     }
 
@@ -2728,6 +2730,10 @@ mod flow_api {
             &effective_vars,
             &results,
             total_elapsed,
+            // Linear flows have no terminal state ID -- per issue #257 the
+            // field stays absent so audit consumers can distinguish linear
+            // and graph runs structurally.
+            None,
         );
         stack::write_manifest(&ctx.run_path, &manifest)
             .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
@@ -2928,15 +2934,21 @@ mod flow_api {
             if task_state.is_cancelled() {
                 return Err(eyre!("run cancelled before graph driver started"));
             }
-            let results =
+            let outcome =
                 super::graph::run_graph_flow(&graph, &agents_by_id, &state_to_agent, &ctx).await?;
             let total_elapsed = flow_start.elapsed();
+            let super::graph::GraphRunOutcome {
+                steps: results,
+                final_state,
+            } = outcome;
 
             // Manifest: reuse the linear builder so `kuro show-output`
             // and `read_run` see the same shape regardless of flow
             // type. Resolved roles are empty for graph flows in this
             // prototype -- a richer audit lands with the role/state
-            // resolution pass.
+            // resolution pass. `final_state` is populated for graph
+            // runs so audit consumers can tell terminal states (`done`
+            // vs `aborted`) apart without parsing stderr (issue #257).
             let manifest = build_manifest(
                 &ctx,
                 &flow_name,
@@ -2950,6 +2962,7 @@ mod flow_api {
                 &effective_vars,
                 &results,
                 total_elapsed,
+                Some(final_state.as_str()),
             );
             stack::write_manifest(&ctx.run_path, &manifest)
                 .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
