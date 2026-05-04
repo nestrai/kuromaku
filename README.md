@@ -97,6 +97,28 @@ kuromaku takes a fundamentally different approach from Python-based agent framew
 
 **Backend-agnostic.** Run your architect on Claude API for complex reasoning, your developer on a local Ollama model for speed, your reviewer on Claude CLI for tool access -- all in the same flow. The orchestration layer does not care which LLM serves the response.
 
+## Privacy
+
+kuromaku stores every run on your local machine -- nothing leaves the host unless you wire it up yourself. Run artifacts (prompts, agent responses, manifests, audit logs) live under:
+
+```
+~/.koto/stacks/<project>/<run-id>/
+```
+
+`<project>` defaults to the current directory's name; `<run-id>` is the timestamped flow run.
+
+**Inspect.** Browse the directory with the file manager of your choice. Each run dir contains a `manifest.yaml` that pins what was used (flow, rules, skills, agents) plus a `steps/` subdirectory with one Markdown file per step.
+
+**Erase.** Delete a single project's stack data with:
+
+```
+kuro stack purge <project>           # asks for confirmation
+kuro stack purge <project> --dry-run # preview only, no deletion
+kuro stack purge <project> --yes     # skip the prompt (scripted use)
+```
+
+This is the GDPR Art. 17 mechanism for kuromaku: when you receive an erasure request for a data subject whose data is contained in a project's stack, `kuro stack purge` removes that project's directory atomically. Erasure is hard-delete; the deletion itself is not recorded by kuromaku (see `docs/decisions/0007-stack-purge.md` for the rationale and how to add a controller-side audit trail if your obligations require one).
+
 ## Build
 
 ```bash

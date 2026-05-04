@@ -22,6 +22,20 @@ pub enum StackError {
 
     #[error("step '{0}' not found in run directory")]
     StepNotFound(String),
+
+    #[error(
+        "invalid project name '{0}': must be a single path segment (no '/', no '..', no leading '.')"
+    )]
+    InvalidProjectName(String),
+
+    #[error("project '{0}' has no stack data at {1}")]
+    ProjectNotFound(String, PathBuf),
+
+    #[error("refusing to operate on '{0}': resolved path escapes stack root {1}")]
+    PathOutsideStackRoot(PathBuf, PathBuf),
+
+    #[error("failed to remove stack directory {0}: {1}")]
+    Remove(PathBuf, std::io::Error),
 }
 
 // --- Legacy flat-file layout (kept for backward compat with pre-#31 stacks).
@@ -532,6 +546,167 @@ pub fn write_resolution_audit(run_path: &Path, text: &str) -> Result<(), StackEr
     std::fs::write(run_path.join("resolution-audit.txt"), text).map_err(StackError::Write)
 }
 
+// --- Per-project purge (issue #232).
+//
+// `kuro stack purge <project>` removes a single project's stack directory in
+// one shot. The library entry points (`plan_purge`, `purge_project`) own
+// validation and the symlink-escape check so non-CLI callers (a future MCP
+// tool, scripted use) inherit the same safety net. The CLI layer is
+// intentionally not the only line of defence.
+
+/// Default stack root: `~/.koto/stacks/`. The `.koto/` home root is pinned by
+/// the comment trail in #176 -- a rename here orphans every existing user's
+/// run history. Falls back to `./stacks` when `dirs::home_dir()` cannot
+/// resolve a home (CI containers without `HOME`), mirroring the same fallback
+/// `runner::resolve_stack_path` already used.
+pub fn stack_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".koto")
+        .join("stacks")
+}
+
+/// What was (or would be) removed by a purge call. Numbers are computed via
+/// a single recursive walk over the project directory, using
+/// `symlink_metadata` so a stray symlink inside the directory does not get
+/// followed across filesystems.
+#[derive(Debug, Clone)]
+pub struct PurgeReport {
+    pub project: String,
+    /// Canonicalised project path. Already verified to live under the stack
+    /// root before this struct is built -- callers can print it without
+    /// re-checking.
+    pub path: PathBuf,
+    pub run_count: usize,
+    pub file_count: u64,
+    pub byte_size: u64,
+    /// `false` for `plan_purge` (preview), `true` for `purge_project` after
+    /// the directory has been removed. Part of the public API so callers
+    /// who pass a report through more than one layer can tell preview from
+    /// post-delete; the binary itself does not branch on it (each call site
+    /// already knows which entry point it used), hence the `allow`.
+    #[allow(dead_code)]
+    pub deleted: bool,
+}
+
+/// Reject project names that would let a caller climb out of the stack root
+/// or target a hidden directory. The rules match the design plan:
+///
+/// * empty / `.` / `..` / leading `.`: out
+/// * any path separator (`/`, `\`) or NUL: out
+///
+/// The on-disk symlink-escape check happens later in `resolve_project_path`;
+/// this function is the cheap string-shape gate that surfaces a clear error
+/// before any filesystem call.
+fn validate_project_name(name: &str) -> Result<(), StackError> {
+    let bad = name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.starts_with('.')
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0');
+    if bad {
+        return Err(StackError::InvalidProjectName(name.to_string()));
+    }
+    Ok(())
+}
+
+/// Resolve `<root>/<project>` for purge, with the full safety chain:
+///
+/// 1. `validate_project_name` -- string-shape gate.
+/// 2. Existence check -- `ProjectNotFound` if the candidate path is missing
+///    (we do not also error when the root itself is missing; the project
+///    just has no stack data, same outcome).
+/// 3. Canonicalise both root and project, then verify the canonical project
+///    path starts with the canonical root. This catches the case where a
+///    well-formed name resolves to a symlink pointing outside the root.
+fn resolve_project_path(root: &Path, project: &str) -> Result<PathBuf, StackError> {
+    validate_project_name(project)?;
+    let candidate = root.join(project);
+    if !candidate.exists() {
+        return Err(StackError::ProjectNotFound(project.to_string(), candidate));
+    }
+    // Canonicalise the root only when it exists. If the root is missing we
+    // already returned `ProjectNotFound` above (the candidate cannot exist
+    // without the root existing).
+    let canonical_root = root.canonicalize().map_err(StackError::Read)?;
+    let canonical_project = candidate.canonicalize().map_err(StackError::Read)?;
+    if !canonical_project.starts_with(&canonical_root) {
+        return Err(StackError::PathOutsideStackRoot(
+            canonical_project,
+            canonical_root,
+        ));
+    }
+    Ok(canonical_project)
+}
+
+/// Walk the project directory once and collect (run_count, file_count,
+/// byte_size). Run count is the number of direct subdirectories (each run
+/// lives in its own dir under `<project>/`). File count and byte size are
+/// totals across the whole tree, using `symlink_metadata` so the walk does
+/// not follow symlinks.
+fn inspect_directory(path: &Path) -> Result<(usize, u64, u64), StackError> {
+    let mut runs = 0usize;
+    let mut files = 0u64;
+    let mut bytes = 0u64;
+    for entry in std::fs::read_dir(path).map_err(StackError::Read)? {
+        let entry = entry.map_err(StackError::Read)?;
+        let meta = entry.metadata().map_err(StackError::Read)?;
+        if meta.is_dir() {
+            runs += 1;
+        }
+    }
+    walk_files(path, &mut files, &mut bytes)?;
+    Ok((runs, files, bytes))
+}
+
+fn walk_files(path: &Path, files: &mut u64, bytes: &mut u64) -> Result<(), StackError> {
+    for entry in std::fs::read_dir(path).map_err(StackError::Read)? {
+        let entry = entry.map_err(StackError::Read)?;
+        // `symlink_metadata` so a symlink under the project dir is counted
+        // as a single entry rather than being followed into another tree.
+        let meta = entry.path().symlink_metadata().map_err(StackError::Read)?;
+        if meta.is_dir() {
+            walk_files(&entry.path(), files, bytes)?;
+        } else if meta.is_file() {
+            *files += 1;
+            *bytes += meta.len();
+        }
+    }
+    Ok(())
+}
+
+/// Preview a purge: returns the report without touching disk. Errors map
+/// 1:1 to `purge_project` so the CLI can run the same validation chain in
+/// dry-run mode and surface the same diagnostics.
+pub fn plan_purge(root: &Path, project: &str) -> Result<PurgeReport, StackError> {
+    let path = resolve_project_path(root, project)?;
+    let (run_count, file_count, byte_size) = inspect_directory(&path)?;
+    Ok(PurgeReport {
+        project: project.to_string(),
+        path,
+        run_count,
+        file_count,
+        byte_size,
+        deleted: false,
+    })
+}
+
+/// Permanently delete the project's stack directory. Re-runs the full
+/// validation chain (string shape + canonical containment) before removing
+/// anything, so a caller that splits "plan" and "purge" across an
+/// interactive prompt cannot be fooled by a directory swap in between.
+pub fn purge_project(root: &Path, project: &str) -> Result<PurgeReport, StackError> {
+    let report = plan_purge(root, project)?;
+    std::fs::remove_dir_all(&report.path)
+        .map_err(|e| StackError::Remove(report.path.clone(), e))?;
+    Ok(PurgeReport {
+        deleted: true,
+        ..report
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -976,5 +1151,138 @@ mod tests {
         write_resolution_audit(&run_path, "[resolve] seeds: .kuro\n").unwrap();
         let txt = std::fs::read_to_string(run_path.join("resolution-audit.txt")).unwrap();
         assert!(txt.starts_with("[resolve] seeds:"));
+    }
+
+    // --- per-project purge (issue #232) ---
+
+    /// Build a fake stack-root tempdir holding `<project>/<run>/...` with
+    /// two run dirs and one content file each. The shape mimics what the
+    /// runner actually writes (`steps/` subdir + a content file).
+    fn fake_project_stack(project: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let project_dir = dir.path().join(project);
+        for run in ["dev-20260501-100000", "dev-20260501-100100"] {
+            let steps_dir = project_dir.join(run).join("steps");
+            std::fs::create_dir_all(&steps_dir).unwrap();
+            std::fs::write(steps_dir.join("01-design.md"), "BODY-A").unwrap();
+        }
+        (dir, project_dir)
+    }
+
+    #[test]
+    fn plan_purge_reports_existing_runs_and_does_not_delete() {
+        let (dir, project_dir) = fake_project_stack("ikno");
+
+        let report = plan_purge(dir.path(), "ikno").unwrap();
+
+        // Two run dirs, two content files (one per run), 6 bytes each
+        // ("BODY-A" = 6 bytes), 12 bytes total.
+        assert_eq!(report.project, "ikno");
+        assert_eq!(report.run_count, 2);
+        assert_eq!(report.file_count, 2);
+        assert_eq!(report.byte_size, 12);
+        assert!(!report.deleted);
+        // Plan must not delete -- the directory still has to be there.
+        assert!(project_dir.exists());
+    }
+
+    #[test]
+    fn purge_project_removes_directory_and_marks_deleted() {
+        let (dir, project_dir) = fake_project_stack("ikno");
+        let report = purge_project(dir.path(), "ikno").unwrap();
+        assert!(report.deleted);
+        assert_eq!(report.run_count, 2);
+        assert!(!project_dir.exists(), "project dir must be gone");
+    }
+
+    #[test]
+    fn purge_project_idempotent_returns_not_found() {
+        // Erasure semantics: a second call after the directory is gone is
+        // not a system error, it is "no such project". Callers that script
+        // erasure across multiple projects rely on this to keep going.
+        let (dir, _) = fake_project_stack("ikno");
+        purge_project(dir.path(), "ikno").unwrap();
+        let err = purge_project(dir.path(), "ikno").unwrap_err();
+        assert!(
+            matches!(err, StackError::ProjectNotFound(_, _)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn purge_rejects_path_traversal_and_hidden_names() {
+        // String-shape gate runs before any filesystem work, so we can
+        // pass a non-existent root and still see the validation error.
+        let dir = tempfile::tempdir().unwrap();
+        for bad in &["..", ".", "", ".hidden", "foo/bar", "a\\b", "with\0nul"] {
+            let err = plan_purge(dir.path(), bad).unwrap_err();
+            assert!(
+                matches!(err, StackError::InvalidProjectName(_)),
+                "expected InvalidProjectName for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn purge_unknown_project_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = plan_purge(dir.path(), "ghost").unwrap_err();
+        assert!(
+            matches!(err, StackError::ProjectNotFound(_, _)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn purge_handles_missing_root_as_not_found() {
+        // No stacks dir at all (fresh user). The candidate path does not
+        // exist, so the existence check fires first -- we never reach the
+        // canonicalize call that would otherwise error on a missing root.
+        let dir = tempfile::tempdir().unwrap();
+        let missing_root = dir.path().join("never-created");
+        let err = plan_purge(&missing_root, "ikno").unwrap_err();
+        assert!(
+            matches!(err, StackError::ProjectNotFound(_, _)),
+            "got {err:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_rejects_symlink_escape() {
+        // The string-shape gate accepts the name (it's a single segment),
+        // but the on-disk entry is a symlink that targets a directory
+        // outside the stack root. The canonical-containment check must
+        // refuse to delete it.
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // Populate the outside directory so canonicalize succeeds.
+        std::fs::write(outside.path().join("file"), "secret").unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+
+        let err = plan_purge(root.path(), "escape").unwrap_err();
+        assert!(
+            matches!(err, StackError::PathOutsideStackRoot(_, _)),
+            "got {err:?}"
+        );
+
+        // The outside directory must remain intact.
+        assert!(outside.path().join("file").is_file());
+    }
+
+    #[test]
+    fn stack_root_uses_dotkoto_under_home() {
+        // Audit lock: the `.koto/stacks/` location is pinned by #176, and
+        // a refactor that drops the constant would silently relocate
+        // every existing user's run history. This test fails loudly the
+        // moment the path changes.
+        let root = stack_root();
+        assert!(
+            root.ends_with(".koto/stacks") || root.ends_with(".koto\\stacks"),
+            "stack_root must end with .koto/stacks, got {}",
+            root.display()
+        );
     }
 }
