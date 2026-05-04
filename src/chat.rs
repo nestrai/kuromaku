@@ -37,7 +37,11 @@ fn ensure_chat_supported(backend: Backend) -> Result<()> {
 /// Entry point for `kuro chat --agent <name>`. Resolves the agent the same
 /// way `kuro task` does, builds the system prompt, prints a one-line
 /// preamble to stderr, and hands the terminal over to the upstream CLI.
-pub async fn run_chat(agent_name: &str) -> Result<()> {
+///
+/// `include_project_context` mirrors the `kuro task` flag of the same name:
+/// off by default so seed agents do not inherit cwd project identity (#245),
+/// on when the chat session is meant to be project-aware.
+pub async fn run_chat(agent_name: &str, include_project_context: bool) -> Result<()> {
     let koto_dir = Path::new(KOTO_DIR);
 
     // Same resolution path as `kuro task`: project config is optional, falls
@@ -70,8 +74,10 @@ pub async fn run_chat(agent_name: &str) -> Result<()> {
     // identical in shape. The runner already builds the cascade
     // (Guide > Rules > Skills > Role); reusing it keeps the conversation
     // continuous between `kuro task <agent> -t "..."` and `kuro chat
-    // --agent <agent>`.
-    let guide = runner::load_guide_from_seeds(&seeds).map_err(|e| eyre!("{e}"))?;
+    // --agent <agent>`. Guide injection is gated on the same
+    // `--include-project-context` flag as `kuro task` (issue #245).
+    let guide =
+        runner::load_guide_for_task(&seeds, include_project_context).map_err(|e| eyre!("{e}"))?;
     let agents_slice = std::slice::from_ref(&agent);
     let rules_cache =
         runner::load_rules_for_agents_with_seeds(agents_slice, &seeds).map_err(|e| eyre!("{e}"))?;
