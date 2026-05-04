@@ -134,6 +134,13 @@ pub struct RawFlowConfig {
     pub version: Version,
     pub name: String,
     pub prompt: Option<String>,
+    /// Sibling-file source for `prompt:` (issue #258). When set, the
+    /// path-aware loader reads the file relative to the flow YAML's
+    /// directory and folds the contents into [`RawFlowConfig::prompt`].
+    /// Mutually exclusive with `prompt:`. After
+    /// [`resolve_raw_external_prompts`] runs this is always `None`.
+    #[serde(default)]
+    pub prompt_file: Option<String>,
     #[serde(default)]
     pub defaults: Option<RawDefaults>,
     #[serde(default)]
@@ -167,6 +174,13 @@ pub struct RawStep {
     pub agent: Option<String>,
     pub role: Option<String>,
     pub task: Option<String>,
+    /// Sibling-file source for `task:` (issue #258). When set, the
+    /// path-aware loader reads the file relative to the flow YAML's
+    /// directory and folds the contents into [`RawStep::task`].
+    /// Mutually exclusive with `task:`. After
+    /// [`resolve_raw_external_prompts`] runs this is always `None`.
+    #[serde(default)]
+    pub task_file: Option<String>,
     /// Shell command to execute via `sh -c` instead of calling an LLM. When
     /// set, the step is a shell step: `agent`, `role`, `task`, `model`, and
     /// `backend` must not be set. stdout is captured as the step output.
@@ -373,6 +387,15 @@ pub struct GraphFlow {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Sibling-file source for `prompt:` (issue #258). The path-aware
+    /// loader resolves the file relative to the flow YAML's directory
+    /// and folds the contents into [`GraphFlow::prompt`]. Mutually
+    /// exclusive with `prompt:`. After
+    /// [`resolve_graph_external_prompts`] runs this is always `None`,
+    /// so the runtime never has to branch on which way the prompt was
+    /// authored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_file: Option<String>,
     /// State ID where the graph starts. Must reference a key in
     /// [`GraphFlow::states`]; the structural check fires in
     /// [`validate_graph_flow`].
@@ -408,6 +431,13 @@ pub struct GraphState {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
+    /// Sibling-file source for `task:` (issue #258). The path-aware
+    /// loader resolves the file relative to the flow YAML's directory
+    /// and folds the contents into [`GraphState::task`]. Mutually
+    /// exclusive with `task:`. After
+    /// [`resolve_graph_external_prompts`] runs this is always `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_file: Option<String>,
     /// Free-form intent for this state. Optional everywhere; a soft
     /// warning surfaces when a terminal state omits it (see
     /// [`validate_graph_reachability`]).
@@ -546,6 +576,286 @@ pub fn load_graph_flow_from_str(contents: &str) -> Result<GraphFlow, ConfigError
     let raw: GraphFlow = serde_yaml::from_str(contents)?;
     validate_graph_flow(&raw)?;
     Ok(raw)
+}
+
+// --- External-prompt resolution (issue #258) ---
+
+/// Read a sibling prompt file and fold it into `value`.
+///
+/// `value` and `file_field` are the inline (`task:` / `prompt:`) and
+/// external-file (`task_file:` / `prompt_file:`) fields of the same
+/// element. After this returns `Ok`, `file_field` is always `None` and
+/// `value` is `Some(_)` whenever the YAML had either field.
+///
+/// Returns `ConfigError::Validation` when both fields are set, when the
+/// path escapes `base_dir` (absolute, contains a `..` component, or
+/// canonicalizes outside the base), or when the file is missing.
+/// Other I/O errors (permissions, unreadable bytes) are surfaced as
+/// `ConfigError::Io` with a message that names the locator and field.
+///
+/// `locator` and `field` are used to build human-readable error
+/// messages (e.g. `"flow '<path>' state 'design': task_file '<rel>' ..."`).
+fn resolve_prompt_field(
+    value: &mut Option<String>,
+    file_field: &mut Option<String>,
+    base_dir: &Path,
+    locator: &str,
+    field: &str,
+) -> Result<(), ConfigError> {
+    let file_field_name = format!("{field}_file");
+    let Some(rel) = file_field.take() else {
+        // No external file -- nothing to resolve. Inline `value` (if
+        // any) stays as-is.
+        return Ok(());
+    };
+
+    if value.is_some() {
+        return Err(ConfigError::Validation(format!(
+            "{locator}: both '{field}' and '{file_field_name}' set -- pick one"
+        )));
+    }
+
+    // Component-level traversal guard. Runs before any I/O so the `..`
+    // case is rejected deterministically even when the file does not
+    // exist on disk.
+    let rel_path = Path::new(&rel);
+    for component in rel_path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                return Err(ConfigError::Validation(format!(
+                    "{locator}: {file_field_name} '{rel}' escapes the flow directory ('..' is not allowed)"
+                )));
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err(ConfigError::Validation(format!(
+                    "{locator}: {file_field_name} '{rel}' must be a relative path under the flow directory"
+                )));
+            }
+            _ => {}
+        }
+    }
+
+    let joined = base_dir.join(rel_path);
+
+    // Read with a hand-rolled error path so missing files become a
+    // Validation error (with the flow locator and the relative path
+    // the user wrote) instead of a bare std::io::Error string. Other
+    // I/O errors keep the original kind via ConfigError::Io.
+    let contents = match std::fs::read_to_string(&joined) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(ConfigError::Validation(format!(
+                "{locator}: {file_field_name} '{rel}' not found (looked in '{}')",
+                joined.display()
+            )));
+        }
+        Err(e) => {
+            return Err(ConfigError::Io(std::io::Error::new(
+                e.kind(),
+                format!("{locator}: failed to read {file_field_name} '{rel}': {e}"),
+            )));
+        }
+    };
+
+    // Belt-and-suspenders symlink-escape check. The component walk
+    // above rejects literal `..`, but a symlink inside `base_dir`
+    // could still point outside. Both sides are canonicalized so we
+    // compare resolved forms; if either canonicalize call fails the
+    // check is skipped (e.g. base_dir lives in a tempdir on a
+    // platform without canonicalize support) -- the read already
+    // succeeded, so the file exists, and the component check guards
+    // the literal-traversal case.
+    if let (Ok(canon_base), Ok(canon_target)) = (base_dir.canonicalize(), joined.canonicalize())
+        && !canon_target.starts_with(&canon_base)
+    {
+        return Err(ConfigError::Validation(format!(
+            "{locator}: {file_field_name} '{rel}' resolves to '{}' which is outside the flow directory '{}'",
+            canon_target.display(),
+            canon_base.display()
+        )));
+    }
+
+    *value = Some(contents);
+    Ok(())
+}
+
+/// Fold every `prompt_file` / `task_file` on a [`RawFlowConfig`] into
+/// the matching inline field, reading siblings of `base_dir` (issue
+/// #258).
+///
+/// Runs after `serde_yaml::from_str` and before [`validate_and_resolve`]
+/// so the rest of the resolver sees a flow indistinguishable from one
+/// that was authored entirely inline. Variable substitution is **not**
+/// applied here -- it stays in `runner::flow_api::substitute_vars`,
+/// which already runs over `prompt:` / `task:` after parse, so external
+/// content gets the same `{{vars.X}}` treatment automatically.
+///
+/// `flow_path_display` is used in error messages so the user can jump
+/// straight to the offending YAML when a file is missing or escapes
+/// the flow directory.
+pub fn resolve_raw_external_prompts(
+    raw: &mut RawFlowConfig,
+    base_dir: &Path,
+    flow_path_display: &str,
+) -> Result<(), ConfigError> {
+    resolve_prompt_field(
+        &mut raw.prompt,
+        &mut raw.prompt_file,
+        base_dir,
+        &format!("flow '{flow_path_display}'"),
+        "prompt",
+    )?;
+    for (id, step) in raw.flow.iter_mut() {
+        resolve_prompt_field(
+            &mut step.task,
+            &mut step.task_file,
+            base_dir,
+            &format!("flow '{flow_path_display}' step '{id}'"),
+            "task",
+        )?;
+    }
+    Ok(())
+}
+
+/// Fold every `prompt_file` / `task_file` on a [`GraphFlow`] into the
+/// matching inline field (issue #258). Same contract as
+/// [`resolve_raw_external_prompts`]. Operating on the resolved
+/// [`GraphFlow`] is safe because the graph format does not have a
+/// raw/resolved split -- the on-disk schema is the runtime shape.
+///
+/// After this returns `Ok`, `prompt_file` and every state's
+/// `task_file` are guaranteed `None`, so the runtime never has to
+/// branch on which way the prompt was authored.
+pub fn resolve_graph_external_prompts(
+    graph: &mut GraphFlow,
+    base_dir: &Path,
+    flow_path_display: &str,
+) -> Result<(), ConfigError> {
+    resolve_prompt_field(
+        &mut graph.prompt,
+        &mut graph.prompt_file,
+        base_dir,
+        &format!("flow '{flow_path_display}'"),
+        "prompt",
+    )?;
+    for (id, state) in graph.states.iter_mut() {
+        resolve_prompt_field(
+            &mut state.task,
+            &mut state.task_file,
+            base_dir,
+            &format!("flow '{flow_path_display}' state '{id}'"),
+            "task",
+        )?;
+    }
+    Ok(())
+}
+
+/// Helper: pick the directory that contains `path`, falling back to
+/// `"."` when `path` has no parent (e.g. a bare `flow.yaml` in the
+/// current directory). Used by the path-aware loaders to feed the
+/// external-prompt resolver.
+///
+/// Exposed as `flow_base_dir_for` so callers like the runner -- which
+/// already has the flow YAML in memory but still wants to resolve
+/// sibling prompt files -- can compute the same base directory the
+/// path-aware loaders use.
+pub fn flow_base_dir_for(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+/// Path-aware variant of [`load_flow_from_str`] (issue #258).
+///
+/// Reads `path`, parses the linear flow, resolves any
+/// `prompt_file:` / `task_file:` references against the flow's
+/// directory, then validates and returns the resolved
+/// [`FlowConfig`]. Existing string-based loaders keep working for
+/// schema-layer unit tests; only callers that need to honour
+/// external prompt files have to switch.
+#[allow(dead_code)]
+pub fn load_flow_from_path(path: &Path) -> Result<FlowConfig, ConfigError> {
+    load_flow_from_path_with_project(path, &HashMap::new(), &HashMap::new())
+}
+
+/// Path-aware variant of [`load_flow_from_str_with_project`] (issue
+/// #258). Same semantics as [`load_flow_from_path`] but accepts the
+/// CLI role overrides and project-level role bindings used by the
+/// runner.
+pub fn load_flow_from_path_with_project(
+    path: &Path,
+    role_overrides: &HashMap<String, String>,
+    project_roles: &HashMap<String, String>,
+) -> Result<FlowConfig, ConfigError> {
+    let contents = std::fs::read_to_string(path)?;
+    load_flow_from_str_with_project_at(
+        &contents,
+        flow_base_dir_for(path),
+        &path.display().to_string(),
+        role_overrides,
+        project_roles,
+    )
+}
+
+/// String-based loader that still resolves external-prompt files
+/// against `base_dir` (issue #258). Used by the runner, which already
+/// has the flow YAML in memory for the manifest hash and would
+/// otherwise read the file twice.
+pub fn load_flow_from_str_with_project_at(
+    contents: &str,
+    base_dir: &Path,
+    flow_path_display: &str,
+    role_overrides: &HashMap<String, String>,
+    project_roles: &HashMap<String, String>,
+) -> Result<FlowConfig, ConfigError> {
+    let mut raw: RawFlowConfig = serde_yaml::from_str(contents)?;
+    warn_unknown_fields("top-level", &raw.unknown);
+    if let Some(ref defaults) = raw.defaults {
+        warn_unknown_fields("defaults", &defaults.unknown);
+    }
+    for (id, step) in &raw.flow {
+        warn_unknown_fields(&format!("step '{id}'"), &step.unknown);
+    }
+    if let Some(ref stack) = raw.stack {
+        warn_unknown_fields("stack", &stack.unknown);
+    }
+    resolve_raw_external_prompts(&mut raw, base_dir, flow_path_display)?;
+    validate_and_resolve(raw, role_overrides, project_roles)
+}
+
+/// Path-aware variant of [`load_flow_any_from_str`] (issue #258).
+///
+/// Reads `path`, dispatches on `flow:` vs `states:` like the
+/// string-based loader, then resolves any external prompt files
+/// against `path`'s directory. Linear flows go through
+/// [`load_flow_from_str_with_project_at`]; graph flows are parsed
+/// and validated, then [`resolve_graph_external_prompts`] folds the
+/// `*_file` fields in.
+pub fn load_flow_any_from_path(path: &Path) -> Result<Flow, ConfigError> {
+    let contents = std::fs::read_to_string(path)?;
+    let probe: FlowShapeProbe = serde_yaml::from_str(&contents)?;
+    let flow_path_display = path.display().to_string();
+    let base_dir = flow_base_dir_for(path);
+    match (probe.flow.is_some(), probe.states.is_some()) {
+        (true, true) => Err(ConfigError::Validation(
+            "flow file declares both 'flow:' and 'states:' -- pick one (linear flow vs state graph)"
+                .to_string(),
+        )),
+        (false, false) => Err(ConfigError::Validation(
+            "flow file must declare either 'flow:' (linear) or 'states:' (state graph)"
+                .to_string(),
+        )),
+        (true, false) => Ok(Flow::Linear(load_flow_from_str_with_project_at(
+            &contents,
+            base_dir,
+            &flow_path_display,
+            &HashMap::new(),
+            &HashMap::new(),
+        )?)),
+        (false, true) => {
+            let mut graph = load_graph_flow_from_str(&contents)?;
+            resolve_graph_external_prompts(&mut graph, base_dir, &flow_path_display)?;
+            Ok(Flow::Graph(graph))
+        }
+    }
 }
 
 /// Structural validation for [`GraphFlow`].
@@ -3532,6 +3842,7 @@ states:
             version: Version("1".to_string()),
             name: "test".to_string(),
             prompt: None,
+            prompt_file: None,
             initial: initial.to_string(),
             states: map,
         }
@@ -3552,6 +3863,7 @@ states:
             kind: None,
             role: Some("developer".to_string()),
             task: None,
+            task_file: None,
             description: None,
             edges: Some(map),
         }
@@ -3566,6 +3878,7 @@ states:
             kind: Some(StateKind::Final),
             role: None,
             task: None,
+            task_file: None,
             description: Some("Test terminal state.".to_string()),
             edges: None,
         }
@@ -3578,6 +3891,7 @@ states:
             kind: Some(StateKind::Final),
             role: None,
             task: None,
+            task_file: None,
             description: None,
             edges: None,
         }
@@ -3629,6 +3943,7 @@ states:
             kind: None,
             role: Some("developer".to_string()),
             task: None,
+            task_file: None,
             description: None,
             edges: None, // no kind, no edges -- dead end
         };
@@ -3778,6 +4093,7 @@ states:
             kind: None,
             role: Some("developer".to_string()),
             task: None,
+            task_file: None,
             description: None,
             edges: None,
         };
@@ -4055,5 +4371,381 @@ states:
             reparsed.states["done"].description.as_deref(),
             Some("All good.")
         );
+    }
+
+    // --- External-prompt resolution tests (issue #258) ---
+
+    /// Build a tempdir with `<dir>/flow.yaml` and any extra sibling
+    /// files. Returns the tempdir guard and the absolute path to the
+    /// flow YAML.
+    fn write_flow_with_siblings(
+        flow_yaml: &str,
+        siblings: &[(&str, &str)],
+    ) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let flow_path = tmp.path().join("flow.yaml");
+        std::fs::write(&flow_path, flow_yaml).expect("write flow.yaml");
+        for (rel, contents) in siblings {
+            let abs = tmp.path().join(rel);
+            if let Some(parent) = abs.parent() {
+                std::fs::create_dir_all(parent).expect("mkdir sibling parent");
+            }
+            std::fs::write(&abs, contents).expect("write sibling");
+        }
+        (tmp, flow_path)
+    }
+
+    #[test]
+    fn graph_flow_parses_prompt_file_field() {
+        // AC1: prompt_file accepted on GraphFlow.
+        let yaml = r#"
+version: "1"
+name: g
+prompt_file: prompts/intro.md
+initial: start
+states:
+  start:
+    role: dev
+    edges:
+      ok: { to: done, description: continue }
+  done:
+    kind: final
+    description: end
+"#;
+        let g = load_graph_flow_from_str(yaml).unwrap();
+        assert_eq!(g.prompt_file.as_deref(), Some("prompts/intro.md"));
+        assert!(g.prompt.is_none());
+    }
+
+    #[test]
+    fn graph_state_parses_task_file_field() {
+        // AC2: task_file accepted on GraphState.
+        let yaml = r#"
+version: "1"
+name: g
+initial: start
+states:
+  start:
+    role: dev
+    task_file: prompts/start.md
+    edges:
+      ok: { to: done, description: continue }
+  done:
+    kind: final
+    description: end
+"#;
+        let g = load_graph_flow_from_str(yaml).unwrap();
+        assert_eq!(
+            g.states["start"].task_file.as_deref(),
+            Some("prompts/start.md")
+        );
+        assert!(g.states["start"].task.is_none());
+    }
+
+    #[test]
+    fn linear_flow_parses_prompt_file_and_task_file_fields() {
+        // AC1, AC2 on the linear shape.
+        let yaml = r#"
+version: "1"
+name: lin
+prompt_file: prompts/intro.md
+flow:
+  build:
+    agent: dev
+    task_file: prompts/build.md
+"#;
+        let raw: RawFlowConfig = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(raw.prompt_file.as_deref(), Some("prompts/intro.md"));
+        assert_eq!(
+            raw.flow["build"].task_file.as_deref(),
+            Some("prompts/build.md")
+        );
+    }
+
+    #[test]
+    fn graph_flow_resolves_task_file_from_sibling() {
+        // AC4 (file content materialized) + happy path on graph.
+        let yaml = r#"
+version: "1"
+name: g
+initial: design
+states:
+  design:
+    role: architect
+    task_file: prompts/design.md
+    edges:
+      ok: { to: done, description: continue }
+  done:
+    kind: final
+    description: end
+"#;
+        let (tmp, path) =
+            write_flow_with_siblings(yaml, &[("prompts/design.md", "Design the thing.\n")]);
+        let parsed = load_flow_any_from_path(&path).unwrap();
+        let Flow::Graph(g) = parsed else {
+            panic!("expected graph flow");
+        };
+        assert_eq!(
+            g.states["design"].task.as_deref(),
+            Some("Design the thing.\n")
+        );
+        assert!(g.states["design"].task_file.is_none());
+        drop(tmp);
+    }
+
+    #[test]
+    fn linear_flow_resolves_task_file_from_sibling() {
+        let yaml = r#"
+version: "1"
+name: lin
+flow:
+  build:
+    agent: dev
+    task_file: prompts/build.md
+"#;
+        let (tmp, path) =
+            write_flow_with_siblings(yaml, &[("prompts/build.md", "Build the thing.")]);
+        let cfg = load_flow_from_path(&path).unwrap();
+        assert_eq!(cfg.steps[0].task.as_deref(), Some("Build the thing."));
+        drop(tmp);
+    }
+
+    #[test]
+    fn task_and_task_file_together_is_validation_error_graph() {
+        // AC3: mutual exclusion on graph.
+        let yaml = r#"
+version: "1"
+name: g
+initial: design
+states:
+  design:
+    role: architect
+    task: inline
+    task_file: prompts/design.md
+    edges:
+      ok: { to: done, description: continue }
+  done:
+    kind: final
+    description: end
+"#;
+        let (tmp, path) = write_flow_with_siblings(yaml, &[("prompts/design.md", "external")]);
+        let err = load_flow_any_from_path(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'task' and 'task_file'"), "got: {msg}");
+        assert!(msg.contains("design"), "should name state ID, got: {msg}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn prompt_and_prompt_file_together_is_validation_error_linear() {
+        // AC3: mutual exclusion on linear, top-level prompt.
+        let yaml = r#"
+version: "1"
+name: lin
+prompt: inline
+prompt_file: prompts/intro.md
+flow:
+  build:
+    agent: dev
+"#;
+        let (tmp, path) = write_flow_with_siblings(yaml, &[("prompts/intro.md", "external")]);
+        let err = load_flow_from_path(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'prompt' and 'prompt_file'"), "got: {msg}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn missing_task_file_reports_flow_path_and_state_id() {
+        // AC6: validator output names flow path + state ID.
+        let yaml = r#"
+version: "1"
+name: g
+initial: design
+states:
+  design:
+    role: architect
+    task_file: prompts/missing.md
+    edges:
+      ok: { to: done, description: continue }
+  done:
+    kind: final
+    description: end
+"#;
+        let (tmp, path) = write_flow_with_siblings(yaml, &[]);
+        let err = load_flow_any_from_path(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("not found"), "should mention not-found: {msg}");
+        assert!(msg.contains("design"), "should name state: {msg}");
+        assert!(
+            msg.contains("prompts/missing.md"),
+            "should name relative path: {msg}"
+        );
+        assert!(
+            msg.contains(&path.display().to_string()),
+            "should embed flow path: {msg}"
+        );
+        drop(tmp);
+    }
+
+    #[test]
+    fn parent_dir_traversal_is_rejected_before_io() {
+        // AC5: '..' rejected. The file does not exist anywhere on
+        // disk, so the test confirms the traversal error fires before
+        // any read attempt -- i.e. the message is the traversal one,
+        // not a generic 'not found'.
+        let yaml = r#"
+version: "1"
+name: g
+initial: design
+states:
+  design:
+    role: architect
+    task_file: ../escape.md
+    edges:
+      ok: { to: done, description: continue }
+  done:
+    kind: final
+    description: end
+"#;
+        let (tmp, path) = write_flow_with_siblings(yaml, &[]);
+        let err = load_flow_any_from_path(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("'..' is not allowed") || msg.contains("escapes the flow directory"),
+            "got: {msg}"
+        );
+        drop(tmp);
+    }
+
+    #[test]
+    fn absolute_path_is_rejected() {
+        // AC5: absolute path rejected.
+        let yaml = r#"
+version: "1"
+name: lin
+flow:
+  build:
+    agent: dev
+    task_file: /etc/passwd
+"#;
+        let (tmp, path) = write_flow_with_siblings(yaml, &[]);
+        let err = load_flow_from_path(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must be a relative path"), "got: {msg}");
+        drop(tmp);
+    }
+
+    #[test]
+    fn nested_parent_dir_in_path_is_rejected() {
+        // AC5: `prompts/../prompts/x.md` is rejected by the
+        // component check -- not flattened first.
+        let yaml = r#"
+version: "1"
+name: lin
+flow:
+  build:
+    agent: dev
+    task_file: prompts/../escape.md
+"#;
+        let (tmp, path) =
+            write_flow_with_siblings(yaml, &[("prompts/build.md", "x"), ("escape.md", "x")]);
+        let err = load_flow_from_path(&path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("'..' is not allowed"), "got: {msg}");
+        drop(tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_outside_base_dir_is_rejected() {
+        // AC5: symlink-escape via canonicalize. Build a flow dir that
+        // contains a symlink pointing to a file in a sibling dir, and
+        // expect the loader to reject it after canonicalizing both
+        // sides.
+        let outer = tempfile::tempdir().expect("outer tempdir");
+        let outside = outer.path().join("outside.md");
+        std::fs::write(&outside, "secret").expect("write outside");
+
+        let flow_dir = outer.path().join("flow_dir");
+        std::fs::create_dir(&flow_dir).expect("mk flow dir");
+        let link = flow_dir.join("link.md");
+        std::os::unix::fs::symlink(&outside, &link).expect("symlink");
+
+        let yaml = r#"
+version: "1"
+name: lin
+flow:
+  build:
+    agent: dev
+    task_file: link.md
+"#;
+        let flow_path = flow_dir.join("flow.yaml");
+        std::fs::write(&flow_path, yaml).expect("write flow");
+
+        let err = load_flow_from_path(&flow_path).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("outside the flow directory"),
+            "expected escape error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn external_prompt_content_is_substituted_with_vars() {
+        // AC4: variable substitution still applies after the file is
+        // loaded. The resolver does not run substitute_vars itself --
+        // the runner does -- but the contract is that the resolved
+        // `task:` carries placeholders that the runner substitutes
+        // later. This test covers the resolver side: it verifies the
+        // file content lands in `task` so subsequent
+        // `substitute_vars` would pick it up. The runner side is
+        // covered indirectly by the existing substitute_vars tests
+        // running on `step.task`.
+        let yaml = r#"
+version: "1"
+name: lin
+flow:
+  build:
+    agent: dev
+    task_file: t.md
+"#;
+        let (tmp, path) = write_flow_with_siblings(yaml, &[("t.md", "Issue #{{vars.id}}")]);
+        let cfg = load_flow_from_path(&path).unwrap();
+        assert_eq!(cfg.steps[0].task.as_deref(), Some("Issue #{{vars.id}}"));
+        drop(tmp);
+    }
+
+    #[test]
+    fn resolver_clears_file_field_after_resolution() {
+        // After `resolve_graph_external_prompts` runs, every *_file
+        // field is None. The runtime relies on this invariant
+        // (`debug_assert` in `execute_graph_flow_setup`).
+        let yaml = r#"
+version: "1"
+name: g
+prompt_file: intro.md
+initial: design
+states:
+  design:
+    role: architect
+    task_file: design.md
+    edges:
+      ok: { to: done, description: continue }
+  done:
+    kind: final
+    description: end
+"#;
+        let (tmp, path) =
+            write_flow_with_siblings(yaml, &[("intro.md", "intro"), ("design.md", "design")]);
+        let parsed = load_flow_any_from_path(&path).unwrap();
+        let Flow::Graph(g) = parsed else {
+            panic!("expected graph");
+        };
+        assert!(g.prompt_file.is_none());
+        assert!(g.states.values().all(|s| s.task_file.is_none()));
+        assert_eq!(g.prompt.as_deref(), Some("intro"));
+        assert_eq!(g.states["design"].task.as_deref(), Some("design"));
+        drop(tmp);
     }
 }

@@ -326,3 +326,56 @@ states:
         "stderr must show graph runtime markers; got:\n{stderr}"
     );
 }
+
+/// AC6 of issue #258: `kuro validate` reports missing prompt files
+/// with the flow path AND the offending state ID. The error must land
+/// on stderr (not stdout), and the exit code must be non-zero so CI
+/// pipelines fail loud.
+#[test]
+fn validate_reports_missing_task_file_with_flow_path_and_state_id() {
+    const GRAPH_WITH_MISSING_TASK_FILE: &str = r#"
+version: "1"
+name: missing-task-file
+initial: design
+states:
+  design:
+    role: developer
+    task_file: prompts/design.md
+    edges:
+      ok:
+        to: done
+        description: Move on.
+  done:
+    kind: final
+    description: Done.
+"#;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let flow = write_flow(tmp.path(), "missing.yaml", GRAPH_WITH_MISSING_TASK_FILE);
+
+    let out = Command::new(kuro_bin())
+        .arg("validate")
+        .arg(&flow)
+        .output()
+        .expect("spawn kuro validate");
+
+    assert!(
+        !out.status.success(),
+        "missing task_file must exit non-zero; stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("design"),
+        "stderr must name the offending state ID 'design'; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(&flow.display().to_string()),
+        "stderr must embed the flow path; got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("prompts/design.md"),
+        "stderr must name the unresolved relative path; got:\n{stderr}"
+    );
+}
