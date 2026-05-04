@@ -33,6 +33,7 @@ use indexmap::IndexMap;
 use crate::config::{Agent, Backend, GraphEdge, GraphFlow, StateKind};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, OutputFormat};
 use crate::stack::{self, GraphDecision, StepRecord};
+use crate::ui::{self, StepInfo, StepState};
 
 use super::decision::{
     DecisionError, DecisionParseError, parse_agent_decision, validate_transition,
@@ -128,7 +129,7 @@ pub async fn run_graph_flow(
         // Final state: terminate cleanly. We do NOT count terminal states
         // toward step_num so a `start -> final` graph runs exactly one step.
         if matches!(state.kind, Some(StateKind::Final)) {
-            eprintln!("graph: reached final state '{current}'");
+            ui::print_graph_final(&current);
             return Ok(results);
         }
 
@@ -185,10 +186,22 @@ pub async fn run_graph_flow(
                 agent: agent_id.clone(),
             })?;
 
-        eprintln!(
-            "graph: step {step_num} state '{current}' agent '{agent_id}' edges {:?}",
-            edges.keys().collect::<Vec<_>>()
-        );
+        // Step banner mirrors the linear runner so the visual rhythm of a
+        // graph run matches a linear run (#266). `total` is the global cap
+        // because a graph has no fixed step count -- visit caps land in
+        // #263 and will refine this. Edge names are not included in the
+        // banner; they appear in the per-step prompt and in the post-step
+        // transition line so the user can see what was picked vs available.
+        let step_info = StepInfo {
+            id: current.clone(),
+            agent: agent.name.clone(),
+            title: agent.title.clone(),
+            model: agent.model.clone(),
+            backend: agent.backend,
+            input: Vec::new(),
+            state: StepState::Running,
+        };
+        ui::print_step_banner(step_num, DEFAULT_MAX_STEPS, &step_info);
 
         // Build the user prompt: top-level prompt (from ctx.task), per-state
         // task, then the deterministic edge menu. ctx.task is already var-
@@ -224,6 +237,11 @@ pub async fn run_graph_flow(
             stack::STEPS_SUBDIR,
             content_filename
         );
+
+        // Spinner mirrors the linear runner so the user sees movement while
+        // the agent is running. We start it after path setup so the path-
+        // resolution prints (if any) do not race with the spinner repaint.
+        let spinner = ui::start_spinner();
 
         let (decision, raw_content): (super::decision::AgentDecision, String) = {
             let mut last_raw: Option<String> = None;
@@ -294,6 +312,7 @@ pub async fn run_graph_flow(
             (d, raw)
         };
 
+        spinner.stop();
         let duration = attempt_start.elapsed();
 
         // Resolve the next state BEFORE persisting the step record so the
@@ -349,12 +368,13 @@ pub async fn run_graph_flow(
             }
         })?;
 
-        eprintln!(
-            "graph: step {step_num} '{current}' --[{}]--> '{next}' ({}) reason: {}",
-            decision.transition,
-            format_duration(duration),
-            decision.reason,
-        );
+        let display_path = output_path
+            .canonicalize()
+            .unwrap_or(output_path.clone())
+            .display()
+            .to_string();
+        ui::print_step_done(&format_duration(duration), "—", "—", &display_path);
+        ui::print_graph_transition(&decision.transition, &next, &decision.reason);
 
         results.push(StepRunResult {
             step_id: current.clone(),

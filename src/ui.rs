@@ -408,6 +408,54 @@ pub fn print_step_done(duration: &str, tokens_in: &str, tokens_out: &str, output
     );
 }
 
+/// Print the chosen transition for a graph state visit.
+///
+/// Mirrors the visual rhythm of [`print_step_done`] but carries the
+/// graph-specific information: the edge name the agent picked, the
+/// resolved next state, and the agent's reason. Lives next to the linear
+/// helpers because graph runs reuse the rest of this module today --
+/// #269 will redesign this once the broader graph UI brief lands.
+pub fn print_graph_transition(transition: &str, next_state: &str, reason: &str) {
+    let t = &DARK;
+    println!(
+        "      {} {} {} {} {}",
+        style::style("→").with(t.cyan),
+        style::style("transition").with(t.dim),
+        style::style(transition).with(t.cyan),
+        style::style("→").with(t.dim),
+        style::style(next_state)
+            .with(t.fg)
+            .attribute(Attribute::Bold),
+    );
+    // The reason is dimmed because it is auxiliary -- a user scanning a
+    // run wants the picked transition to pop, with the reason available
+    // for context but not competing for attention.
+    println!(
+        "        {} {}",
+        style::style("reason").with(t.dim),
+        style::style(reason).with(t.dim),
+    );
+}
+
+/// Print the line announcing a graph reached a `kind: final` state.
+///
+/// Distinct from [`print_flow_complete`] because the graph driver still
+/// needs to write the manifest and emit the standard summary table after
+/// this; this helper just marks the terminal hop. #269 will fold this
+/// into a richer graph-aware summary.
+pub fn print_graph_final(state_id: &str) {
+    let t = &DARK;
+    println!();
+    println!(
+        "      {} {} {}",
+        style::style("◆").with(t.green).attribute(Attribute::Bold),
+        style::style("reached final state").with(t.dim),
+        style::style(state_id)
+            .with(t.green)
+            .attribute(Attribute::Bold),
+    );
+}
+
 /// Print context injection line (handoff between steps).
 pub fn print_context_injection(from_step: &str, from_file: &str, tokens: &str) {
     let t = &DARK;

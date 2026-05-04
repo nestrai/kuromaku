@@ -2035,6 +2035,12 @@ mod flow_api {
     /// empty/unclear payload -- the failure mode flagged in the team
     /// review on #213. Resolves the flow through the seed cascade so the
     /// check uses the same file the runner would execute.
+    ///
+    /// Accepts both flow shapes (#268): linear flows are matched against
+    /// `steps[].id`; graph flows are matched against `states` keys. Both
+    /// shapes persist per-step records under the same id, so the same
+    /// required-id list works for both -- the loader just needs to handle
+    /// either YAML shape rather than only the linear one.
     pub(crate) fn verify_flow_step_ids(flow_name: &str, required: &[&str]) -> Result<Vec<String>> {
         let koto_config = KotoConfig::load_optional(Path::new("."))?;
         let seeds = koto_config
@@ -2043,10 +2049,19 @@ mod flow_api {
             .unwrap_or_else(Seeds::default_local);
         let path = resolve_flow_path(&FlowSource::Name(flow_name.to_string()), &seeds)?;
         let contents = std::fs::read_to_string(&path)?;
-        let flow_config = config::load_flow_from_str(&contents)?;
+        let has_id: Box<dyn Fn(&str) -> bool> = match config::load_flow_any_from_str(&contents)? {
+            config::Flow::Linear(flow_config) => {
+                let ids: Vec<String> = flow_config.steps.iter().map(|s| s.id.clone()).collect();
+                Box::new(move |id| ids.iter().any(|s| s == id))
+            }
+            config::Flow::Graph(graph) => {
+                let ids: Vec<String> = graph.states.keys().cloned().collect();
+                Box::new(move |id| ids.iter().any(|s| s == id))
+            }
+        };
         Ok(required
             .iter()
-            .filter(|id| !flow_config.steps.iter().any(|s| s.id == **id))
+            .filter(|id| !has_id(id))
             .map(|s| s.to_string())
             .collect())
     }
@@ -2879,15 +2894,17 @@ mod flow_api {
         stack::init_run_layout(&ctx.run_path)
             .map_err(|e| eyre!("failed to create run dir: {e}"))?;
 
-        // Run banner so the user sees which graph started running. The
-        // linear path emits a richer banner (counts, agents); for the
-        // graph prototype we keep it minimal until the dedicated UI
-        // hooks land.
-        eprintln!(
-            "graph flow '{}' starting (states: {}, agents: {})",
-            graph.name,
+        // Run banner mirroring the linear path so the visual rhythm of a
+        // graph run matches a linear run (#266). `step_count` is reported
+        // as the state count -- not byte-equivalent to a linear flow's
+        // step count (graphs revisit), but it is the closest analogue
+        // until #269 redesigns the graph-aware UI.
+        let display_path_str = flow_path.display().to_string();
+        ui::print_flow_start(
+            &graph.name,
+            &display_path_str,
             graph.states.len(),
-            agents_by_id.len()
+            agents_by_id.len(),
         );
 
         // ---- Spawn driver task -----------------------------------------
@@ -2937,10 +2954,22 @@ mod flow_api {
             stack::write_manifest(&ctx.run_path, &manifest)
                 .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
 
-            eprintln!(
-                "graph flow '{flow_name}' done in {} ({} state(s) visited)",
-                format_elapsed(total_elapsed),
-                results.len()
+            // Reuse the linear summary table so a graph run ends with the
+            // same per-step recap a linear run does (#266). Token totals
+            // are 0 today because the graph driver does not collect usage
+            // metadata yet -- mirrors the linear path's "—" treatment when
+            // a backend declines to report tokens. #269 will design a
+            // graph-native summary that also visualises the path taken.
+            let summary = super::build_summary(&results);
+            let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
+            let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
+            ui::print_flow_complete(
+                &summary,
+                &format_elapsed(total_elapsed),
+                &total_in.to_string(),
+                &total_out.to_string(),
+                "—",
+                &ctx.stack_path.display().to_string(),
             );
 
             Ok(FlowResult {
