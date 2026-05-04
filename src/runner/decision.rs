@@ -61,14 +61,40 @@ pub enum DecisionError {
 /// Accepts:
 /// - a bare JSON object,
 /// - a JSON object inside a fenced code block (```json ... ``` or ``` ... ```),
-/// - a JSON object embedded in surrounding prose.
+/// - a JSON object embedded in surrounding prose,
+/// - prose with arbitrary `{...}` snippets (e.g. Rust code blocks) preceding
+///   the routing JSON object.
 ///
-/// The first balanced `{...}` in the input is used. JSON string contents are
-/// honoured, so a `}` inside a string literal does not close the object.
+/// The graph-flow prompt contract instructs the agent to put the routing JSON
+/// "exactly once, on its own line at the end of your reply". To honour that
+/// contract robustly we enumerate every top-level balanced `{...}` block in
+/// the input and pick the **last** one that successfully deserialises into
+/// [`AgentDecision`]. Earlier `{...}` snippets (Rust enums, code samples,
+/// example payloads) are skipped.
+///
+/// JSON string contents are honoured, so a `}` inside a string literal does
+/// not close the object.
 pub fn parse_agent_decision(raw: &str) -> Result<AgentDecision, DecisionParseError> {
-    let slice = first_json_object(raw).ok_or(DecisionParseError::NoJsonObject)?;
-    let decision: AgentDecision = serde_json::from_str(slice)?;
-    Ok(decision)
+    let candidates = top_level_json_objects(raw);
+    if candidates.is_empty() {
+        return Err(DecisionParseError::NoJsonObject);
+    }
+
+    // Walk from end to start. The contract says the routing JSON is the
+    // final object; earlier `{...}` blocks are prose noise.
+    let mut last_err: Option<serde_json::Error> = None;
+    for slice in candidates.iter().rev() {
+        match serde_json::from_str::<AgentDecision>(slice) {
+            Ok(decision) => return Ok(decision),
+            Err(err) => last_err = Some(err),
+        }
+    }
+
+    // No candidate deserialised. Surface the error from the last (most
+    // likely intended) candidate so the message points at the right block.
+    Err(DecisionParseError::InvalidJson(last_err.expect(
+        "candidates non-empty implies at least one deserialise attempt",
+    )))
 }
 
 /// Validate that the agent's chosen transition is in the closed set of edges
@@ -87,14 +113,21 @@ pub fn validate_transition(
     }
 }
 
-/// Locate the first balanced `{...}` substring in `raw`.
+/// Collect every top-level balanced `{...}` substring in `raw` in order of
+/// appearance.
 ///
-/// Walks the input byte-wise, opens on the first `{`, then tracks brace
-/// depth. While inside a JSON string literal (`"..."`) braces are ignored;
-/// `\\` and `\"` escape sequences are skipped so the closing quote is
-/// detected correctly. Returns `None` if no balanced object exists.
-fn first_json_object(raw: &str) -> Option<&str> {
+/// Walks the input byte-wise, opens on each top-level `{`, then tracks brace
+/// depth until it returns to zero. While inside a JSON string literal
+/// (`"..."`) braces are ignored; `\\` and `\"` escape sequences are skipped
+/// so the closing quote is detected correctly. Nested objects are *not*
+/// returned separately -- only the outermost balanced block is collected.
+///
+/// An unterminated `{` at the end of input is silently dropped (no half-open
+/// candidate is returned). This matches the previous `first_json_object`
+/// semantics where unbalanced braces produced `None`.
+fn top_level_json_objects(raw: &str) -> Vec<&str> {
     let bytes = raw.as_bytes();
+    let mut out: Vec<&str> = Vec::new();
     let mut start: Option<usize> = None;
     let mut depth: usize = 0;
     let mut in_string = false;
@@ -126,15 +159,15 @@ fn first_json_object(raw: &str) -> Option<&str> {
             b'}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let s = start.unwrap();
-                    return Some(&raw[s..=idx]);
+                    let s = start.take().unwrap();
+                    out.push(&raw[s..=idx]);
                 }
             }
             _ => {}
         }
     }
 
-    None
+    out
 }
 
 #[cfg(test)]
@@ -207,6 +240,55 @@ mod tests {
         let raw = r#"{"transition": "x", "reason": "he said \"hi\" }"}"#;
         let decision = parse_agent_decision(raw).expect("escaped quotes handled");
         assert_eq!(decision.reason, r#"he said "hi" }"#);
+    }
+
+    #[test]
+    fn picks_routing_json_after_rust_code_snippet() {
+        // Real-world failure mode: the design-step prompt asks the agent to
+        // write a full design plan AND end the reply with a routing JSON
+        // object. Plans frequently contain Rust code snippets like
+        // `enum StepKindData { Llm }`. The parser must skip those and pick
+        // the routing JSON at the end.
+        let raw = "Here is the plan:\n\n\
+                   ```rust\n\
+                   enum StepKindData { Llm, Shell }\n\
+                   struct Step { id: String }\n\
+                   ```\n\n\
+                   And the routing decision:\n\
+                   {\"transition\": \"approved\", \"reason\": \"plan looks solid\"}\n";
+        let decision = parse_agent_decision(raw).expect("routing JSON after code parses");
+        assert_eq!(decision.transition, "approved");
+        assert_eq!(decision.reason, "plan looks solid");
+    }
+
+    #[test]
+    fn picks_last_decision_when_multiple_routing_jsons_present() {
+        // If the agent quotes an example payload earlier in its reply and
+        // then emits the real decision at the end, the last one wins.
+        let raw = "Example: {\"transition\": \"rejected\", \"reason\": \"example\"}\n\
+                   Final: {\"transition\": \"approved\", \"reason\": \"all good\"}";
+        let decision = parse_agent_decision(raw).expect("last decision wins");
+        assert_eq!(decision.transition, "approved");
+        assert_eq!(decision.reason, "all good");
+    }
+
+    #[test]
+    fn surfaces_decode_error_from_last_candidate_when_all_fail() {
+        // If no candidate deserialises, the error must come from the last
+        // candidate (the one the agent most likely intended as the
+        // decision) so log lines point at the right block.
+        let raw = "{\"unrelated\": 1} {\"transition\": 42, \"reason\": \"bad type\"}";
+        let err = parse_agent_decision(raw).expect_err("all candidates fail");
+        let DecisionParseError::InvalidJson(json_err) = err else {
+            panic!("expected InvalidJson, got {err:?}");
+        };
+        // The error must reference the wrong-type field, not the unrelated
+        // earlier object.
+        let msg = json_err.to_string();
+        assert!(
+            msg.contains("transition") || msg.contains("string"),
+            "error must point at the routing JSON candidate; got: {msg}"
+        );
     }
 
     #[test]
