@@ -19,6 +19,11 @@
 //!   matches the runner's prompt-assembly (`runner::build_system_prompt`):
 //!   Guide > Rules > Skills > Role. A consumer that joins the non-null parts
 //!   with `\n\n` reproduces what the runner builds.
+//! - **Guide gate (#245)**: by default `guide` is `null`. The cwd's
+//!   `Guide.md` only loads when the caller passes `include_guide: true`.
+//!   Mirrors the `kuro task --include-project-context` gate so the same
+//!   "agents stay repo-agnostic by default" invariant holds across CLI and
+//!   MCP invocation paths.
 //! - **Description derivation**: the team review pinned "first 200 chars of
 //!   the role field, single line, frontmatter stripped" for agents and
 //!   "the prompt field" for flows. Implemented in [`derive_description`].
@@ -388,6 +393,12 @@ struct LoadAgentResult {
 #[derive(Deserialize)]
 struct LoadAgentArgs {
     name: String,
+    /// Issue #245: opt-in for cwd `Guide.md` injection. Default false keeps
+    /// the response repo-agnostic so MCP clients cannot accidentally inherit
+    /// the kuromaku-server cwd's project identity. Mirrors the
+    /// `kuro task --include-project-context` flag.
+    #[serde(default)]
+    include_guide: bool,
 }
 
 /// `load_agent` -- assemble Guide + Rules + Skills + Role for one agent.
@@ -401,8 +412,9 @@ impl Tool for LoadAgent {
     fn description(&self) -> &'static str {
         "Load one agent's prompt parts (Guide, rules, skills, role) so an MCP client can inject \
          them as system context. Returns structured JSON with parts in runner-assembly order; \
-         join the non-null parts with two newlines to reproduce the runner's prompt. Example: \
-         load_agent {\"name\":\"Neo\"}."
+         join the non-null parts with two newlines to reproduce the runner's prompt. The cwd \
+         Guide is omitted unless `include_guide: true` is passed, so agents stay repo-agnostic \
+         by default (issue #245). Example: load_agent {\"name\":\"Neo\"}."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -411,6 +423,11 @@ impl Tool for LoadAgent {
                 "name": {
                     "type": "string",
                     "description": "Agent name (e.g. 'Neo', 'Bella'). Nested IDs supported via '/' (e.g. 'coding/rust/Sage')."
+                },
+                "include_guide": {
+                    "type": "boolean",
+                    "default": false,
+                    "description": "When true, inject the cwd project's Guide.md (mirrors `kuro task --include-project-context`). Default false keeps the response repo-agnostic so the kuromaku-server cwd's project identity does not leak into the agent."
                 }
             },
             "required": ["name"]
@@ -430,11 +447,11 @@ impl Tool for LoadAgent {
                 json!({"reason": "name must not be empty"}),
             ));
         }
-        do_load_agent(&cwd, &args.name)
+        do_load_agent(&cwd, &args.name, args.include_guide)
     }
 }
 
-fn do_load_agent(cwd: &Path, name: &str) -> Result<Value, McpError> {
+fn do_load_agent(cwd: &Path, name: &str, include_guide: bool) -> Result<Value, McpError> {
     let seeds = discover_seeds(cwd)?;
     let project = project_config(cwd);
 
@@ -455,7 +472,16 @@ fn do_load_agent(cwd: &Path, name: &str) -> Result<Value, McpError> {
         })?;
 
     // --- Guide ---
-    let guide = load_guide_from_seeds(&seeds).map_err(|e| internal(format!("guide load: {e}")))?;
+    // Gate (#245): same principle as `kuro task`/`kuro chat` -- the cwd
+    // Guide.md only loads when the caller explicitly asks for project
+    // context. Default off keeps an MCP server started in any project
+    // directory from leaking that project's identity into the agent it
+    // hands back to the client.
+    let guide = if include_guide {
+        load_guide_from_seeds(&seeds).map_err(|e| internal(format!("guide load: {e}")))?
+    } else {
+        None
+    };
 
     // --- Rules: load each by name in agent declaration order ---
     let mut rules: Vec<NamedContent> = Vec::with_capacity(agent.rules.len());
@@ -826,7 +852,10 @@ mod tests {
              rules:\n  - style\n\
              skills:\n  - skill-x\n",
         );
-        let v = do_load_agent(cwd, "Neo").unwrap();
+        // Opt in to the cwd Guide so the byte-equality assertion below still
+        // holds; the default-off path is covered by
+        // `do_load_agent_default_omits_cwd_guide` (#245 regression).
+        let v = do_load_agent(cwd, "Neo", true).unwrap();
 
         // Each part is present and looked up by key.
         assert_eq!(v["name"], "Neo");
@@ -888,7 +917,7 @@ mod tests {
             &cwd.join(".kuro/config.yaml"),
             &project_config_yaml(&cwd.join(".kuro")),
         );
-        let err = do_load_agent(cwd, "Nonexistent").unwrap_err();
+        let err = do_load_agent(cwd, "Nonexistent", false).unwrap_err();
         assert_eq!(err.code, McpErrorCode::AgentMissing);
         let details = err.details.unwrap();
         assert_eq!(details["name"], "Nonexistent");
@@ -907,7 +936,7 @@ mod tests {
             &cwd.join(".kuro/agents/Neo.yaml"),
             "name: Neo\nrole: |\n  r\nrules:\n  - missing-rule\n",
         );
-        let err = do_load_agent(cwd, "Neo").unwrap_err();
+        let err = do_load_agent(cwd, "Neo", false).unwrap_err();
         assert_eq!(err.code, McpErrorCode::InternalError);
         let details = err.details.unwrap();
         assert_eq!(details["rule"], "missing-rule");
@@ -925,10 +954,52 @@ mod tests {
             &cwd.join(".kuro/agents/Mini.yaml"),
             "name: Mini\nrole: |\n  short\n",
         );
-        let v = do_load_agent(cwd, "Mini").unwrap();
+        let v = do_load_agent(cwd, "Mini", true).unwrap();
         assert_eq!(v["rules"].as_array().unwrap().len(), 0);
         assert_eq!(v["skills"].as_array().unwrap().len(), 0);
         assert!(v["guide"].is_null());
+    }
+
+    #[test]
+    fn do_load_agent_default_omits_cwd_guide() {
+        // Regression for #245: even when the cwd has a `Guide.md`, the MCP
+        // `load_agent` tool must omit it unless the caller explicitly opts
+        // in via `include_guide: true`. Mirrors `kuro task` /
+        // `load_guide_for_task_skips_guide_by_default` so the same
+        // "agents stay repo-agnostic by default" invariant holds across CLI
+        // and MCP invocation paths.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        write(
+            &cwd.join(".kuro/config.yaml"),
+            &project_config_yaml(&cwd.join(".kuro")),
+        );
+        write(
+            &cwd.join(".kuro/Guide.md"),
+            "You are working on **kuromaku** -- a CLI tool for reproducible AI agents.",
+        );
+        write(
+            &cwd.join(".kuro/agents/Neo.yaml"),
+            "name: Neo\nrole: |\n  ROLE-CONTENT\n",
+        );
+
+        // Default (false) -- Guide must NOT appear in the response.
+        let v = do_load_agent(cwd, "Neo", false).unwrap();
+        assert!(
+            v["guide"].is_null(),
+            "MCP load_agent default must not return cwd Guide (#245); got: {v}"
+        );
+
+        // Opt-in (true) -- Guide is loaded as before. Symmetric coverage so
+        // a future regression that breaks the opt-in path surfaces here next
+        // to the regression test.
+        let v = do_load_agent(cwd, "Neo", true).unwrap();
+        assert!(
+            v["guide"]
+                .as_str()
+                .is_some_and(|s| s.contains("kuromaku")),
+            "include_guide:true must inject the cwd Guide; got: {v}"
+        );
     }
 
     // ---- Tool::call: input validation ----
