@@ -145,6 +145,12 @@ pub async fn run_graph_flow(
     state_to_agent: &HashMap<String, String>,
     ctx: &RunContext,
 ) -> Result<GraphRunOutcome, RunError> {
+    // Announce dispatch into the graph runtime on stderr so callers and
+    // tests can confirm we did not silently fall through to the linear
+    // DAG loader. Emitted before any I/O so even an init failure leaves
+    // a breadcrumb on the stream.
+    ui::print_graph_run_start(&graph.name);
+
     stack::init_run_layout(&ctx.run_path).map_err(|e| RunError::Stack {
         step: "<run-init>".to_string(),
         source: e,
