@@ -2942,6 +2942,11 @@ mod flow_api {
             match state.kind {
                 Some(StateKind::Final) => continue,
                 Some(StateKind::Human) => continue,
+                // Shell states are deterministic command runners with no
+                // agent binding -- skip role resolution (issue #310). The
+                // graph driver dispatches them through the executor
+                // instead of `run_state_via_executor`.
+                Some(StateKind::Shell) => continue,
                 None => {}
             }
             let role_name = state.role.as_deref().ok_or_else(|| {
@@ -3003,6 +3008,14 @@ mod flow_api {
                 *task = super::flow_api::substitute_vars(task, &effective_vars)?;
                 let ctx = format!("state '{state_id}'");
                 *task = super::flow_api::substitute_roles(task, &roles_map, &ctx)?;
+            }
+            // Shell-state commands (issue #310) get the same var
+            // substitution as `task:`. Roles do not apply -- a shell
+            // command does not address an agent. Substituting now keeps
+            // the runtime free of var-aware string handling on the
+            // shell-dispatch path.
+            if let Some(command) = state.command.as_mut() {
+                *command = super::flow_api::substitute_vars(command, &effective_vars)?;
             }
         }
 
