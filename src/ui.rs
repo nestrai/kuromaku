@@ -437,16 +437,40 @@ pub fn print_graph_transition(transition: &str, next_state: &str, reason: &str) 
     );
 }
 
+/// Print the banner announcing a graph flow has started executing.
+///
+/// Emitted on stderr at the top of [`runner::graph::run_graph_flow`] so
+/// that test harnesses (and humans tailing logs) can confirm execution
+/// routed through the graph runtime rather than silently falling back
+/// to the linear DAG loader. Stderr is the right stream for run-level
+/// banners: stdout is reserved for structured per-step artifacts that
+/// callers may want to pipe into other tools. The companion
+/// [`print_graph_final`] uses the same stream for symmetry.
+pub fn print_graph_run_start(flow_name: &str) {
+    let t = &DARK;
+    eprintln!(
+        "  {} running graph flow {}",
+        style::style("→").with(t.cyan),
+        style::style(format!("'{flow_name}'"))
+            .with(t.fg)
+            .attribute(Attribute::Bold),
+    );
+}
+
 /// Print the line announcing a graph reached a `kind: final` state.
 ///
 /// Distinct from [`print_flow_complete`] because the graph driver still
 /// needs to write the manifest and emit the standard summary table after
 /// this; this helper just marks the terminal hop. #269 will fold this
 /// into a richer graph-aware summary.
+///
+/// Output goes to stderr so the marker stays out of any structured
+/// stdout artifacts a caller may pipe downstream (matches the
+/// stderr discipline of [`print_graph_run_start`]).
 pub fn print_graph_final(state_id: &str) {
     let t = &DARK;
-    println!();
-    println!(
+    eprintln!();
+    eprintln!(
         "      {} {} {}",
         style::style("◆").with(t.green).attribute(Attribute::Bold),
         style::style("reached final state").with(t.dim),
