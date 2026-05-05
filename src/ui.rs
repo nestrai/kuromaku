@@ -17,6 +17,7 @@ use std::time::Instant;
 use crossterm::style::{self, Attribute, Color, Stylize};
 
 use crate::config::Backend;
+use crate::notify::github::IssueSummary;
 
 // --- Theme ---
 
@@ -99,6 +100,34 @@ pub fn print_flow_start(name: &str, file: &str, step_count: usize, agent_count: 
         step_count,
         agent_count,
     );
+}
+
+/// Print the issue context banner shown after `print_flow_start` when a flow
+/// is launched with `--var id=<n>` and `gh` succeeds (issue #309).
+///
+/// Layout mirrors the indent and rule glyphs of [`print_step_banner`] so the
+/// banner reads as a sibling header rather than a step. The body preview
+/// renders dim and indented; an empty preview suppresses the body line
+/// entirely so flows with empty issue bodies don't show a stray blank row.
+pub fn print_issue_banner(summary: &IssueSummary) {
+    let t = &DARK;
+    let marker = style::style("▶").with(t.cyan).attribute(Attribute::Bold);
+    println!();
+    println!(
+        "  {}  {} {}  {}",
+        style::style("──").with(t.muted),
+        marker,
+        style::style(format!("Issue #{}", summary.id))
+            .with(t.fg)
+            .attribute(Attribute::Bold),
+        style::style(&summary.title).with(t.fg),
+    );
+    println!("       {}", style::style(&summary.url).with(t.dim),);
+    if !summary.body_preview.is_empty() {
+        for line in summary.body_preview.lines() {
+            println!("       {}", style::style(line).with(t.dim));
+        }
+    }
 }
 
 /// Print backend resolution: "✓ resolved backends [api] ok [claude-cli v0.8.2] ok"

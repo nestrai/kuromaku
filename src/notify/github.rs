@@ -2,6 +2,12 @@
 //!
 //! Kept in its own module so the runner stays transport-agnostic -- adding a
 //! Slack or webhook sink later is a sibling module, not a runner change.
+//!
+//! Also exposes [`fetch_issue_summary`] (issue #309) so the runner can show a
+//! context banner with the issue title, URL and a body preview at the start of
+//! `implement-issue` / `rework-pr` runs. The fetch reuses the same `gh`-CLI
+//! pattern as [`post_comment`] and is silent on failure: the banner is a
+//! convenience, not part of the flow contract.
 
 use std::collections::HashMap;
 
@@ -160,6 +166,83 @@ pub fn post_comment(
     Ok(())
 }
 
+/// Summary of a GitHub issue for the run-start banner (issue #309).
+///
+/// Owned strings keep this trivially `Clone`-able and free the renderer from
+/// any borrow on the fetch path. `body_preview` has already been truncated to
+/// at most 3 non-empty lines on the producer side so the renderer stays a
+/// pure layout function.
+#[derive(Debug, Clone)]
+pub struct IssueSummary {
+    pub id: u64,
+    pub title: String,
+    pub url: String,
+    pub body_preview: String,
+}
+
+/// Number of body lines the banner will show. The fetch path applies the
+/// truncation in Rust (rather than via `--jq`) so we stay robust against
+/// missing or null fields in the JSON.
+const ISSUE_BODY_PREVIEW_LINES: usize = 3;
+
+/// Fetch a [`IssueSummary`] via `gh issue view <id> --json title,url,body`.
+///
+/// Returns `None` on any failure -- `gh` not on PATH, non-zero exit (e.g. not
+/// in a github repo, network issue, unknown issue), JSON parse error, or
+/// missing fields. The banner is opportunistic: a failed fetch must not
+/// produce noise on flows that don't follow the issue convention. Any logging
+/// would defeat that contract.
+pub fn fetch_issue_summary(id: u64) -> Option<IssueSummary> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("gh")
+        .arg("issue")
+        .arg("view")
+        .arg(id.to_string())
+        .arg("--json")
+        .arg("title,url,body")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    let title = json.get("title")?.as_str()?.to_string();
+    let url = json.get("url")?.as_str()?.to_string();
+    let body = json
+        .get("body")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let body_preview = truncate_body_preview(body, ISSUE_BODY_PREVIEW_LINES);
+
+    Some(IssueSummary {
+        id,
+        title,
+        url,
+        body_preview,
+    })
+}
+
+/// Take the first `max_lines` non-empty lines and join them with `\n`.
+///
+/// Issue bodies tend to start with a blank line or a heading; skipping empty
+/// lines means the preview shows actual content even when the markdown puts
+/// whitespace at the top. Trimmed `\r` keeps Windows line endings from
+/// looking ragged inside a coloured banner.
+fn truncate_body_preview(body: &str, max_lines: usize) -> String {
+    body.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .take(max_lines)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,5 +394,29 @@ mod tests {
             }
             other => panic!("expected Posted, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn truncate_body_preview_skips_blank_lines_and_trims() {
+        // Issue bodies typically start with a blank line; the preview must
+        // surface actual content rather than echo whitespace.
+        let body = "\n\n## Why\n\nThe runner needs a banner\n\nMore detail\nfourth line\n";
+        let preview = truncate_body_preview(body, 3);
+        assert_eq!(preview, "## Why\nThe runner needs a banner\nMore detail");
+    }
+
+    #[test]
+    fn truncate_body_preview_handles_short_bodies() {
+        assert_eq!(truncate_body_preview("", 3), "");
+        assert_eq!(truncate_body_preview("only one\n", 3), "only one");
+        assert_eq!(truncate_body_preview("a\nb\n", 3), "a\nb");
+    }
+
+    #[test]
+    fn truncate_body_preview_strips_trailing_cr() {
+        // CRLF input should not leave stray `\r` in the rendered banner.
+        let body = "first\r\nsecond\r\n";
+        let preview = truncate_body_preview(body, 3);
+        assert_eq!(preview, "first\nsecond");
     }
 }

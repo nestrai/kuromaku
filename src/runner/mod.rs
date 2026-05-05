@@ -106,6 +106,26 @@ impl RunContext {
 /// being created later in the run, but `kuro run` invocations are user-driven
 /// (not a service loop), so the race is bounded by how fast a human can press
 /// Enter twice. The overwrite bug, by contrast, hits any back-to-back run.
+/// Print the issue context banner if the run was launched with `--var id=<n>`
+/// and `gh` returns a usable summary (issue #309).
+///
+/// All silent-skip conditions (missing var, non-numeric value, `gh` not on
+/// PATH or returning non-zero) collapse to "no banner, no warning" so flows
+/// that don't follow the issue convention stay quiet. Returns `()` regardless;
+/// the banner is opportunistic and never aborts a run.
+fn try_print_issue_banner(template_vars: &HashMap<String, String>) {
+    let Some(raw) = template_vars.get("id").map(String::as_str) else {
+        return;
+    };
+    let Ok(id) = raw.parse::<u64>() else {
+        return;
+    };
+    let Some(summary) = github::fetch_issue_summary(id) else {
+        return;
+    };
+    ui::print_issue_banner(&summary);
+}
+
 fn unique_run_path(stack_path: &Path, base: &str) -> (String, PathBuf) {
     let direct = stack_path.join(base);
     if !direct.exists() {
@@ -2649,6 +2669,7 @@ mod flow_api {
             flow_config.steps.len(),
             agents.len(),
         );
+        super::try_print_issue_banner(&effective_vars);
 
         // ---- 8. DAG validation + backend list -------------------------
         let topo = dag::validate_dag(&flow_config)?;
@@ -3060,6 +3081,7 @@ mod flow_api {
             graph.states.len(),
             agents_by_id.len(),
         );
+        super::try_print_issue_banner(&effective_vars);
 
         // ---- Spawn driver task -----------------------------------------
         let state = Arc::new(RunState::default());
