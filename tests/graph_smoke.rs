@@ -110,11 +110,41 @@ fn install_shim(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     (dir, shim, log)
 }
 
+/// Install a `just` shim that exits with `code` regardless of arguments.
+///
+/// The seed flow's `verify` state (issue #310) runs `just lint && just
+/// test` -- a tempdir project has no Justfile, so the real `just` would
+/// error before the test could exercise routing. The shim lets the
+/// happy-path test simulate green CI (exit 0) and the failure-path test
+/// simulate red CI (non-zero) without a real toolchain on the runner.
+fn install_just_shim(code: i32) -> (tempfile::TempDir, PathBuf) {
+    let dir = tempfile::tempdir().expect("just-shim tempdir");
+    let shim = dir.path().join("just");
+    let script = format!("#!/bin/sh\nexit {code}\n");
+    std::fs::write(&shim, script).unwrap();
+    let mut perms = std::fs::metadata(&shim).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&shim, perms).unwrap();
+    (dir, shim)
+}
+
 /// Spawn `kuro run --file <flow>` from inside `project` with a sandboxed
 /// HOME so stack writes land in the test tempdir. `OLLAMA_PATH` is wired
 /// to the shim. `RUST_LOG` is stripped to keep stderr predictable.
-fn run_kuro(project: &Path, flow: &Path, shim: &Path, home_dir: &Path) -> std::process::Output {
+///
+/// `just_dir` is prepended to PATH so the seed flow's `verify` state
+/// resolves to the `just` shim installed by [`install_just_shim`]
+/// instead of whatever (if anything) the host has.
+fn run_kuro(
+    project: &Path,
+    flow: &Path,
+    shim: &Path,
+    home_dir: &Path,
+    just_dir: &Path,
+) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_kuro");
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{host_path}", just_dir.display());
     Command::new(bin)
         .args(["run", "--file"])
         .arg(flow)
@@ -122,6 +152,7 @@ fn run_kuro(project: &Path, flow: &Path, shim: &Path, home_dir: &Path) -> std::p
         .current_dir(project)
         .env("HOME", home_dir)
         .env("OLLAMA_PATH", shim)
+        .env("PATH", path)
         .env_remove("RUST_LOG")
         .output()
         .expect("spawn kuro run")
@@ -148,8 +179,8 @@ fn read_manifest(home: &Path, project_name: &str) -> String {
 fn happy_path_walks_design_to_done() {
     // AC2 (issue #241): smoke test runs the flow with a canned issue and
     // lands at a terminal state. This case verifies the longest valid
-    // walk through the graph: design -> implement -> review -> create_pr
-    // -> done.
+    // walk through the graph: design -> implement -> review -> verify
+    // (shell, exit 0, issue #310) -> create_pr -> done.
     let project = make_project();
     let project_name = project
         .path()
@@ -181,8 +212,12 @@ esac
 "#,
     );
 
+    // Green CI: `just` exits 0 so `verify` routes via `on: pass`.
+    let (_just_dir, just_shim) = install_just_shim(0);
+    let just_dir = just_shim.parent().unwrap();
+
     let home = tempfile::tempdir().expect("home tempdir");
-    let out = run_kuro(project.path(), &flow, &shim, home.path());
+    let out = run_kuro(project.path(), &flow, &shim, home.path(), just_dir);
 
     assert!(
         out.status.success(),
@@ -193,14 +228,16 @@ esac
         std::fs::read_to_string(&log).unwrap_or_default()
     );
 
-    // Manifest must have been written and reference all four agent-bearing
-    // states in declaration order. Final states (`done`, `aborted`) are not
+    // Manifest must have been written and reference all five non-terminal
+    // states in the happy walk. Final states (`done`, `aborted`) are not
     // expected to appear in `steps:` because the driver does not persist a
     // step record for them; instead, the terminal state lands in the
     // top-level `final_state:` field (issue #257) so audit consumers can
-    // tell `done` apart from `aborted` without grepping stderr.
+    // tell `done` apart from `aborted` without grepping stderr. `verify`
+    // is included to lock in that the deterministic gate (#310) shows up
+    // alongside agent steps in the manifest.
     let manifest = read_manifest(home.path(), &project_name);
-    for state in ["design", "implement", "review", "create_pr"] {
+    for state in ["design", "implement", "review", "verify", "create_pr"] {
         assert!(
             manifest.contains(state),
             "manifest must reference state '{state}', got:\n{manifest}"
@@ -209,6 +246,100 @@ esac
     assert!(
         manifest.contains("final_state: done"),
         "happy path must record `final_state: done` in the manifest, got:\n{manifest}"
+    );
+}
+
+#[test]
+fn verify_failure_loops_back_to_implement() {
+    // AC4 (issue #310): a non-zero `just` exit must route the run back
+    // through `implement` instead of progressing to `create_pr`. The
+    // visit cap (`DEFAULT_MAX_VISITS_PER_STATE`) eventually terminates
+    // the loop so the test does not hang -- we assert the run exited
+    // (non-zero, the cap fires `RunError::GraphRuntime`) and that the
+    // manifest records at least one shell step with a non-zero exit.
+    let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let flow = seed_flow_path();
+
+    let (_shim_dir, shim, _log) = install_shim(
+        r#"case "$PROMPT" in
+  *'state `design`'*)
+    printf '{"transition": "design_complete", "reason": "plan ready"}\n'
+    ;;
+  *'state `implement`'*)
+    printf '{"transition": "implementation_complete", "reason": "code in"}\n'
+    ;;
+  *'state `review`'*)
+    printf '{"transition": "approved", "reason": "criteria met"}\n'
+    ;;
+  *'state `create_pr`'*)
+    printf '{"transition": "pr_created", "reason": "draft pr opened"}\n'
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+
+    // Red CI: `just` always exits non-zero, so `verify` routes via
+    // `on: fail` back to `implement`. With every agent state happy and
+    // `verify` always red, the loop runs until the visit cap aborts.
+    let (_just_dir, just_shim) = install_just_shim(1);
+    let just_dir = just_shim.parent().unwrap();
+
+    let home = tempfile::tempdir().expect("home tempdir");
+    let out = run_kuro(project.path(), &flow, &shim, home.path(), just_dir);
+    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+
+    assert!(
+        !out.status.success(),
+        "loop must abort with non-zero exit (visit cap), got status={:?}\nstderr={stderr}",
+        out.status,
+    );
+
+    // GraphRuntime errors abort before the manifest is written, but the
+    // per-step records are persisted live as the driver walks. Assert
+    // that at least one verify-shell-step landed on disk and that its
+    // meta.yaml records `type: shell` with a non-zero exit code.
+    let stacks = home.path().join(".koto/stacks").join(&project_name);
+    let run_dir = std::fs::read_dir(&stacks)
+        .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .max()
+        .unwrap_or_else(|| panic!("no run directories under {}", stacks.display()));
+    let steps_dir = run_dir.join("steps");
+    let verify_metas: Vec<PathBuf> = std::fs::read_dir(&steps_dir)
+        .unwrap_or_else(|e| panic!("read steps dir {}: {e}", steps_dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with("-verify.meta.yaml"))
+        })
+        .collect();
+    assert!(
+        !verify_metas.is_empty(),
+        "expected at least one verify shell step on disk under {}\nstderr was:\n{stderr}",
+        steps_dir.display()
+    );
+    let meta = std::fs::read_to_string(&verify_metas[0]).unwrap();
+    assert!(
+        meta.contains("type: shell"),
+        "verify step meta.yaml must record `type: shell`, got:\n{meta}"
+    );
+    assert!(
+        !meta.contains("exit_code: 0"),
+        "verify step meta.yaml must record a non-zero exit code, got:\n{meta}"
     );
 }
 
@@ -240,8 +371,13 @@ esac
 "#,
     );
 
+    // No verify gate fires on this path (`design` aborts immediately),
+    // but `run_kuro` still wants a `just_dir`. An empty tempdir is fine.
+    let (_just_dir, just_shim) = install_just_shim(0);
+    let just_dir = just_shim.parent().unwrap();
+
     let home = tempfile::tempdir().expect("home tempdir");
-    let out = run_kuro(project.path(), &flow, &shim, home.path());
+    let out = run_kuro(project.path(), &flow, &shim, home.path(), just_dir);
 
     assert!(
         out.status.success(),

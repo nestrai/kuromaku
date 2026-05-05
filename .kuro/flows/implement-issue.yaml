@@ -8,7 +8,9 @@
 # Topology:
 #   design (architect) --design_complete--> implement (developer)
 #   implement --implementation_complete--> review (reviewer)
-#   review   --approved--> pr --pr_created--> done
+#   review   --approved--> verify (shell: just lint && just test)
+#   verify   --verify_passed--> pr --pr_created--> done
+#   verify   --verify_failed--> implement (with captured output as context)
 #
 # Usage: kuro run implement-issue --var id=42
 version: "1"
@@ -69,7 +71,7 @@ states:
       is PASS.
     edges:
       approved:
-        to: pr
+        to: verify
         description: All acceptance criteria met, code quality acceptable.
       changes_implementation:
         to: implement
@@ -80,6 +82,28 @@ states:
       blocked:
         to: aborted
         description: Review cannot complete.
+
+  # Deterministic verify gate (issue #310). No agent, no LLM call --
+  # exit code from `just lint && just test` decides routing. The captured
+  # stdout/stderr/exit-code is threaded into Noah's next prompt verbatim
+  # via the graph driver's prior_context plumbing, so a failing test
+  # routes back to `implement` with the real failure in context instead
+  # of a Bella-paraphrased restatement.
+  verify:
+    kind: shell
+    command: "just lint && just test"
+    description: |
+      Deterministic gate -- shell exit code routes the next state.
+      No model call.
+    edges:
+      verify_passed:
+        to: pr
+        on: pass
+        description: All checks green, ready to open the PR.
+      verify_failed:
+        to: implement
+        on: fail
+        description: Lint or tests failed -- captured output is injected into the implementer's next prompt.
 
   # Step id `pr` (not `create_pr`) so the `implement_issue` MCP tool's
   # REQUIRED_STEP_IDS pre-flight matches both this graph and the linear

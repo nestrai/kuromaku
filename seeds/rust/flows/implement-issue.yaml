@@ -53,7 +53,7 @@ states:
       Review the implementation against the issue's acceptance criteria.
     edges:
       approved:
-        to: create_pr
+        to: verify
         description: All acceptance criteria met, code quality acceptable.
       changes_implementation:
         to: implement
@@ -64,6 +64,28 @@ states:
       blocked:
         to: aborted
         description: Review cannot complete.
+
+  # Deterministic verify gate (issue #310): runs the project's lint and
+  # test commands, routes on the exit code, no LLM call. The shell is
+  # the source of truth for "does it compile and tests pass" -- the
+  # reviewer is left to judge meaning, not correctness. The captured
+  # output is threaded into the next state's prior_context so a failing
+  # test routes back to `implement` with the real failure in view.
+  verify:
+    kind: shell
+    command: "just lint && just test"
+    description: |
+      Deterministic gate -- shell exit code routes the next state.
+      No model call.
+    edges:
+      verify_passed:
+        to: create_pr
+        on: pass
+        description: All checks green, ready to open the PR.
+      verify_failed:
+        to: implement
+        on: fail
+        description: Lint or tests failed -- captured output is injected into the implementer's next prompt.
 
   create_pr:
     role: developer
