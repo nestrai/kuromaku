@@ -410,10 +410,12 @@ pub struct GraphFlow {
 /// A non-terminal state declares `edges:`. A terminal state declares
 /// `kind: final`. A human-handoff state declares `kind: human` (and may
 /// also declare `edges:` for the resume-* targets shown in the design
-/// doc). A state with neither `edges:` nor a terminal `kind:` is a
-/// dead end -- this is caught by [`validate_graph_reachability`] as a
-/// hard error, not at the schema layer, so the dead-end branch is
-/// reachable from real YAML and AC5 can be verified end-to-end.
+/// doc). A `kind: shell` state runs a deterministic command, no agent
+/// or LLM call -- the exit code routes the next transition (issue #310).
+/// A state with neither `edges:` nor a terminal `kind:` is a dead end --
+/// this is caught by [`validate_graph_reachability`] as a hard error,
+/// not at the schema layer, so the dead-end branch is reachable from
+/// real YAML and AC5 can be verified end-to-end.
 ///
 /// `description:` is optional and free-form: it carries human intent
 /// for the state ("happy-path exit", "early abort", "design gets
@@ -438,6 +440,11 @@ pub struct GraphState {
     /// [`resolve_graph_external_prompts`] runs this is always `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_file: Option<String>,
+    /// Shell command for `kind: shell` states (issue #310). Required when
+    /// `kind: shell`, forbidden on every other state shape. Variable
+    /// substitution (`{{vars.X}}`) applies the same way as on `task:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
     /// Free-form intent for this state. Optional everywhere; a soft
     /// warning surfaces when a terminal state omits it (see
     /// [`validate_graph_reachability`]).
@@ -451,26 +458,52 @@ pub struct GraphState {
     pub edges: Option<IndexMap<String, GraphEdge>>,
 }
 
-/// Terminal-state discriminator. `final` ends the run; `human` hands off
-/// to a human operator. Both are accepted at the schema level here --
-/// runtime semantics for `human` (resume, abort) are owned by the driver
-/// issue.
+/// Terminal- or non-LLM-state discriminator.
+///
+/// * `final` ends the run.
+/// * `human` hands off to a human operator.
+/// * `shell` runs a configured command and routes on the exit code
+///   (issue #310). Counts toward the visit caps the same way an
+///   agent state does.
+///
+/// All three are accepted at the schema level here -- runtime semantics
+/// for `human` (resume, abort) are owned by the driver issue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StateKind {
     Final,
     Human,
+    Shell,
 }
 
-/// One outgoing transition from a state. Both fields are required:
-/// `to:` so the runtime knows where to go, `description:` so the agent
-/// (or human) understands when to pick this edge. Missing either is a
-/// serde-level error.
+/// Edge-routing tag for `kind: shell` states (issue #310).
+///
+/// The shell exit code picks the edge: `0` selects the first edge tagged
+/// `on: pass`, non-zero selects the first edge tagged `on: fail`. The
+/// tag is required on every edge of a shell state and rejected on every
+/// other state shape -- positional-by-declaration-order routing was
+/// considered and rejected because reordering YAML keys would silently
+/// re-route the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EdgeOn {
+    Pass,
+    Fail,
+}
+
+/// One outgoing transition from a state. `to:` and `description:` are
+/// required; missing either is a serde-level error.
+///
+/// `on:` is the routing tag for `kind: shell` edges (issue #310). The
+/// validator requires it on every edge of a shell state and rejects it
+/// on edges of any other state shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphEdge {
     pub to: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<EdgeOn>,
 }
 
 /// Probe struct used by [`load_flow_any_from_str`] to decide which shape
@@ -896,6 +929,101 @@ fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
                         "graph state '{id}' edge '{edge_name}' targets unknown state '{}' (known states: {})",
                         edge.to,
                         sorted_state_ids(&g.states).join(", ")
+                    )));
+                }
+            }
+        }
+        validate_shell_state_semantics(id, state)?;
+    }
+
+    Ok(())
+}
+
+/// Schema-level checks for `kind: shell` states (issue #310).
+///
+/// A shell state is a deterministic exit-code-routed gate. To prevent
+/// it from collapsing into something it isn't, we reject:
+///
+/// * `kind: shell` without `command:` (nothing to run)
+/// * `kind: shell` with an empty `command:` (silent no-op)
+/// * `kind: shell` with `role:`, `task:`, or `task_file:` (those belong
+///   to LLM states; mixing them is almost certainly a typo)
+/// * `kind: shell` without `edges:` or with no `on: pass` / `on: fail`
+///   pair (the runtime would have nowhere to route)
+/// * `kind: shell` self-loops (a shell can't recover from its own
+///   failure -- the implementer or human must)
+/// * `command:` on any non-shell state (it would be silently ignored)
+/// * `on:` on edges of any non-shell state (only meaningful as a routing
+///   tag for shell exit codes)
+///
+/// Errors name the offending state and field so the user can jump to the
+/// problem in the YAML.
+fn validate_shell_state_semantics(id: &str, state: &GraphState) -> Result<(), ConfigError> {
+    let is_shell = matches!(state.kind, Some(StateKind::Shell));
+
+    if is_shell {
+        match state.command.as_deref().map(str::trim) {
+            Some(cmd) if !cmd.is_empty() => {}
+            _ => {
+                return Err(ConfigError::Validation(format!(
+                    "graph state '{id}' is `kind: shell` but has no non-empty `command:` -- declare the shell command to run"
+                )));
+            }
+        }
+        if state.role.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' is `kind: shell` and must not declare `role:` -- shell states have no agent"
+            )));
+        }
+        if state.task.is_some() || state.task_file.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' is `kind: shell` and must not declare `task:` or `task_file:` -- shell states do not run an LLM"
+            )));
+        }
+        let edges = state.edges.as_ref().ok_or_else(|| {
+            ConfigError::Validation(format!(
+                "graph state '{id}' is `kind: shell` and must declare `edges:` with both an `on: pass` and an `on: fail` target"
+            ))
+        })?;
+        let mut has_pass = false;
+        let mut has_fail = false;
+        for (edge_name, edge) in edges {
+            match edge.on {
+                Some(EdgeOn::Pass) => has_pass = true,
+                Some(EdgeOn::Fail) => has_fail = true,
+                None => {
+                    return Err(ConfigError::Validation(format!(
+                        "graph state '{id}' edge '{edge_name}' must declare `on: pass` or `on: fail` -- every edge of a `kind: shell` state is exit-code-routed"
+                    )));
+                }
+            }
+            if edge.to == id {
+                return Err(ConfigError::Validation(format!(
+                    "graph state '{id}' edge '{edge_name}' is a self-loop -- a `kind: shell` state cannot recover from its own failure, route to a different state"
+                )));
+            }
+        }
+        if !has_pass {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' is `kind: shell` and must declare at least one edge with `on: pass`"
+            )));
+        }
+        if !has_fail {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' is `kind: shell` and must declare at least one edge with `on: fail`"
+            )));
+        }
+    } else {
+        if state.command.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' declares `command:` but is not `kind: shell` -- `command:` is only valid on shell states"
+            )));
+        }
+        if let Some(edges) = &state.edges {
+            for (edge_name, edge) in edges {
+                if edge.on.is_some() {
+                    return Err(ConfigError::Validation(format!(
+                        "graph state '{id}' edge '{edge_name}' declares `on:` but the state is not `kind: shell` -- `on:` is only valid on shell-state edges"
                     )));
                 }
             }
@@ -3856,6 +3984,7 @@ states:
                 GraphEdge {
                     to: to.to_string(),
                     description: format!("go to {to}"),
+                    on: None,
                 },
             );
         }
@@ -3864,6 +3993,7 @@ states:
             role: Some("developer".to_string()),
             task: None,
             task_file: None,
+            command: None,
             description: None,
             edges: Some(map),
         }
@@ -3879,6 +4009,7 @@ states:
             role: None,
             task: None,
             task_file: None,
+            command: None,
             description: Some("Test terminal state.".to_string()),
             edges: None,
         }
@@ -3892,6 +4023,7 @@ states:
             role: None,
             task: None,
             task_file: None,
+            command: None,
             description: None,
             edges: None,
         }
@@ -3944,6 +4076,7 @@ states:
             role: Some("developer".to_string()),
             task: None,
             task_file: None,
+            command: None,
             description: None,
             edges: None, // no kind, no edges -- dead end
         };
@@ -4094,6 +4227,7 @@ states:
             role: Some("developer".to_string()),
             task: None,
             task_file: None,
+            command: None,
             description: None,
             edges: None,
         };
@@ -4747,5 +4881,292 @@ states:
         assert_eq!(g.prompt.as_deref(), Some("intro"));
         assert_eq!(g.states["design"].task.as_deref(), Some("design"));
         drop(tmp);
+    }
+
+    // --- `kind: shell` schema validation (issue #310) -------------------
+    //
+    // The shell-state contract is enforced at parse time so a misshapen
+    // verify gate is rejected long before the runner spawns anything.
+    // Each test pins one rule from `validate_shell_state_semantics` and
+    // names the field the user would need to fix.
+
+    /// Helper: minimal three-state graph with a `kind: shell` `verify`
+    /// state between `a` and the two terminal states. Tests mutate the
+    /// returned YAML to flip one field at a time.
+    fn shell_yaml(verify_block: &str) -> String {
+        format!(
+            r#"
+version: "1"
+name: shell-test
+initial: a
+states:
+  a:
+    role: developer
+    edges:
+      go:
+        to: verify
+        description: run verify
+{verify_block}
+  done:
+    kind: final
+    description: pass
+  back:
+    role: developer
+    edges:
+      retry:
+        to: verify
+        description: try again
+"#
+        )
+    }
+
+    #[test]
+    fn kind_shell_requires_command() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+      bad:
+        to: back
+        on: fail
+        description: red
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify") && msg.contains("command"),
+            "expected error naming state and command field, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn kind_shell_rejects_empty_command() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "   "
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+      bad:
+        to: back
+        on: fail
+        description: red
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn kind_shell_rejects_role() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "true"
+    role: developer
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+      bad:
+        to: back
+        on: fail
+        description: red
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify") && msg.contains("role"),
+            "expected error mentioning role on shell state, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn kind_shell_rejects_task() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "true"
+    task: "do the thing"
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+      bad:
+        to: back
+        on: fail
+        description: red
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("verify") && msg.contains("task"),
+            "expected error mentioning task on shell state, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn kind_shell_requires_pass_edge() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "true"
+    edges:
+      bad:
+        to: back
+        on: fail
+        description: red
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        assert!(err.to_string().contains("on: pass"));
+    }
+
+    #[test]
+    fn kind_shell_requires_fail_edge() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "true"
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        assert!(err.to_string().contains("on: fail"));
+    }
+
+    #[test]
+    fn kind_shell_rejects_untagged_edge() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "true"
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+      stray:
+        to: back
+        description: missing on
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("stray") && (msg.contains("on: pass") || msg.contains("on: fail")),
+            "expected error naming the untagged edge, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn kind_shell_rejects_self_loop() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "true"
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+      bad:
+        to: verify
+        on: fail
+        description: loop to self
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("self-loop") && msg.contains("verify"),
+            "expected self-loop error naming state, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn command_forbidden_on_agent_state() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    role: developer
+    command: "true"
+    edges:
+      go:
+        to: done
+        description: done
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("command") && msg.contains("kind: shell"),
+            "expected error stating command is shell-only, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn on_field_forbidden_on_agent_edges() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    role: developer
+    edges:
+      go:
+        to: done
+        on: pass
+        description: green
+"#,
+        );
+        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("on:") && msg.contains("kind: shell"),
+            "expected error stating on: is shell-only, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn kind_shell_round_trips() {
+        let yaml = shell_yaml(
+            r#"  verify:
+    kind: shell
+    command: "just lint && just test"
+    edges:
+      ok:
+        to: done
+        on: pass
+        description: green
+      bad:
+        to: back
+        on: fail
+        description: red
+"#,
+        );
+        let flow = load_flow_any_from_str(&yaml).unwrap();
+        let g = match flow {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph"),
+        };
+        let verify = &g.states["verify"];
+        assert_eq!(verify.kind, Some(StateKind::Shell));
+        assert_eq!(verify.command.as_deref(), Some("just lint && just test"));
+        let edges = verify.edges.as_ref().unwrap();
+        assert_eq!(edges["ok"].on, Some(EdgeOn::Pass));
+        assert_eq!(edges["bad"].on, Some(EdgeOn::Fail));
     }
 }
