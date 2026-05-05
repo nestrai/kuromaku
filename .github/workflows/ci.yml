@@ -1,3 +1,12 @@
+# CI runs every job inside the project's flake devShell so the toolchain in
+# CI is the exact one pinned by flake.lock and used locally via `nix develop`.
+#
+# Do NOT replace this with `dtolnay/rust-toolchain` + `Swatinem/rust-cache` +
+# `extractions/setup-just`. That setup pulls a floating "stable" at workflow-run
+# time and bypasses flake.lock, which breaks local==CI parity. See
+# docs/decisions/0008-ci-uses-flake-devshell.md and issue #303 for the
+# rationale before changing this.
+
 name: ci
 
 on:
@@ -14,27 +23,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: cachix/install-nix-action@v27
         with:
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
-      - run: just lint
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - run: nix develop --command just lint
 
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
-      - run: just build
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - run: nix develop --command just build
 
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - uses: extractions/setup-just@v3
-      - run: just test
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - run: nix develop --command just test
