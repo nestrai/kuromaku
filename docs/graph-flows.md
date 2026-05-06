@@ -111,7 +111,6 @@ optional reason. Supported formats:
 
 ```yaml
 next:
-  - target                      # bare string, no reason
   - target: "reason"            # single reason
   - target: ["reason1", "r2"]   # list of reasons (OR-combined)
   - target: |                   # multiline reason
