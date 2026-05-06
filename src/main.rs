@@ -7,6 +7,7 @@ use color_eyre::eyre::eyre;
 
 mod chat;
 mod config;
+mod config_md;
 mod dag;
 #[allow(dead_code)]
 mod executor;
@@ -119,9 +120,10 @@ enum Command {
     /// on warnings only (e.g. unreachable states). Warnings and errors
     /// route to stderr; stdout stays clean for machine-readable use.
     Validate {
-        /// Flow name (looked up in seeds under `flows/<name>.yaml`) or a
-        /// path to a flow YAML file. Path is tried first; falls back to
-        /// the seed-based lookup if the value is not an existing file.
+        /// Flow name (looked up in seeds under `flows/<name>.yaml` or
+        /// `flows/<name>.md`) or a path to a flow file. Path is tried
+        /// first; falls back to the seed-based lookup if the value is
+        /// not an existing file.
         flow: String,
     },
     /// Fetch skills from remote sources pinned in .kuro/skills.lock
