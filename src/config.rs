@@ -381,7 +381,7 @@ pub enum Flow {
 /// State-graph flow definition.
 ///
 /// Issue #317 redesign: the top-level key is `graph:` (not `states:`),
-/// transitions use `select:` lists (not `edges:`), shell states use
+/// transitions use `next:` lists (not `edges:`), shell states use
 /// `run:` (not `kind: shell` + `command:`), and terminal states use
 /// `final:` (not `kind: final` + `description:`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -413,11 +413,11 @@ pub struct GraphFlow {
 ///
 /// Three state shapes:
 ///
-/// * **Agent state**: has `role:`, `task:`, and `select:`. The runtime
-///   asks the bound agent to pick one of the `select:` targets.
-/// * **Shell state**: has `run:` and `select:`. The runtime executes
+/// * **Agent state**: has `role:`, `task:`, and `next:`. The runtime
+///   asks the bound agent to pick one of the `next:` targets.
+/// * **Shell state**: has `run:` and `next:`. The runtime executes
 ///   the command via `sh -c` and routes by exit code (`pass`/`fail`
-///   reserved reason words in `select:`).
+///   reserved reason words in `next:`).
 /// * **Final state**: has `final: "description"`. Terminates the run.
 /// * **Human state**: has `human: true`. Accepted at schema level but
 ///   not runtime-supported yet.
@@ -453,8 +453,8 @@ pub struct GraphState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human: Option<bool>,
     /// Outgoing transitions. Each entry maps a target state name to an
-    /// optional reason string. Replaces the old `edges:` map.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// optional reason string. The YAML key is `next:`.
+    #[serde(default, rename = "next", skip_serializing_if = "Option::is_none")]
     pub select: Option<Vec<SelectEntry>>,
 }
 
@@ -480,7 +480,7 @@ impl GraphState {
     }
 }
 
-/// One entry in a state's `select:` list.
+/// One entry in a state's `next:` list.
 ///
 /// YAML forms:
 /// - `- target` (bare string, no reason)
@@ -1044,9 +1044,9 @@ fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
 ///   one with `pass` reason and one with `fail` reason. No self-loops.
 ///   `run:` must be non-empty.
 /// * **Final states** (`final:` present): the description string must
-///   be non-empty. Must not have `select:`, `role:`, `task:`, `run:`.
-/// * **Human states** (`human: true`): schema-accepted, may have `select:`.
-/// * **Agent states** (none of the above): must have `select:` with at
+///   be non-empty. Must not have `next:`, `role:`, `task:`, `run:`.
+/// * **Human states** (`human: true`): schema-accepted, may have `next:`.
+/// * **Agent states** (none of the above): must have `next:` with at
 ///   least 2 entries, each with a non-empty reason.
 /// * Mutual exclusion: `run:`, `final:`, and `human:` are pairwise
 ///   exclusive.
@@ -1090,7 +1090,7 @@ fn validate_state_semantics(id: &str, state: &GraphState) -> Result<(), ConfigEr
         }
         let entries = state.select.as_ref().ok_or_else(|| {
             ConfigError::Validation(format!(
-                "graph state '{id}' has `run:` and must declare `select:` with both a `pass` and a `fail` target"
+                "graph state '{id}' has `run:` and must declare `next:` with both a `pass` and a `fail` target"
             ))
         })?;
         if entries.len() != 2 {
@@ -1145,7 +1145,7 @@ fn validate_state_semantics(id: &str, state: &GraphState) -> Result<(), ConfigEr
         }
         if state.role.is_some() || state.task.is_some() || state.select.is_some() {
             return Err(ConfigError::Validation(format!(
-                "graph state '{id}' is `final:` and must not declare `role:`, `task:`, or `select:`"
+                "graph state '{id}' is `final:` and must not declare `role:`, `task:`, or `next:`"
             )));
         }
     } else if state.is_human() {
@@ -3711,7 +3711,7 @@ graph:
     role: developer
     task: |
       Do the first thing.
-    select:
+    next:
       - middle: "Things went well."
       - aborted: "Cannot proceed."
 
@@ -3719,13 +3719,13 @@ graph:
     role: reviewer
     task: |
       Check the result.
-    select:
+    next:
       - done: "Looks good."
       - start: "Needs another round."
 
   human_review:
     human: true
-    select:
+    next:
       - middle: "Operator unblocks the review."
       - aborted: "Operator aborts the run."
 
@@ -3833,7 +3833,7 @@ initial: start
 graph:
   start:
     role: developer
-    select:
+    next:
       - ghost: "Goes nowhere real."
       - done: "ok"
   done:
@@ -3922,14 +3922,14 @@ initial: start
 graph:
   start:
     run: "true"
-    select:
+    next:
       - done: pass
       - back: fail
   done:
     final: "end"
   back:
     run: "false"
-    select:
+    next:
       - done: pass
       - start: fail
 "#;
@@ -3955,14 +3955,14 @@ initial: start
 graph:
   start:
     role: developer
-    select:
+    next:
       - done: ["reason one", "reason two"]
       - back: "fallback"
   done:
     final: "end"
   back:
     role: developer
-    select:
+    next:
       - done: "ok"
       - start: "retry"
 "#;
@@ -3991,7 +3991,7 @@ graph:
   start:
     role: developer
     typo_field: oops
-    select:
+    next:
       - done: "ok"
       - start: "retry"
   done:
@@ -4354,7 +4354,7 @@ initial: start
 graph:
   start:
     role: developer
-    select:
+    next:
       - done: "Looks good."
       - ask_human: "Need a person."
   ask_human:
@@ -4379,7 +4379,7 @@ graph:
   start:
     role: developer
     descriptionn: oops
-    select:
+    next:
       - done: "ok"
       - start: "retry"
   done:
@@ -4440,7 +4440,7 @@ initial: start
 graph:
   start:
     role: developer
-    select:
+    next:
       - done: "ok"
       - start: "retry"
   done:
@@ -4488,7 +4488,7 @@ initial: start
 graph:
   start:
     role: dev
-    select:
+    next:
       - done: "continue"
       - start: "retry"
   done:
@@ -4509,7 +4509,7 @@ graph:
   start:
     role: dev
     task_file: prompts/start.md
-    select:
+    next:
       - done: "continue"
       - start: "retry"
   done:
@@ -4553,7 +4553,7 @@ graph:
   design:
     role: architect
     task_file: prompts/design.md
-    select:
+    next:
       - done: "continue"
       - design: "retry"
   done:
@@ -4601,7 +4601,7 @@ graph:
     role: architect
     task: inline
     task_file: prompts/design.md
-    select:
+    next:
       - done: "continue"
       - design: "retry"
   done:
@@ -4644,7 +4644,7 @@ graph:
   design:
     role: architect
     task_file: prompts/missing.md
-    select:
+    next:
       - done: "continue"
       - design: "retry"
   done:
@@ -4680,7 +4680,7 @@ graph:
   design:
     role: architect
     task_file: ../escape.md
-    select:
+    next:
       - done: "continue"
       - design: "retry"
   done:
@@ -4808,7 +4808,7 @@ graph:
   design:
     role: architect
     task_file: design.md
-    select:
+    next:
       - done: "continue"
       - design: "retry"
   done:
@@ -4846,7 +4846,7 @@ initial: a
 graph:
   a:
     role: developer
-    select:
+    next:
       - verify: "run verify"
       - done: "skip verify"
 {verify_block}
@@ -4854,7 +4854,7 @@ graph:
     final: "pass"
   back:
     role: developer
-    select:
+    next:
       - verify: "try again"
       - done: "give up"
 "#
@@ -4866,7 +4866,7 @@ graph:
         let yaml = shell_yaml(
             r#"  verify:
     run: "   "
-    select:
+    next:
       - done: pass
       - back: fail
 "#,
@@ -4881,7 +4881,7 @@ graph:
             r#"  verify:
     run: "true"
     role: developer
-    select:
+    next:
       - done: pass
       - back: fail
 "#,
@@ -4900,7 +4900,7 @@ graph:
             r#"  verify:
     run: "true"
     task: "do the thing"
-    select:
+    next:
       - done: pass
       - back: fail
 "#,
@@ -4918,7 +4918,7 @@ graph:
         let yaml = shell_yaml(
             r#"  verify:
     run: "true"
-    select:
+    next:
       - back: fail
       - done: fail
 "#,
@@ -4932,7 +4932,7 @@ graph:
         let yaml = shell_yaml(
             r#"  verify:
     run: "true"
-    select:
+    next:
       - done: pass
       - back: pass
 "#,
@@ -4946,7 +4946,7 @@ graph:
         let yaml = shell_yaml(
             r#"  verify:
     run: "true"
-    select:
+    next:
       - done: pass
       - verify: fail
 "#,
@@ -4964,7 +4964,7 @@ graph:
         let yaml = shell_yaml(
             r#"  verify:
     run: "just lint && just test"
-    select:
+    next:
       - done: pass
       - back: fail
 "#,

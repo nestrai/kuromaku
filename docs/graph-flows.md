@@ -39,13 +39,13 @@ graph:
   design:
     role: architect
     task: ...
-    select:
+    next:
       - implement: "plan complete"
       - aborted: "missing context, cannot plan"
   implement:
     role: developer
     task: ...
-    select:
+    next:
       - review: "all design items implemented"
       - design: "design flaw found, need to revisit"
       - aborted: "cannot proceed safely"
@@ -56,7 +56,7 @@ graph:
 ```
 
 A graph flow is a state machine. The runtime starts at `initial:`,
-shows the agent the `select:` targets of the current state, and the
+shows the agent the `next:` targets of the current state, and the
 agent replies with `{"transition": "<target-state>", "reason": "..."}`.
 The runtime jumps to the target state and repeats. The run terminates
 at a state with `final:`, or aborts after the configured `max_steps`
@@ -64,24 +64,24 @@ budget (currently 30) to bound runaway loops.
 
 ### State shapes
 
-**Agent state** -- has `role:`, `task:`, and `select:`:
+**Agent state** -- has `role:`, `task:`, and `next:`:
 
 ```yaml
 design:
   role: architect
   task: |
     Read the issue, produce a plan.
-  select:
+  next:
     - implement: "plan complete"
     - aborted: "cannot plan"
 ```
 
-**Shell state** -- has `run:` and `select:` with `pass`/`fail` reasons:
+**Shell state** -- has `run:` and `next:` with `pass`/`fail` reasons:
 
 ```yaml
 verify:
   run: just lint && just test
-  select:
+  next:
     - create-pr: pass
     - implement: fail
 ```
@@ -99,18 +99,18 @@ runtime-supported):
 ```yaml
 operator:
   human: true
-  select:
+  next:
     - middle: "Operator unblocks."
     - aborted: "Operator aborts."
 ```
 
-### `select:` entries
+### `next:` entries
 
-Each entry in a state's `select:` list maps a target state to an
+Each entry in a state's `next:` list maps a target state to an
 optional reason. Supported formats:
 
 ```yaml
-select:
+next:
   - target                      # bare string, no reason
   - target: "reason"            # single reason
   - target: ["reason1", "r2"]   # list of reasons (OR-combined)
@@ -172,13 +172,13 @@ graph:
   design:
     role: architect
     task_file: prompts/design.md          # per-state
-    select:
+    next:
       - implement: "plan complete"
       - aborted: "cannot plan"
   implement:
     role: developer
     task_file: prompts/implement.md
-    select:
+    next:
       - done: "all items done"
       - design: "design flaw"
   done:
@@ -236,20 +236,20 @@ graph:
   review:
     role: reviewer
     task: ...
-    select:
+    next:
       - verify: "all criteria met"
       - implement: "code-level changes needed"
 
   verify:
     run: just lint && just test
-    select:
+    next:
       - create-pr: pass
       - implement: fail
 
   create-pr:
     role: developer
     task: ...
-    select:
+    next:
       - done: "PR opened"
       - aborted: "PR creation failed"
 ```
@@ -269,7 +269,7 @@ JSON.
 | Field | Required | Notes |
 |--|--|--|
 | `run:` | yes | The shell command, run via `sh -c`. |
-| `select:` | yes | Exactly 2 entries: one `pass`, one `fail`. |
+| `next:` | yes | Exactly 2 entries: one `pass`, one `fail`. |
 | `role:`, `task:`, `task_file:` | rejected | Shell states have no agent. |
 
 Self-loops on shell states are rejected: a shell command cannot
@@ -305,7 +305,7 @@ to `task:` strings, so a flow can parameterize the gate:
 ```yaml
 verify:
   run: "cargo test --test {{vars.suite}}"
-  select:
+  next:
     - pr: pass
     - implement: fail
 ```

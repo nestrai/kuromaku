@@ -148,13 +148,13 @@ graph:
   start:
     role: dev
     task: "say hi"
-    select:
+    next:
       - middle: "Move to the middle state."
       - done: "Skip to done."
   middle:
     role: dev
     task: "look around"
-    select:
+    next:
       - done: "Move to the final state."
       - start: "Go back."
   done:
@@ -361,12 +361,12 @@ initial: a
 graph:
   a:
     role: dev
-    select:
+    next:
       - b: "go to b"
       - a: "stay"
   b:
     role: dev
-    select:
+    next:
       - a: "back to a"
       - b: "stay"
 "#;

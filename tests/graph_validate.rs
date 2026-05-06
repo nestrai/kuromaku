@@ -34,7 +34,7 @@ initial: start
 graph:
   start:
     role: developer
-    select:
+    next:
       - done: "Looks good."
       - start: "Retry."
   done:
@@ -54,7 +54,7 @@ initial: start
 graph:
   start:
     role: developer
-    select:
+    next:
       - dead: "Walk into the dead end."
       - start: "Loop."
   dead:
@@ -80,14 +80,14 @@ initial: start
 graph:
   start:
     role: developer
-    select:
+    next:
       - done: "Done."
       - start: "Loop."
   done:
     final: "Happy-path exit."
   orphan:
     role: reviewer
-    select:
+    next:
       - done: "Loops back."
       - start: "Go to start."
 "#;
@@ -337,7 +337,7 @@ graph:
   design:
     role: developer
     task_file: prompts/design.md
-    select:
+    next:
       - done: "Move on."
       - design: "Retry."
   done:
