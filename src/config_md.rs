@@ -45,6 +45,8 @@ enum Phase {
     StateBody,
     /// Collecting `->` transition lines.
     Transitions,
+    /// Between states (after `---` or flush). Only `##` and `---` allowed.
+    BetweenStates,
 }
 
 struct ParseState {
@@ -239,21 +241,10 @@ fn parse_line(st: &mut ParseState, line: &str, ln: usize) -> Result<(), ConfigEr
                 st.flush_state()?;
                 start_state(st, line, ln)?;
             } else if line.trim() == "---" {
-                // Could be decorative separator between states
-                // If we're in body and hit ---, flush and go back to expecting ## or ->
-                // Actually, --- between states is decorative. But we might still be in body.
-                // Let's just treat it as body -- it's ignored cosmetically per the spec.
-                // Wait, spec says "--- between states is decorative, ignored by parser."
-                // But we don't know if this --- is between states or in body.
-                // The safest approach: if we're in StateBody, a --- that's NOT followed
-                // by ## or -> is body text. But we can't look ahead.
-                // The spec says `### Next` is cosmetic too. Let's just allow --- in body
-                // and also allow it to terminate body when followed by ## on next line.
-                // Actually, re-reading the spec: `---` between states is decorative.
-                // In practice, the --- comes AFTER transitions and BEFORE the next ##.
-                // So when we're in StateBody, a --- should flush the state.
                 st.flush_state()?;
-                st.phase = Phase::FlowPrompt; // will catch next ## heading
+                st.phase = Phase::BetweenStates;
+            } else if line.trim() == "### Next" || line.trim() == "### next" {
+                // Cosmetic heading before transitions -- skip it
             } else {
                 st.current_body_lines.push(line.to_string());
             }
@@ -267,11 +258,25 @@ fn parse_line(st: &mut ParseState, line: &str, ln: usize) -> Result<(), ConfigEr
                 start_state(st, line, ln)?;
             } else if line.trim() == "---" {
                 st.flush_state()?;
-                st.phase = Phase::FlowPrompt;
+                st.phase = Phase::BetweenStates;
             } else if line.trim().is_empty() {
                 // Blank line after transitions, ignore
             } else {
-                // Could be cosmetic text after transitions, ignore
+                return Err(ConfigError::Validation(format!(
+                    "line {ln}: unexpected text after transitions, expected `->`, `##`, or `---`: {line}"
+                )));
+            }
+        }
+
+        Phase::BetweenStates => {
+            if line.starts_with("## ") {
+                start_state(st, line, ln)?;
+            } else if line.trim() == "---" || line.trim().is_empty() {
+                // Decorative separators and blank lines between states
+            } else {
+                return Err(ConfigError::Validation(format!(
+                    "line {ln}: unexpected text between states, expected `##` or `---`: {line}"
+                )));
             }
         }
     }
@@ -293,9 +298,17 @@ fn start_state(st: &mut ParseState, line: &str, _ln: usize) -> Result<(), Config
 }
 
 /// Check if a line is an italic metadata line: `*key: value*`
+/// Only the three known keys are recognized to avoid matching
+/// stray italic prose like `*remember: do not delete files*`.
 fn is_italic_meta(line: &str) -> bool {
     let trimmed = line.trim();
-    trimmed.starts_with('*') && trimmed.ends_with('*') && trimmed.contains(':')
+    if !(trimmed.starts_with('*') && trimmed.ends_with('*')) {
+        return false;
+    }
+    let inner = &trimmed[1..trimmed.len() - 1];
+    ["role:", "run:", "final:"]
+        .iter()
+        .any(|k| inner.starts_with(k))
 }
 
 /// Parse `*key: value*` metadata line.
@@ -579,9 +592,9 @@ Do something.
 
         let flow = load_graph_flow_from_md(md).unwrap();
         let start = &flow.graph["start"];
-        // The ### Next heading is part of the body, not a structural element
-        assert!(start.task.as_ref().unwrap().contains("### Next"));
-        // But transitions still parse correctly
+        // ### Next is cosmetic and stripped from the body
+        assert!(!start.task.as_ref().unwrap().contains("### Next"));
+        // Transitions still parse correctly
         let entries = start.select.as_ref().unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].target, "done");
