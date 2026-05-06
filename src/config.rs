@@ -380,11 +380,10 @@ pub enum Flow {
 
 /// State-graph flow definition.
 ///
-/// Schema-only for now (issue #237): no runtime, no reachability/dead-end
-/// validator. The driver and validator that turn this into executable
-/// behaviour live in follow-up issues. Validation here covers structural
-/// references only -- `initial:` exists, every `edge.to:` exists, and each
-/// state has either outgoing edges or a `kind:`.
+/// Issue #317 redesign: the top-level key is `graph:` (not `states:`),
+/// transitions use `next:` lists (not `edges:`), shell states use
+/// `run:` (not `kind: shell` + `command:`), and terminal states use
+/// `final:` (not `kind: final` + `description:`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphFlow {
@@ -402,38 +401,32 @@ pub struct GraphFlow {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_file: Option<String>,
     /// State ID where the graph starts. Must reference a key in
-    /// [`GraphFlow::states`]; the structural check fires in
+    /// [`GraphFlow::graph`]; the structural check fires in
     /// [`validate_graph_flow`].
     pub initial: String,
     /// State definitions, keyed by state ID. Order is preserved so a
     /// future Mermaid exporter can render states in declaration order.
-    pub states: IndexMap<String, GraphState>,
+    pub graph: IndexMap<String, GraphState>,
 }
 
-/// One node in the state graph.
+/// One node in the state graph (issue #317 redesign).
 ///
-/// A non-terminal state declares `edges:`. A terminal state declares
-/// `kind: final`. A human-handoff state declares `kind: human` (and may
-/// also declare `edges:` for the resume-* targets shown in the design
-/// doc). A `kind: shell` state runs a deterministic command, no agent
-/// or LLM call -- the exit code routes the next transition (issue #310).
-/// A state with neither `edges:` nor a terminal `kind:` is a dead end --
-/// this is caught by [`validate_graph_reachability`] as a hard error,
-/// not at the schema layer, so the dead-end branch is reachable from
-/// real YAML and AC5 can be verified end-to-end.
+/// Three state shapes:
 ///
-/// `description:` is optional and free-form: it carries human intent
-/// for the state ("happy-path exit", "early abort", "design gets
-/// challenged") so a reader does not have to infer meaning from the
-/// state name or trace incoming edges. [`validate_graph_reachability`]
-/// emits a warning (not an error) when a terminal state -- where intent
-/// matters most for audit consumers and operators -- has no description.
-/// A future Mermaid exporter renders the description as the node label.
+/// * **Agent state**: has `role:`, `task:`, and `next:`. The runtime
+///   asks the bound agent to pick one of the `next:` targets.
+/// * **Shell state**: has `run:` and `next:`. The runtime executes
+///   the command via `sh -c` and routes by exit code (`pass`/`fail`
+///   reserved reason words in `next:`).
+/// * **Final state**: has `final: "description"`. Terminates the run.
+/// * **Human state**: has `human: true`. Accepted at schema level but
+///   not runtime-supported yet.
+///
+/// A state with none of these is a dead end, caught by
+/// [`validate_graph_reachability`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphState {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kind: Option<StateKind>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -445,70 +438,165 @@ pub struct GraphState {
     /// [`resolve_graph_external_prompts`] runs this is always `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_file: Option<String>,
-    /// Shell command for `kind: shell` states (issue #310). Required when
-    /// `kind: shell`, forbidden on every other state shape. Variable
-    /// substitution (`{{vars.X}}`) applies the same way as on `task:`.
+    /// Shell command for shell states (replaces `kind: shell` +
+    /// `command:`). When present, the state is a deterministic
+    /// exit-code-routed gate with no LLM call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub command: Option<String>,
-    /// Free-form intent for this state. Optional everywhere; a soft
-    /// warning surfaces when a terminal state omits it (see
-    /// [`validate_graph_reachability`]).
+    pub run: Option<String>,
+    /// Terminal state description (replaces `kind: final` +
+    /// `description:`). When present, the state is a terminal that
+    /// ends the run. The string value documents intent.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "final")]
+    pub final_desc: Option<String>,
+    /// Human-handoff marker. When `true`, the state hands off to a
+    /// human operator. Accepted at schema level but not runtime-supported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    /// Outgoing transitions, keyed by edge name. Optional because
-    /// `kind: final` states do not need any. Order is preserved so the
-    /// runtime (when it lands) can present choices to an agent in
-    /// declaration order.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub edges: Option<IndexMap<String, GraphEdge>>,
+    pub human: Option<bool>,
+    /// Outgoing transitions. Each entry maps a target state name to an
+    /// optional reason string. The YAML key is `next:`.
+    #[serde(default, rename = "next", skip_serializing_if = "Option::is_none")]
+    pub select: Option<Vec<SelectEntry>>,
 }
 
-/// Terminal- or non-LLM-state discriminator.
-///
-/// * `final` ends the run.
-/// * `human` hands off to a human operator.
-/// * `shell` runs a configured command and routes on the exit code
-///   (issue #310). Counts toward the visit caps the same way an
-///   agent state does.
-///
-/// All three are accepted at the schema level here -- runtime semantics
-/// for `human` (resume, abort) are owned by the driver issue.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum StateKind {
-    Final,
-    Human,
-    Shell,
+impl GraphState {
+    /// True when this state is a terminal (`final:` present).
+    pub fn is_final(&self) -> bool {
+        self.final_desc.is_some()
+    }
+
+    /// True when this state is a human-handoff (`human: true`).
+    pub fn is_human(&self) -> bool {
+        self.human == Some(true)
+    }
+
+    /// True when this state is a shell gate (`run:` present).
+    pub fn is_shell(&self) -> bool {
+        self.run.is_some()
+    }
+
+    /// True when this state is terminal (final or human).
+    pub fn is_terminal(&self) -> bool {
+        self.is_final() || self.is_human()
+    }
 }
 
-/// Edge-routing tag for `kind: shell` states (issue #310).
+/// One entry in a state's `next:` list.
 ///
-/// The shell exit code picks the edge: `0` selects the first edge tagged
-/// `on: pass`, non-zero selects the first edge tagged `on: fail`. The
-/// tag is required on every edge of a shell state and rejected on every
-/// other state shape -- positional-by-declaration-order routing was
-/// considered and rejected because reordering YAML keys would silently
-/// re-route the run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EdgeOn {
-    Pass,
-    Fail,
+/// YAML forms:
+/// - `- target` (bare string, no reason)
+/// - `- target: "reason"` (single reason)
+/// - `- target: ["reason1", "reason2"]` (list of reasons, OR-combined)
+/// - `- target: |` (multiline string reason)
+///
+/// For shell states, `pass` and `fail` are reserved reason words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectEntry {
+    pub target: String,
+    pub reason: Option<SelectReason>,
 }
 
-/// One outgoing transition from a state. `to:` and `description:` are
-/// required; missing either is a serde-level error.
-///
-/// `on:` is the routing tag for `kind: shell` edges (issue #310). The
-/// validator requires it on every edge of a shell state and rejects it
-/// on edges of any other state shape.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GraphEdge {
-    pub to: String,
-    pub description: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub on: Option<EdgeOn>,
+/// The reason(s) attached to a select entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectReason {
+    Single(String),
+    List(Vec<String>),
+}
+
+impl SelectReason {
+    /// Return a human-readable summary of the reason(s).
+    pub fn display(&self) -> String {
+        match self {
+            SelectReason::Single(s) => s.clone(),
+            SelectReason::List(v) => v.join(" | "),
+        }
+    }
+}
+
+impl Serialize for SelectEntry {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        match &self.reason {
+            None => serializer.serialize_str(&self.target),
+            Some(SelectReason::Single(s)) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(&self.target, s)?;
+                map.end()
+            }
+            Some(SelectReason::List(v)) => {
+                let mut map = serializer.serialize_map(Some(1))?;
+                map.serialize_entry(&self.target, v)?;
+                map.end()
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SelectEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct SelectEntryVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for SelectEntryVisitor {
+            type Value = SelectEntry;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string (bare target) or a single-key map (target: reason)")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<SelectEntry, E> {
+                Ok(SelectEntry {
+                    target: v.to_string(),
+                    reason: None,
+                })
+            }
+
+            fn visit_map<M>(self, mut map: M) -> Result<SelectEntry, M::Error>
+            where
+                M: serde::de::MapAccess<'de>,
+            {
+                let (key, value): (String, serde_yaml::Value) = map
+                    .next_entry()?
+                    .ok_or_else(|| serde::de::Error::custom("empty map in select entry"))?;
+                if map.next_key::<String>()?.is_some() {
+                    return Err(serde::de::Error::custom(
+                        "select entry must have exactly one key (the target state name)",
+                    ));
+                }
+                let reason = match value {
+                    serde_yaml::Value::String(s) => Some(SelectReason::Single(s)),
+                    serde_yaml::Value::Sequence(seq) => {
+                        let strings: Result<Vec<String>, _> = seq
+                            .into_iter()
+                            .map(|v| match v {
+                                serde_yaml::Value::String(s) => Ok(s),
+                                _ => Err(serde::de::Error::custom(
+                                    "select entry reason list must contain only strings",
+                                )),
+                            })
+                            .collect();
+                        Some(SelectReason::List(strings?))
+                    }
+                    serde_yaml::Value::Null => None,
+                    _ => {
+                        return Err(serde::de::Error::custom(
+                            "select entry value must be a string, list of strings, or null",
+                        ));
+                    }
+                };
+                Ok(SelectEntry {
+                    target: key,
+                    reason,
+                })
+            }
+        }
+
+        deserializer.deserialize_any(SelectEntryVisitor)
+    }
 }
 
 /// Probe struct used by [`load_flow_any_from_str`] to decide which shape
@@ -521,7 +609,7 @@ struct FlowShapeProbe {
     #[serde(default)]
     flow: Option<serde_yaml::Value>,
     #[serde(default)]
-    states: Option<serde_yaml::Value>,
+    graph: Option<serde_yaml::Value>,
 }
 
 // --- Constants ---
@@ -589,14 +677,13 @@ pub fn load_flow_from_str_with_project(
 #[allow(dead_code)]
 pub fn load_flow_any_from_str(contents: &str) -> Result<Flow, ConfigError> {
     let probe: FlowShapeProbe = serde_yaml::from_str(contents)?;
-    match (probe.flow.is_some(), probe.states.is_some()) {
+    match (probe.flow.is_some(), probe.graph.is_some()) {
         (true, true) => Err(ConfigError::Validation(
-            "flow file declares both 'flow:' and 'states:' -- pick one (linear flow vs state graph)"
+            "flow file declares both 'flow:' and 'graph:' -- pick one (linear flow vs state graph)"
                 .to_string(),
         )),
         (false, false) => Err(ConfigError::Validation(
-            "flow file must declare either 'flow:' (linear) or 'states:' (state graph)"
-                .to_string(),
+            "flow file must declare either 'flow:' (linear) or 'graph:' (state graph)".to_string(),
         )),
         (true, false) => Ok(Flow::Linear(load_flow_from_str(contents)?)),
         (false, true) => Ok(Flow::Graph(load_graph_flow_from_str(contents)?)),
@@ -776,7 +863,7 @@ pub fn resolve_graph_external_prompts(
         &format!("flow '{flow_path_display}'"),
         "prompt",
     )?;
-    for (id, state) in graph.states.iter_mut() {
+    for (id, state) in graph.graph.iter_mut() {
         resolve_prompt_field(
             &mut state.task,
             &mut state.task_file,
@@ -872,14 +959,13 @@ pub fn load_flow_any_from_path(path: &Path) -> Result<Flow, ConfigError> {
     let probe: FlowShapeProbe = serde_yaml::from_str(&contents)?;
     let flow_path_display = path.display().to_string();
     let base_dir = flow_base_dir_for(path);
-    match (probe.flow.is_some(), probe.states.is_some()) {
+    match (probe.flow.is_some(), probe.graph.is_some()) {
         (true, true) => Err(ConfigError::Validation(
-            "flow file declares both 'flow:' and 'states:' -- pick one (linear flow vs state graph)"
+            "flow file declares both 'flow:' and 'graph:' -- pick one (linear flow vs state graph)"
                 .to_string(),
         )),
         (false, false) => Err(ConfigError::Validation(
-            "flow file must declare either 'flow:' (linear) or 'states:' (state graph)"
-                .to_string(),
+            "flow file must declare either 'flow:' (linear) or 'graph:' (state graph)".to_string(),
         )),
         (true, false) => Ok(Flow::Linear(load_flow_from_str_with_project_at(
             &contents,
@@ -896,13 +982,17 @@ pub fn load_flow_any_from_path(path: &Path) -> Result<Flow, ConfigError> {
     }
 }
 
-/// Structural validation for [`GraphFlow`].
+/// Structural validation for [`GraphFlow`] (issue #317 redesign).
 ///
-/// Walks the state map twice: first to confirm `initial:` resolves, then
-/// per state to confirm every edge target resolves and the
-/// edges-or-kind requirement holds. Errors are written to name the
-/// offending state ID and field so the user can jump straight to the
-/// problem in the YAML.
+/// Checks:
+/// - version must be "1"
+/// - `initial:` must reference a key in `graph:`
+/// - all select targets must exist in `graph:`
+/// - each target at most once per state's select list
+/// - shell states (`run:` present): exactly 2 select entries, one pass one fail
+/// - agent states: at least 2 select entries, non-empty reasons
+/// - `final:` states must have non-empty description string
+/// - no self-loops on shell states
 fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
     if g.version.0 != "1" {
         return Err(ConfigError::Validation(format!(
@@ -911,124 +1001,181 @@ fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
         )));
     }
 
-    if !g.states.contains_key(&g.initial) {
+    if !g.graph.contains_key(&g.initial) {
         return Err(ConfigError::Validation(format!(
             "graph flow 'initial' references unknown state '{}' (known states: {})",
             g.initial,
-            sorted_state_ids(&g.states).join(", ")
+            sorted_state_ids(&g.graph).join(", ")
         )));
     }
 
-    // Schema validation only checks structural references (initial and
-    // edge.to resolve to declared states). The "must have edges OR a
-    // terminal kind" rule is dead-end semantics and lives in
-    // [`validate_graph_reachability`] -- otherwise the schema and the
-    // reachability check duplicate the same rule, the dead-end branch
-    // in the reachability validator is unreachable from real YAML, and
-    // AC5 from issue #238 cannot be verified end-to-end.
-    for (id, state) in &g.states {
-        if let Some(edges) = &state.edges {
-            for (edge_name, edge) in edges {
-                if !g.states.contains_key(&edge.to) {
+    for (id, state) in &g.graph {
+        // Validate select targets reference known states
+        if let Some(entries) = &state.select {
+            let mut seen_targets: HashSet<&str> = HashSet::new();
+            for entry in entries {
+                if !g.graph.contains_key(&entry.target) {
                     return Err(ConfigError::Validation(format!(
-                        "graph state '{id}' edge '{edge_name}' targets unknown state '{}' (known states: {})",
-                        edge.to,
-                        sorted_state_ids(&g.states).join(", ")
+                        "graph state '{id}' select targets unknown state '{}' (known states: {})",
+                        entry.target,
+                        sorted_state_ids(&g.graph).join(", ")
+                    )));
+                }
+                if !seen_targets.insert(&entry.target) {
+                    return Err(ConfigError::Validation(format!(
+                        "graph state '{id}' lists target '{}' more than once in select",
+                        entry.target
                     )));
                 }
             }
         }
-        validate_shell_state_semantics(id, state)?;
+        validate_state_semantics(id, state)?;
     }
 
     Ok(())
 }
 
-/// Schema-level checks for `kind: shell` states (issue #310).
+/// Schema-level checks for graph states (issue #317 redesign).
 ///
-/// A shell state is a deterministic exit-code-routed gate. To prevent
-/// it from collapsing into something it isn't, we reject:
+/// Validates the consistency rules for each state shape:
 ///
-/// * `kind: shell` without `command:` (nothing to run)
-/// * `kind: shell` with an empty `command:` (silent no-op)
-/// * `kind: shell` with `role:`, `task:`, or `task_file:` (those belong
-///   to LLM states; mixing them is almost certainly a typo)
-/// * `kind: shell` without `edges:` or with no `on: pass` / `on: fail`
-///   pair (the runtime would have nowhere to route)
-/// * `kind: shell` self-loops (a shell can't recover from its own
-///   failure -- the implementer or human must)
-/// * `command:` on any non-shell state (it would be silently ignored)
-/// * `on:` on edges of any non-shell state (only meaningful as a routing
-///   tag for shell exit codes)
-///
-/// Errors name the offending state and field so the user can jump to the
-/// problem in the YAML.
-fn validate_shell_state_semantics(id: &str, state: &GraphState) -> Result<(), ConfigError> {
-    let is_shell = matches!(state.kind, Some(StateKind::Shell));
+/// * **Shell states** (`run:` present): must not declare `role:`,
+///   `task:`, or `task_file:`. Must have exactly 2 select entries,
+///   one with `pass` reason and one with `fail` reason. No self-loops.
+///   `run:` must be non-empty.
+/// * **Final states** (`final:` present): the description string must
+///   be non-empty. Must not have `next:`, `role:`, `task:`, `run:`.
+/// * **Human states** (`human: true`): schema-accepted, may have `next:`.
+/// * **Agent states** (none of the above): must have `next:` with at
+///   least 2 entries, each with a non-empty reason.
+/// * Mutual exclusion: `run:`, `final:`, and `human:` are pairwise
+///   exclusive.
+fn validate_state_semantics(id: &str, state: &GraphState) -> Result<(), ConfigError> {
+    // Count how many discriminator fields are set
+    let mut kinds: Vec<&str> = Vec::new();
+    if state.run.is_some() {
+        kinds.push("run");
+    }
+    if state.final_desc.is_some() {
+        kinds.push("final");
+    }
+    if state.is_human() {
+        kinds.push("human");
+    }
+    if kinds.len() > 1 {
+        return Err(ConfigError::Validation(format!(
+            "graph state '{id}' has conflicting fields {kinds:?} -- use exactly one of 'run', 'final', or 'human'"
+        )));
+    }
 
-    if is_shell {
-        match state.command.as_deref().map(str::trim) {
+    if state.is_shell() {
+        // Shell state validation
+        match state.run.as_deref().map(str::trim) {
             Some(cmd) if !cmd.is_empty() => {}
             _ => {
                 return Err(ConfigError::Validation(format!(
-                    "graph state '{id}' is `kind: shell` but has no non-empty `command:` -- declare the shell command to run"
+                    "graph state '{id}' has `run:` but the command is empty"
                 )));
             }
         }
         if state.role.is_some() {
             return Err(ConfigError::Validation(format!(
-                "graph state '{id}' is `kind: shell` and must not declare `role:` -- shell states have no agent"
+                "graph state '{id}' has `run:` and must not declare `role:` -- shell states have no agent"
             )));
         }
         if state.task.is_some() || state.task_file.is_some() {
             return Err(ConfigError::Validation(format!(
-                "graph state '{id}' is `kind: shell` and must not declare `task:` or `task_file:` -- shell states do not run an LLM"
+                "graph state '{id}' has `run:` and must not declare `task:` or `task_file:` -- shell states do not run an LLM"
             )));
         }
-        let edges = state.edges.as_ref().ok_or_else(|| {
+        let entries = state.select.as_ref().ok_or_else(|| {
             ConfigError::Validation(format!(
-                "graph state '{id}' is `kind: shell` and must declare `edges:` with both an `on: pass` and an `on: fail` target"
+                "graph state '{id}' has `run:` and must declare `next:` with both a `pass` and a `fail` target"
             ))
         })?;
+        if entries.len() != 2 {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' has `run:` and must have exactly 2 select entries (one pass, one fail), got {}",
+                entries.len()
+            )));
+        }
         let mut has_pass = false;
         let mut has_fail = false;
-        for (edge_name, edge) in edges {
-            match edge.on {
-                Some(EdgeOn::Pass) => has_pass = true,
-                Some(EdgeOn::Fail) => has_fail = true,
-                None => {
-                    return Err(ConfigError::Validation(format!(
-                        "graph state '{id}' edge '{edge_name}' must declare `on: pass` or `on: fail` -- every edge of a `kind: shell` state is exit-code-routed"
-                    )));
-                }
-            }
-            if edge.to == id {
+        for entry in entries {
+            let reason_text = entry
+                .reason
+                .as_ref()
+                .map(|r| r.display())
+                .unwrap_or_default();
+            if reason_text == "pass" {
+                has_pass = true;
+            } else if reason_text == "fail" {
+                has_fail = true;
+            } else {
                 return Err(ConfigError::Validation(format!(
-                    "graph state '{id}' edge '{edge_name}' is a self-loop -- a `kind: shell` state cannot recover from its own failure, route to a different state"
+                    "graph state '{id}' select entry '{}' must have reason 'pass' or 'fail' -- shell states are exit-code-routed",
+                    entry.target
+                )));
+            }
+            if entry.target == id {
+                return Err(ConfigError::Validation(format!(
+                    "graph state '{id}' select entry '{}' is a self-loop -- a shell state cannot recover from its own failure, route to a different state",
+                    entry.target
                 )));
             }
         }
         if !has_pass {
             return Err(ConfigError::Validation(format!(
-                "graph state '{id}' is `kind: shell` and must declare at least one edge with `on: pass`"
+                "graph state '{id}' has `run:` and must declare a select entry with reason 'pass'"
             )));
         }
         if !has_fail {
             return Err(ConfigError::Validation(format!(
-                "graph state '{id}' is `kind: shell` and must declare at least one edge with `on: fail`"
+                "graph state '{id}' has `run:` and must declare a select entry with reason 'fail'"
             )));
         }
-    } else {
-        if state.command.is_some() {
+    } else if state.is_final() {
+        // Final state validation
+        if let Some(desc) = &state.final_desc
+            && desc.trim().is_empty()
+        {
             return Err(ConfigError::Validation(format!(
-                "graph state '{id}' declares `command:` but is not `kind: shell` -- `command:` is only valid on shell states"
+                "graph state '{id}' has `final:` with an empty description"
             )));
         }
-        if let Some(edges) = &state.edges {
-            for (edge_name, edge) in edges {
-                if edge.on.is_some() {
+        if state.role.is_some() || state.task.is_some() || state.select.is_some() {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' is `final:` and must not declare `role:`, `task:`, or `next:`"
+            )));
+        }
+    } else if state.is_human() {
+        // Human state: accepted at schema level, may have select for resume patterns
+    } else {
+        // Agent state validation
+        if state.role.is_none() {
+            // Not an error at schema level -- will be caught by dead-end
+            // detection if there's also no select. The runner validates
+            // role binding separately.
+        }
+        if let Some(entries) = &state.select {
+            if entries.len() < 2 {
+                return Err(ConfigError::Validation(format!(
+                    "graph state '{id}' must have at least 2 select entries (got {})",
+                    entries.len()
+                )));
+            }
+            for entry in entries {
+                if entry.reason.is_none() {
                     return Err(ConfigError::Validation(format!(
-                        "graph state '{id}' edge '{edge_name}' declares `on:` but the state is not `kind: shell` -- `on:` is only valid on shell-state edges"
+                        "graph state '{id}' select entry '{}' must have a non-empty reason",
+                        entry.target
+                    )));
+                }
+                let reason_text = entry.reason.as_ref().unwrap().display();
+                if reason_text.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "graph state '{id}' select entry '{}' must have a non-empty reason",
+                        entry.target
                     )));
                 }
             }
@@ -1099,72 +1246,51 @@ impl GraphValidationReport {
 pub fn validate_graph_reachability(g: &GraphFlow) -> GraphValidationReport {
     let mut report = GraphValidationReport::default();
 
-    // BFS from `initial:`. The schema validator guarantees `initial:` and
-    // every `edge.to:` resolve, so we can deref-and-index without a
-    // contains_key probe.
+    // BFS from `initial:`.
     let mut visited: HashSet<&str> = HashSet::new();
     let mut frontier: Vec<&str> = Vec::new();
     visited.insert(g.initial.as_str());
     frontier.push(g.initial.as_str());
     while let Some(id) = frontier.pop() {
-        let Some(state) = g.states.get(id) else {
-            // Defensive: schema check should make this unreachable, but
-            // an in-memory `GraphFlow` constructed without validation
-            // could still hit it. Skip rather than panic.
+        let Some(state) = g.graph.get(id) else {
             continue;
         };
-        let Some(edges) = &state.edges else { continue };
-        for edge in edges.values() {
-            if visited.insert(edge.to.as_str()) {
-                frontier.push(edge.to.as_str());
+        let Some(entries) = &state.select else {
+            continue;
+        };
+        for entry in entries {
+            if visited.insert(entry.target.as_str()) {
+                frontier.push(entry.target.as_str());
             }
         }
     }
 
-    // Dead-end detection. Walk every state (declaration order via
-    // IndexMap), not just the reachable ones, so the user sees every
-    // dead-end in one validation pass even if some are unreachable too.
-    // Iterating in declaration order keeps error output stable for tests
-    // and matches the user's mental model of the YAML file.
-    //
-    // The same pass also flags terminal states (`kind: final` or
-    // `kind: human`) without a `description:` as a soft warning. Issue
-    // #260: at the terminal, intent matters most -- audit consumers
-    // (#257 records `final_state:` in the manifest) and human operators
-    // need to read the YAML and tell `done` apart from `aborted`
-    // without guessing from the name. Non-terminal states are not
-    // warned about: descriptions are optional everywhere, but the
-    // payoff is concentrated at the terminals, and warning on every
-    // node would flood existing flows with low-signal noise.
-    for (id, state) in &g.states {
-        let has_edges = state.edges.as_ref().is_some_and(|e| !e.is_empty());
-        let is_terminal = matches!(state.kind, Some(StateKind::Final) | Some(StateKind::Human));
-        if !has_edges && !is_terminal {
+    // Dead-end detection + terminal description warning.
+    for (id, state) in &g.graph {
+        let has_select = state.select.as_ref().is_some_and(|e| !e.is_empty());
+        let is_terminal = state.is_terminal();
+        if !has_select && !is_terminal {
             report.errors.push(format!(
-                "graph state '{id}' is a dead end: no outgoing edges and not 'kind: final' or 'kind: human'"
+                "graph state '{id}' is a dead end: no select entries and not a terminal state"
             ));
         }
-        if is_terminal && state.description.is_none() {
+        // Final states with empty description: the description is in
+        // the `final:` field itself, so we check its content.
+        if state.is_final()
+            && let Some(desc) = &state.final_desc
+            && desc.trim().is_empty()
+        {
             report.warnings.push(format!(
-                "graph state '{id}' is terminal ('kind: {}') but has no `description:` -- intent should be visible at the terminal",
-                match state.kind {
-                    Some(StateKind::Final) => "final",
-                    Some(StateKind::Human) => "human",
-                    // Unreachable: `is_terminal` was true, so `kind` is
-                    // one of the two arms above. Fall back to a stable
-                    // string rather than panic if a future variant slips
-                    // in without updating this match.
-                    _ => "?",
-                }
+                "graph state '{id}' is terminal ('final') but has an empty description -- intent should be visible at the terminal"
             ));
         }
+        // Human states don't carry a description field in the new schema
+        // (the concept is accepted but minimal). No warning needed.
     }
 
-    // Unreachable detection. Sort lexically for stable output -- BFS
-    // visits in non-deterministic order (HashSet iteration), so we need
-    // an explicit sort here for diffable error messages.
+    // Unreachable detection.
     let mut unreachable: Vec<&str> = g
-        .states
+        .graph
         .keys()
         .map(String::as_str)
         .filter(|k| !visited.contains(k))
@@ -3580,55 +3706,38 @@ prompt: |
 
 initial: start
 
-states:
+graph:
   start:
     role: developer
     task: |
       Do the first thing.
-    edges:
-      ok:
-        to: middle
-        description: Things went well.
-      stuck:
-        to: aborted
-        description: Cannot proceed.
+    next:
+      - middle: "Things went well."
+      - aborted: "Cannot proceed."
 
   middle:
     role: reviewer
     task: |
       Check the result.
-    edges:
-      approved:
-        to: done
-        description: Looks good.
-      rework:
-        to: start
-        description: Needs another round.
+    next:
+      - done: "Looks good."
+      - start: "Needs another round."
 
   human_review:
-    kind: human
-    description: Operator picks the next move when automation cannot.
-    edges:
-      resume:
-        to: middle
-        description: Operator unblocks the review.
-      abort:
-        to: aborted
-        description: Operator aborts the run.
+    human: true
+    next:
+      - middle: "Operator unblocks the review."
+      - aborted: "Operator aborts the run."
 
   done:
-    kind: final
-    description: Happy-path exit -- review approved.
+    final: "Happy-path exit -- review approved."
 
   aborted:
-    kind: final
-    description: Early exit -- aborted from `start` or `human_review`.
+    final: "Early exit -- aborted from start or human_review."
 "#;
 
     #[test]
     fn graph_minimal_parses() {
-        // Acceptance: adding `states:` instead of `flow:` parses into a
-        // graph variant of the flow config.
         let flow = load_flow_any_from_str(GRAPH_CONFIG).unwrap();
         let g = match flow {
             Flow::Graph(g) => g,
@@ -3637,31 +3746,27 @@ states:
         assert_eq!(g.name, "example-graph");
         assert_eq!(g.version.0, "1");
         assert_eq!(g.initial, "start");
-        // Order is preserved from declaration order.
-        let ids: Vec<&str> = g.states.keys().map(String::as_str).collect();
+        let ids: Vec<&str> = g.graph.keys().map(String::as_str).collect();
         assert_eq!(
             ids,
             vec!["start", "middle", "human_review", "done", "aborted"]
         );
 
-        // Spot-check a regular state: edges parse with `to:` and
-        // `description:` populated.
-        let start = &g.states["start"];
+        // Spot-check a regular state: select entries parse.
+        let start = &g.graph["start"];
         assert_eq!(start.role.as_deref(), Some("developer"));
-        let edges = start.edges.as_ref().unwrap();
-        assert_eq!(edges["ok"].to, "middle");
-        assert_eq!(edges["ok"].description, "Things went well.");
+        let select = start.select.as_ref().unwrap();
+        assert_eq!(select[0].target, "middle");
 
-        // Final state has no edges, just kind.
-        let done = &g.states["done"];
-        assert_eq!(done.kind, Some(StateKind::Final));
-        assert!(done.edges.is_none());
+        // Final state has final_desc, no select.
+        let done = &g.graph["done"];
+        assert!(done.is_final());
+        assert!(done.select.is_none());
 
-        // Human state carries kind AND edges (the design doc resume-*
-        // pattern).
-        let hr = &g.states["human_review"];
-        assert_eq!(hr.kind, Some(StateKind::Human));
-        assert!(hr.edges.is_some());
+        // Human state carries human: true and has select entries.
+        let hr = &g.graph["human_review"];
+        assert!(hr.is_human());
+        assert!(hr.select.is_some());
     }
 
     #[test]
@@ -3682,14 +3787,12 @@ states:
 
     #[test]
     fn graph_missing_initial_errors() {
-        // Acceptance: `initial:` is required when `states:` is present;
-        // the error message names the field.
         let yaml = r#"
 version: "1"
 name: no-initial
-states:
+graph:
   done:
-    kind: final
+    final: "end"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
@@ -3701,15 +3804,13 @@ states:
 
     #[test]
     fn graph_unknown_initial_target_errors() {
-        // Acceptance: `initial:` referencing an unknown state produces a
-        // structural error referencing the offending state-id and field.
         let yaml = r#"
 version: "1"
 name: bad-initial
 initial: nowhere
-states:
+graph:
   done:
-    kind: final
+    final: "end"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
@@ -3724,36 +3825,30 @@ states:
     }
 
     #[test]
-    fn graph_edge_to_unknown_state_errors() {
-        // Acceptance: an edge `to:` referencing an unknown state produces
-        // a structural error referencing the offending state-id, edge
-        // name, and target.
+    fn graph_select_to_unknown_state_errors() {
         let yaml = r#"
 version: "1"
-name: bad-edge
+name: bad-select
 initial: start
-states:
+graph:
   start:
     role: developer
-    edges:
-      ok:
-        to: ghost
-        description: Goes nowhere real.
+    next:
+      - ghost: "Goes nowhere real."
+      - done: "ok"
   done:
-    kind: final
+    final: "end"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("start") && msg.contains("'ok'") && msg.contains("'ghost'"),
-            "error must name source state, edge name, and target: {msg}"
+            msg.contains("start") && msg.contains("'ghost'"),
+            "error must name source state and target: {msg}"
         );
     }
 
     #[test]
-    fn graph_mixed_flow_and_states_is_hard_error() {
-        // Acceptance: a flow file with both `flow:` and `states:` is a
-        // hard error -- "pick one".
+    fn graph_mixed_flow_and_graph_is_hard_error() {
         let yaml = r#"
 version: "1"
 name: mixed
@@ -3761,14 +3856,14 @@ initial: start
 flow:
   whatever:
     agent: dev
-states:
+graph:
   start:
-    kind: final
+    final: "end"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("both") && msg.contains("'flow:'") && msg.contains("'states:'"),
+            msg.contains("both") && msg.contains("'flow:'") && msg.contains("'graph:'"),
             "error must explicitly call out the conflict: {msg}"
         );
         assert!(
@@ -3778,10 +3873,7 @@ states:
     }
 
     #[test]
-    fn graph_neither_flow_nor_states_errors() {
-        // Implied by the dispatch: a YAML that declares neither shape is
-        // not a valid flow file. Errors must name both fields so the
-        // user knows the choice they need to make.
+    fn graph_neither_flow_nor_graph_errors() {
         let yaml = r#"
 version: "1"
 name: empty-shape
@@ -3789,23 +3881,18 @@ name: empty-shape
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("'flow:'") && msg.contains("'states:'"),
+            msg.contains("'flow:'") && msg.contains("'graph:'"),
             "error must list both possible top-level shapes: {msg}"
         );
     }
 
     #[test]
-    fn graph_state_without_edges_or_kind_is_dead_end() {
-        // Acceptance: each state has either `edges:` (non-final) or
-        // `kind: final` / `kind: human`. A state with neither is a
-        // dead end. The schema parses such YAML successfully -- the
-        // dead-end semantics live in `validate_graph_reachability` so
-        // the check is exercised by real YAML (AC5 of issue #238).
+    fn graph_state_without_select_or_final_is_dead_end() {
         let yaml = r#"
 version: "1"
 name: dangling-state
 initial: lonely
-states:
+graph:
   lonely:
     role: developer
 "#;
@@ -3827,75 +3914,88 @@ states:
     }
 
     #[test]
-    fn graph_edge_missing_to_is_serde_error() {
-        // The `to:` field is required by the GraphEdge serde derive;
-        // omitting it surfaces a parse error from serde, not a custom
-        // validation. We assert the error mentions `to` so the user can
-        // locate the omission.
+    fn graph_select_entry_parses_bare_string() {
         let yaml = r#"
 version: "1"
-name: bad-edge
+name: bare
 initial: start
-states:
+graph:
   start:
-    edges:
-      ok:
-        description: Missing the target.
+    run: "true"
+    next:
+      - done: pass
+      - back: fail
   done:
-    kind: final
+    final: "end"
+  back:
+    run: "false"
+    next:
+      - done: pass
+      - start: fail
 "#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("to"),
-            "serde error must mention the missing 'to' field: {msg}"
+        let flow = load_flow_any_from_str(yaml).unwrap();
+        let g = match flow {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph"),
+        };
+        let select = g.graph["start"].select.as_ref().unwrap();
+        assert_eq!(select[0].target, "done");
+        assert_eq!(
+            select[0].reason,
+            Some(SelectReason::Single("pass".to_string()))
         );
     }
 
     #[test]
-    fn graph_edge_missing_description_is_serde_error() {
-        // Same contract as the `to:` test: `description:` is required so
-        // the runtime can show the agent/human a meaningful menu of
-        // choices. Omission must fail at parse, not silently default.
+    fn graph_select_entry_parses_list_reason() {
         let yaml = r#"
 version: "1"
-name: bad-edge
+name: list-reason
 initial: start
-states:
+graph:
   start:
-    edges:
-      ok:
-        to: done
+    role: developer
+    next:
+      - done: ["reason one", "reason two"]
+      - back: "fallback"
   done:
-    kind: final
+    final: "end"
+  back:
+    role: developer
+    next:
+      - done: "ok"
+      - start: "retry"
 "#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("description"),
-            "serde error must mention the missing 'description' field: {msg}"
+        let flow = load_flow_any_from_str(yaml).unwrap();
+        let g = match flow {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph"),
+        };
+        let select = g.graph["start"].select.as_ref().unwrap();
+        assert_eq!(
+            select[0].reason,
+            Some(SelectReason::List(vec![
+                "reason one".to_string(),
+                "reason two".to_string()
+            ]))
         );
     }
 
     #[test]
     fn graph_unknown_field_is_rejected() {
-        // `deny_unknown_fields` on GraphFlow / GraphState / GraphEdge
-        // makes typos fail at parse time. We anchor that here so future
-        // edits do not silently relax the schema.
         let yaml = r#"
 version: "1"
 name: typo
 initial: start
-states:
+graph:
   start:
     role: developer
     typo_field: oops
-    edges:
-      ok:
-        to: done
-        description: ok
+    next:
+      - done: "ok"
+      - start: "retry"
   done:
-    kind: final
+    final: "end"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
@@ -3906,38 +4006,34 @@ states:
     }
 
     #[test]
-    fn graph_unknown_kind_value_errors() {
-        // `kind:` is an enum (`final` | `human`); any other value must
-        // fail at parse time so a typo cannot silently disable the
-        // terminal-state semantics.
+    fn graph_conflicting_discriminators_errors() {
+        // A state cannot be both final and a shell state.
         let yaml = r#"
 version: "1"
-name: bad-kind
-initial: done
-states:
-  done:
-    kind: end
+name: bad
+initial: start
+graph:
+  start:
+    run: "true"
+    final: "end"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("end") || msg.contains("variant"),
-            "error must indicate the invalid kind value: {msg}"
+            msg.contains("conflicting"),
+            "error must indicate the conflict: {msg}"
         );
     }
 
     #[test]
     fn graph_unsupported_version_errors() {
-        // Same version policy as the linear loader: only "1" is
-        // accepted today. Mirrored here so the graph loader cannot
-        // silently drift to a different policy.
         let yaml = r#"
 version: "2"
 name: future
 initial: done
-states:
+graph:
   done:
-    kind: final
+    final: "end"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
@@ -3975,60 +4071,53 @@ states:
             version: Version("1".to_string()),
             name: "test".to_string(),
             initial: initial.to_string(),
-            states: map,
+            graph: map,
             ..Default::default()
         }
     }
 
-    fn state_with_edges(edges: Vec<(&str, &str)>) -> GraphState {
-        let mut map: IndexMap<String, GraphEdge> = IndexMap::new();
-        for (name, to) in edges {
-            map.insert(
-                name.to_string(),
-                GraphEdge {
-                    to: to.to_string(),
-                    description: format!("go to {to}"),
-                    on: None,
-                },
-            );
-        }
+    fn state_with_select(targets: Vec<(&str, &str)>) -> GraphState {
+        let entries: Vec<SelectEntry> = targets
+            .iter()
+            .map(|(target, reason)| SelectEntry {
+                target: (*target).to_string(),
+                reason: Some(SelectReason::Single((*reason).to_string())),
+            })
+            .collect();
         GraphState {
             role: Some("developer".to_string()),
-            edges: Some(map),
+            select: Some(entries),
             ..Default::default()
         }
     }
 
-    /// Helper terminal state with a non-empty description -- the default
-    /// for tests that want a clean (no-warning) terminal. Tests that
-    /// intentionally exercise the missing-description warning use
-    /// [`state_final_no_description`].
     fn state_final() -> GraphState {
         GraphState {
-            kind: Some(StateKind::Final),
-            description: Some("Test terminal state.".to_string()),
+            final_desc: Some("Test terminal state.".to_string()),
             ..Default::default()
         }
     }
 
-    /// Bare terminal state (no description) for tests that want to
-    /// trigger the missing-description warning rule from issue #260.
     fn state_final_no_description() -> GraphState {
         GraphState {
-            kind: Some(StateKind::Final),
+            final_desc: Some("".to_string()),
             ..Default::default()
         }
     }
 
-    fn state_human(edges: Vec<(&str, &str)>) -> GraphState {
-        let mut s = state_with_edges(edges);
-        s.kind = Some(StateKind::Human);
-        s.role = None;
-        // Terminal kinds (`final` and `human`) carry a description by
-        // default in the test helpers so existing "must be clean"
-        // assertions do not trip on the issue #260 warning rule.
-        s.description = Some("Test human-handoff state.".to_string());
-        s
+    fn state_human(targets: Vec<(&str, &str)>) -> GraphState {
+        let entries: Vec<SelectEntry> = targets
+            .iter()
+            .map(|(target, reason)| SelectEntry {
+                target: (*target).to_string(),
+                reason: Some(SelectReason::Single((*reason).to_string())),
+            })
+            .collect();
+        GraphState {
+            human: Some(true),
+            select: Some(entries),
+            ..Default::default()
+        }
     }
 
     /// Acceptance: a graph where every state is either reachable + has
@@ -4038,7 +4127,7 @@ states:
         let g = graph(
             "start",
             vec![
-                ("start", state_with_edges(vec![("ok", "done")])),
+                ("start", state_with_select(vec![("done", "looks good")])),
                 ("done", state_final()),
             ],
         );
@@ -4055,22 +4144,17 @@ states:
         );
     }
 
-    /// Acceptance: a graph with a non-final state and zero outgoing
-    /// edges fails validation with a message naming the state. The YAML
-    /// schema rejects this shape, so the test constructs `GraphFlow`
-    /// programmatically -- the validator must still catch it as
-    /// defense-in-depth.
     #[test]
     fn validate_dead_end_state_errors() {
         let stuck = GraphState {
             role: Some("developer".to_string()),
-            // no kind, no edges -- dead end
+            // no final, no select -- dead end
             ..Default::default()
         };
         let g = graph(
             "start",
             vec![
-                ("start", state_with_edges(vec![("go", "stuck")])),
+                ("start", state_with_select(vec![("stuck", "go there")])),
                 ("stuck", stuck),
             ],
         );
@@ -4096,9 +4180,9 @@ states:
         let g = graph(
             "start",
             vec![
-                ("start", state_with_edges(vec![("ok", "done")])),
+                ("start", state_with_select(vec![("done", "looks good")])),
                 ("done", state_final()),
-                ("orphan", state_with_edges(vec![("loop", "done")])),
+                ("orphan", state_with_select(vec![("done", "loops back")])),
             ],
         );
         let report = validate_graph_reachability(&g);
@@ -4130,7 +4214,7 @@ states:
             vec![
                 (
                     "start",
-                    state_with_edges(vec![("retry", "start"), ("done", "done")]),
+                    state_with_select(vec![("start", "retry"), ("done", "finish")]),
                 ),
                 ("done", state_final()),
             ],
@@ -4169,13 +4253,15 @@ states:
     /// dead end. Issue #238 explicitly lists `human` alongside `final`
     /// as terminal for dead-end purposes.
     #[test]
-    fn validate_human_state_without_edges_not_dead_end() {
-        let mut hr = state_final();
-        hr.kind = Some(StateKind::Human);
+    fn validate_human_state_without_select_not_dead_end() {
+        let hr = GraphState {
+            human: Some(true),
+            ..Default::default()
+        };
         let g = graph(
             "start",
             vec![
-                ("start", state_with_edges(vec![("handoff", "operator")])),
+                ("start", state_with_select(vec![("operator", "handoff")])),
                 ("operator", hr),
             ],
         );
@@ -4191,8 +4277,8 @@ states:
         let g = graph(
             "start",
             vec![
-                ("start", state_with_edges(vec![("handoff", "operator")])),
-                ("operator", state_human(vec![("resume", "done")])),
+                ("start", state_with_select(vec![("operator", "handoff")])),
+                ("operator", state_human(vec![("done", "resume")])),
                 ("done", state_final()),
             ],
         );
@@ -4218,7 +4304,7 @@ states:
             vec![
                 (
                     "start",
-                    state_with_edges(vec![("a", "first"), ("b", "second")]),
+                    state_with_select(vec![("first", "go a"), ("second", "go b")]),
                 ),
                 ("first", dead.clone()),
                 ("second", dead),
@@ -4259,94 +4345,45 @@ states:
 
     // --- GraphState description schema + validation tests (issue #260) ---
 
-    /// AC1/AC3: `description:` parses as `Option<String>` on every
-    /// state shape (terminal final, terminal human, non-terminal) when
-    /// present. Spot-checks each shape so a regression in the field's
-    /// serde wiring on any one of them is caught.
     #[test]
-    fn graph_state_description_parses_when_present() {
+    fn graph_final_state_description_parses() {
         let yaml = r#"
 version: "1"
 name: described
 initial: start
-states:
+graph:
   start:
     role: developer
-    description: Kicks the work off.
-    edges:
-      ok:
-        to: done
-        description: Looks good.
-      handoff:
-        to: ask_human
-        description: Need a person.
+    next:
+      - done: "Looks good."
+      - ask_human: "Need a person."
   ask_human:
-    kind: human
-    description: Operator decides what to do next.
+    human: true
   done:
-    kind: final
-    description: Happy-path exit.
+    final: "Happy-path exit."
 "#;
         let g = load_graph_flow_from_str(yaml).expect("must parse");
         assert_eq!(
-            g.states["start"].description.as_deref(),
-            Some("Kicks the work off.")
-        );
-        assert_eq!(
-            g.states["ask_human"].description.as_deref(),
-            Some("Operator decides what to do next.")
-        );
-        assert_eq!(
-            g.states["done"].description.as_deref(),
+            g.graph["done"].final_desc.as_deref(),
             Some("Happy-path exit.")
         );
     }
 
-    /// AC3: omitting `description:` everywhere stays valid -- the field
-    /// is optional, so existing flows from before #260 keep parsing.
     #[test]
-    fn graph_state_description_optional_everywhere() {
-        let yaml = r#"
-version: "1"
-name: bare
-initial: start
-states:
-  start:
-    role: developer
-    edges:
-      ok:
-        to: done
-        description: Looks good.
-  done:
-    kind: final
-"#;
-        let g = load_graph_flow_from_str(yaml).expect("must parse without description");
-        assert!(g.states["start"].description.is_none());
-        assert!(g.states["done"].description.is_none());
-    }
-
-    /// AC2: `deny_unknown_fields` is retained -- a typoed field name on
-    /// `GraphState` must still fail at parse time, including when other
-    /// `description:` siblings are present. This pins the schema's
-    /// strictness so a future relaxation has to be explicit.
-    #[test]
-    fn graph_state_description_does_not_relax_deny_unknown_fields() {
+    fn graph_deny_unknown_fields_still_enforced() {
         let yaml = r#"
 version: "1"
 name: typo
 initial: start
-states:
+graph:
   start:
     role: developer
-    description: ok
-    descriptionn: oops  # typo: extra n
-    edges:
-      ok:
-        to: done
-        description: ok
+    descriptionn: oops
+    next:
+      - done: "ok"
+      - start: "retry"
   done:
-    kind: final
-    description: done
+    final: "done"
 "#;
         let err = load_flow_any_from_str(yaml).unwrap_err();
         let msg = err.to_string();
@@ -4356,92 +4393,33 @@ states:
         );
     }
 
-    /// AC4: a terminal `kind: final` state with no description produces
-    /// a warning (not an error) naming the state and the kind. The
-    /// flow still validates as ok -- warnings do not block.
     #[test]
-    fn validate_terminal_final_without_description_warns() {
+    fn validate_terminal_final_with_empty_description_warns() {
         let g = graph(
             "start",
             vec![
-                ("start", state_with_edges(vec![("ok", "done")])),
+                ("start", state_with_select(vec![("done", "go")])),
                 ("done", state_final_no_description()),
             ],
         );
         let report = validate_graph_reachability(&g);
         assert!(
             report.is_ok(),
-            "missing description must be a warning, not an error; got errors: {:?}",
+            "empty description is a warning, not an error; got errors: {:?}",
             report.errors
         );
         assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
         let w = &report.warnings[0];
         assert!(w.contains("'done'"), "warning must name the state: {w}");
-        assert!(
-            w.contains("kind: final"),
-            "warning must name the terminal kind: {w}"
-        );
-        assert!(
-            w.contains("description"),
-            "warning must mention `description`: {w}"
-        );
     }
 
-    /// AC4: a terminal `kind: human` state with no description also
-    /// warns. The "intent should be visible at the terminal" rule from
-    /// the issue applies to both terminal kinds, not just `final`.
-    #[test]
-    fn validate_terminal_human_without_description_warns() {
-        let mut bare_human = state_final_no_description();
-        bare_human.kind = Some(StateKind::Human);
-        let g = graph(
-            "start",
-            vec![
-                ("start", state_with_edges(vec![("ok", "operator")])),
-                ("operator", bare_human),
-            ],
-        );
-        let report = validate_graph_reachability(&g);
-        assert!(report.is_ok(), "errors: {:?}", report.errors);
-        assert_eq!(report.warnings.len(), 1, "warnings: {:?}", report.warnings);
-        assert!(report.warnings[0].contains("'operator'"));
-        assert!(report.warnings[0].contains("kind: human"));
-    }
-
-    /// AC4 (boundary): a non-terminal state with no description does
-    /// NOT warn. The rule is scoped to terminals because that is where
-    /// `done` vs `aborted` confusion bites; warning on every state
-    /// would flood existing flows with low-signal noise.
-    #[test]
-    fn validate_non_terminal_without_description_does_not_warn() {
-        let g = graph(
-            "start",
-            // `start` has no description and is non-terminal.
-            // `done` carries a description so it does not warn either.
-            vec![
-                ("start", state_with_edges(vec![("ok", "done")])),
-                ("done", state_final()),
-            ],
-        );
-        let report = validate_graph_reachability(&g);
-        assert!(report.is_ok(), "errors: {:?}", report.errors);
-        assert!(
-            report.warnings.is_empty(),
-            "non-terminal states must not warn for missing description; got: {:?}",
-            report.warnings
-        );
-    }
-
-    /// AC4 (positive case): a terminal state WITH a description does
-    /// not warn. Pins the bypass so a future change to the warning
-    /// rule cannot accidentally fire on well-formed YAML.
     #[test]
     fn validate_terminal_with_description_does_not_warn() {
         let g = graph(
             "start",
             vec![
-                ("start", state_with_edges(vec![("ok", "done")])),
-                ("done", state_final()), // helper carries a description
+                ("start", state_with_select(vec![("done", "go")])),
+                ("done", state_final()),
             ],
         );
         let report = validate_graph_reachability(&g);
@@ -4453,38 +4431,27 @@ states:
         );
     }
 
-    /// `description:` round-trips through serde: deserialize, serialize,
-    /// re-deserialize, and assert the field survives both directions.
-    /// Mirrors `graph_round_trip_serde` for the new field so an
-    /// accidental `skip_serializing` cannot silently drop user content.
     #[test]
-    fn graph_state_description_round_trips_via_serde() {
+    fn graph_final_desc_round_trips_via_serde() {
         let yaml = r#"
 version: "1"
 name: rt
 initial: start
-states:
+graph:
   start:
     role: developer
-    description: Kicks off.
-    edges:
-      ok:
-        to: done
-        description: Done.
+    next:
+      - done: "ok"
+      - start: "retry"
   done:
-    kind: final
-    description: All good.
+    final: "All good."
 "#;
         let parsed = load_graph_flow_from_str(yaml).unwrap();
         let serialized = serde_yaml::to_string(&parsed).expect("serialize");
         let reparsed = load_graph_flow_from_str(&serialized).expect("re-parse");
         assert_eq!(parsed, reparsed);
         assert_eq!(
-            reparsed.states["start"].description.as_deref(),
-            Some("Kicks off.")
-        );
-        assert_eq!(
-            reparsed.states["done"].description.as_deref(),
+            reparsed.graph["done"].final_desc.as_deref(),
             Some("All good.")
         );
     }
@@ -4513,20 +4480,19 @@ states:
 
     #[test]
     fn graph_flow_parses_prompt_file_field() {
-        // AC1: prompt_file accepted on GraphFlow.
         let yaml = r#"
 version: "1"
 name: g
 prompt_file: prompts/intro.md
 initial: start
-states:
+graph:
   start:
     role: dev
-    edges:
-      ok: { to: done, description: continue }
+    next:
+      - done: "continue"
+      - start: "retry"
   done:
-    kind: final
-    description: end
+    final: "end"
 "#;
         let g = load_graph_flow_from_str(yaml).unwrap();
         assert_eq!(g.prompt_file.as_deref(), Some("prompts/intro.md"));
@@ -4535,27 +4501,26 @@ states:
 
     #[test]
     fn graph_state_parses_task_file_field() {
-        // AC2: task_file accepted on GraphState.
         let yaml = r#"
 version: "1"
 name: g
 initial: start
-states:
+graph:
   start:
     role: dev
     task_file: prompts/start.md
-    edges:
-      ok: { to: done, description: continue }
+    next:
+      - done: "continue"
+      - start: "retry"
   done:
-    kind: final
-    description: end
+    final: "end"
 "#;
         let g = load_graph_flow_from_str(yaml).unwrap();
         assert_eq!(
-            g.states["start"].task_file.as_deref(),
+            g.graph["start"].task_file.as_deref(),
             Some("prompts/start.md")
         );
-        assert!(g.states["start"].task.is_none());
+        assert!(g.graph["start"].task.is_none());
     }
 
     #[test]
@@ -4580,20 +4545,19 @@ flow:
 
     #[test]
     fn graph_flow_resolves_task_file_from_sibling() {
-        // AC4 (file content materialized) + happy path on graph.
         let yaml = r#"
 version: "1"
 name: g
 initial: design
-states:
+graph:
   design:
     role: architect
     task_file: prompts/design.md
-    edges:
-      ok: { to: done, description: continue }
+    next:
+      - done: "continue"
+      - design: "retry"
   done:
-    kind: final
-    description: end
+    final: "end"
 "#;
         let (tmp, path) =
             write_flow_with_siblings(yaml, &[("prompts/design.md", "Design the thing.\n")]);
@@ -4602,10 +4566,10 @@ states:
             panic!("expected graph flow");
         };
         assert_eq!(
-            g.states["design"].task.as_deref(),
+            g.graph["design"].task.as_deref(),
             Some("Design the thing.\n")
         );
-        assert!(g.states["design"].task_file.is_none());
+        assert!(g.graph["design"].task_file.is_none());
         drop(tmp);
     }
 
@@ -4628,21 +4592,20 @@ flow:
 
     #[test]
     fn task_and_task_file_together_is_validation_error_graph() {
-        // AC3: mutual exclusion on graph.
         let yaml = r#"
 version: "1"
 name: g
 initial: design
-states:
+graph:
   design:
     role: architect
     task: inline
     task_file: prompts/design.md
-    edges:
-      ok: { to: done, description: continue }
+    next:
+      - done: "continue"
+      - design: "retry"
   done:
-    kind: final
-    description: end
+    final: "end"
 "#;
         let (tmp, path) = write_flow_with_siblings(yaml, &[("prompts/design.md", "external")]);
         let err = load_flow_any_from_path(&path).unwrap_err();
@@ -4673,20 +4636,19 @@ flow:
 
     #[test]
     fn missing_task_file_reports_flow_path_and_state_id() {
-        // AC6: validator output names flow path + state ID.
         let yaml = r#"
 version: "1"
 name: g
 initial: design
-states:
+graph:
   design:
     role: architect
     task_file: prompts/missing.md
-    edges:
-      ok: { to: done, description: continue }
+    next:
+      - done: "continue"
+      - design: "retry"
   done:
-    kind: final
-    description: end
+    final: "end"
 "#;
         let (tmp, path) = write_flow_with_siblings(yaml, &[]);
         let err = load_flow_any_from_path(&path).unwrap_err();
@@ -4714,15 +4676,15 @@ states:
 version: "1"
 name: g
 initial: design
-states:
+graph:
   design:
     role: architect
     task_file: ../escape.md
-    edges:
-      ok: { to: done, description: continue }
+    next:
+      - done: "continue"
+      - design: "retry"
   done:
-    kind: final
-    description: end
+    final: "end"
 "#;
         let (tmp, path) = write_flow_with_siblings(yaml, &[]);
         let err = load_flow_any_from_path(&path).unwrap_err();
@@ -4842,15 +4804,15 @@ version: "1"
 name: g
 prompt_file: intro.md
 initial: design
-states:
+graph:
   design:
     role: architect
     task_file: design.md
-    edges:
-      ok: { to: done, description: continue }
+    next:
+      - done: "continue"
+      - design: "retry"
   done:
-    kind: final
-    description: end
+    final: "end"
 "#;
         let (tmp, path) =
             write_flow_with_siblings(yaml, &[("intro.md", "intro"), ("design.md", "design")]);
@@ -4859,9 +4821,9 @@ states:
             panic!("expected graph");
         };
         assert!(g.prompt_file.is_none());
-        assert!(g.states.values().all(|s| s.task_file.is_none()));
+        assert!(g.graph.values().all(|s| s.task_file.is_none()));
         assert_eq!(g.prompt.as_deref(), Some("intro"));
-        assert_eq!(g.states["design"].task.as_deref(), Some("design"));
+        assert_eq!(g.graph["design"].task.as_deref(), Some("design"));
         drop(tmp);
     }
 
@@ -4881,88 +4843,47 @@ states:
 version: "1"
 name: shell-test
 initial: a
-states:
+graph:
   a:
     role: developer
-    edges:
-      go:
-        to: verify
-        description: run verify
+    next:
+      - verify: "run verify"
+      - done: "skip verify"
 {verify_block}
   done:
-    kind: final
-    description: pass
+    final: "pass"
   back:
     role: developer
-    edges:
-      retry:
-        to: verify
-        description: try again
+    next:
+      - verify: "try again"
+      - done: "give up"
 "#
         )
     }
 
     #[test]
-    fn kind_shell_requires_command() {
+    fn shell_state_rejects_empty_run() {
         let yaml = shell_yaml(
             r#"  verify:
-    kind: shell
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
-      bad:
-        to: back
-        on: fail
-        description: red
+    run: "   "
+    next:
+      - done: pass
+      - back: fail
 "#,
         );
         let err = load_flow_any_from_str(&yaml).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("verify") && msg.contains("command"),
-            "expected error naming state and command field, got: {msg}"
-        );
+        assert!(err.to_string().contains("empty"));
     }
 
     #[test]
-    fn kind_shell_rejects_empty_command() {
+    fn shell_state_rejects_role() {
         let yaml = shell_yaml(
             r#"  verify:
-    kind: shell
-    command: "   "
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
-      bad:
-        to: back
-        on: fail
-        description: red
-"#,
-        );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
-        assert!(err.to_string().contains("non-empty"));
-    }
-
-    #[test]
-    fn kind_shell_rejects_role() {
-        let yaml = shell_yaml(
-            r#"  verify:
-    kind: shell
-    command: "true"
+    run: "true"
     role: developer
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
-      bad:
-        to: back
-        on: fail
-        description: red
+    next:
+      - done: pass
+      - back: fail
 "#,
         );
         let err = load_flow_any_from_str(&yaml).unwrap_err();
@@ -4974,21 +4895,14 @@ states:
     }
 
     #[test]
-    fn kind_shell_rejects_task() {
+    fn shell_state_rejects_task() {
         let yaml = shell_yaml(
             r#"  verify:
-    kind: shell
-    command: "true"
+    run: "true"
     task: "do the thing"
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
-      bad:
-        to: back
-        on: fail
-        description: red
+    next:
+      - done: pass
+      - back: fail
 "#,
         );
         let err = load_flow_any_from_str(&yaml).unwrap_err();
@@ -5000,78 +4914,41 @@ states:
     }
 
     #[test]
-    fn kind_shell_requires_pass_edge() {
+    fn shell_state_requires_pass_entry() {
         let yaml = shell_yaml(
             r#"  verify:
-    kind: shell
-    command: "true"
-    edges:
-      bad:
-        to: back
-        on: fail
-        description: red
+    run: "true"
+    next:
+      - back: fail
+      - done: fail
 "#,
         );
         let err = load_flow_any_from_str(&yaml).unwrap_err();
-        assert!(err.to_string().contains("on: pass"));
+        assert!(err.to_string().contains("pass"));
     }
 
     #[test]
-    fn kind_shell_requires_fail_edge() {
+    fn shell_state_requires_fail_entry() {
         let yaml = shell_yaml(
             r#"  verify:
-    kind: shell
-    command: "true"
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
+    run: "true"
+    next:
+      - done: pass
+      - back: pass
 "#,
         );
         let err = load_flow_any_from_str(&yaml).unwrap_err();
-        assert!(err.to_string().contains("on: fail"));
+        assert!(err.to_string().contains("fail"));
     }
 
     #[test]
-    fn kind_shell_rejects_untagged_edge() {
+    fn shell_state_rejects_self_loop() {
         let yaml = shell_yaml(
             r#"  verify:
-    kind: shell
-    command: "true"
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
-      stray:
-        to: back
-        description: missing on
-"#,
-        );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("stray") && (msg.contains("on: pass") || msg.contains("on: fail")),
-            "expected error naming the untagged edge, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn kind_shell_rejects_self_loop() {
-        let yaml = shell_yaml(
-            r#"  verify:
-    kind: shell
-    command: "true"
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
-      bad:
-        to: verify
-        on: fail
-        description: loop to self
+    run: "true"
+    next:
+      - done: pass
+      - verify: fail
 "#,
         );
         let err = load_flow_any_from_str(&yaml).unwrap_err();
@@ -5083,60 +4960,13 @@ states:
     }
 
     #[test]
-    fn command_forbidden_on_agent_state() {
+    fn shell_state_round_trips() {
         let yaml = shell_yaml(
             r#"  verify:
-    role: developer
-    command: "true"
-    edges:
-      go:
-        to: done
-        description: done
-"#,
-        );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("command") && msg.contains("kind: shell"),
-            "expected error stating command is shell-only, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn on_field_forbidden_on_agent_edges() {
-        let yaml = shell_yaml(
-            r#"  verify:
-    role: developer
-    edges:
-      go:
-        to: done
-        on: pass
-        description: green
-"#,
-        );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("on:") && msg.contains("kind: shell"),
-            "expected error stating on: is shell-only, got: {msg}"
-        );
-    }
-
-    #[test]
-    fn kind_shell_round_trips() {
-        let yaml = shell_yaml(
-            r#"  verify:
-    kind: shell
-    command: "just lint && just test"
-    edges:
-      ok:
-        to: done
-        on: pass
-        description: green
-      bad:
-        to: back
-        on: fail
-        description: red
+    run: "just lint && just test"
+    next:
+      - done: pass
+      - back: fail
 "#,
         );
         let flow = load_flow_any_from_str(&yaml).unwrap();
@@ -5144,12 +4974,12 @@ states:
             Flow::Graph(g) => g,
             Flow::Linear(_) => panic!("expected graph"),
         };
-        let verify = &g.states["verify"];
-        assert_eq!(verify.kind, Some(StateKind::Shell));
-        assert_eq!(verify.command.as_deref(), Some("just lint && just test"));
-        let edges = verify.edges.as_ref().unwrap();
-        assert_eq!(edges["ok"].on, Some(EdgeOn::Pass));
-        assert_eq!(edges["bad"].on, Some(EdgeOn::Fail));
+        let verify = &g.graph["verify"];
+        assert!(verify.is_shell());
+        assert_eq!(verify.run.as_deref(), Some("just lint && just test"));
+        let select = verify.select.as_ref().unwrap();
+        assert_eq!(select[0].target, "done");
+        assert_eq!(select[1].target, "back");
     }
 
     // --- Default impl guards (issue #305) ---
@@ -5170,11 +5000,6 @@ states:
     //    `GraphState::default()` emits. The round-trip equality check
     //    catches that divergence.
 
-    /// Compile-time + runtime guard that every type the issue lists
-    /// (`Backend`, `Version`, `Defaults`, `StackConfig`, `Step`,
-    /// `FlowConfig`, `GraphFlow`, `GraphState`, `GraphEdge`) implements
-    /// `Default`. Removing any derive breaks this test before it breaks
-    /// less obvious downstream call sites.
     #[test]
     fn default_impls_present_for_listed_types() {
         let _: Backend = Backend::default();
@@ -5185,7 +5010,6 @@ states:
         let _: FlowConfig = FlowConfig::default();
         let _: GraphFlow = GraphFlow::default();
         let _: GraphState = GraphState::default();
-        let _: GraphEdge = GraphEdge::default();
     }
 
     /// Backend default is `claude-cli`. Pin this so a future tier-zero
@@ -5213,23 +5037,9 @@ states:
         assert_eq!(original, parsed);
     }
 
-    /// Round-trip: `GraphEdge::default()` -- both fields are required
-    /// (no `skip_serializing_if`), so the emitted YAML carries them as
-    /// empty strings and re-parse must match. This guards against future
-    /// `Default` divergence (e.g. someone adding a third required field
-    /// without updating this test) the same way the `GraphState` test
-    /// does.
-    #[test]
-    fn graph_edge_default_serde_round_trip() {
-        let original = GraphEdge::default();
-        let yaml = serde_yaml::to_string(&original).expect("serialize");
-        let parsed: GraphEdge = serde_yaml::from_str(&yaml).expect("re-parse");
-        assert_eq!(original, parsed);
-    }
-
     /// Round-trip: `GraphFlow::default()`. `version`, `name`, and
     /// `initial` are required -- they serialize to empty strings, and
-    /// `states` to an empty mapping. The reparse must equal the
+    /// `graph` to an empty mapping. The reparse must equal the
     /// original. Like the other round-trip tests, this fires when a
     /// future field's `Default` and serde defaults disagree.
     #[test]

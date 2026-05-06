@@ -183,16 +183,14 @@ pub struct StepRecord {
 
 /// Per-step graph-transition record, written into `StepRecord::graph_decision`
 /// for `kind: graph` steps. Captures the structured decision the agent emitted
-/// (`transition`, `reason`) plus the resolved `next_state` so audit consumers
-/// do not need access to the original edge map to follow the run's path.
+/// (`transition`, `reason`). In the #317 schema redesign, `transition` IS the
+/// target state name directly (no separate edge name + next_state).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GraphDecision {
-    /// Edge name the agent picked from the deterministic menu.
+    /// Target state the agent picked (or the shell exit code routed to).
     pub transition: String,
-    /// One- to two-sentence justification from the agent's JSON reply.
+    /// Justification from the agent's JSON reply or "exit code N" for shell states.
     pub reason: String,
-    /// State ID the run jumped to after this transition.
-    pub next_state: String,
 }
 
 /// One row of conversation-step participant statistics.

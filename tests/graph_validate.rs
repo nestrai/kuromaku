@@ -31,16 +31,14 @@ const CLEAN_GRAPH: &str = r#"
 version: "1"
 name: clean
 initial: start
-states:
+graph:
   start:
     role: developer
-    edges:
-      ok:
-        to: done
-        description: Looks good.
+    next:
+      - done: "Looks good."
+      - start: "Retry."
   done:
-    kind: final
-    description: Happy-path exit.
+    final: "Happy-path exit."
 "#;
 
 /// A graph YAML with a real dead-end state: `dead:` has neither
@@ -53,13 +51,12 @@ const DEAD_END_GRAPH: &str = r#"
 version: "1"
 name: dead-end
 initial: start
-states:
+graph:
   start:
     role: developer
-    edges:
-      go:
-        to: dead
-        description: Walk into the dead end.
+    next:
+      - dead: "Walk into the dead end."
+      - start: "Loop."
   dead:
     role: developer
 "#;
@@ -71,31 +68,28 @@ const SCHEMA_INVALID_GRAPH: &str = r#"
 version: "1"
 name: bad-initial
 initial: nowhere
-states:
+graph:
   done:
-    kind: final
+    final: "end"
 "#;
 
 const UNREACHABLE_GRAPH: &str = r#"
 version: "1"
 name: unreachable
 initial: start
-states:
+graph:
   start:
     role: developer
-    edges:
-      ok:
-        to: done
-        description: Done.
+    next:
+      - done: "Done."
+      - start: "Loop."
   done:
-    kind: final
-    description: Happy-path exit.
+    final: "Happy-path exit."
   orphan:
     role: reviewer
-    edges:
-      back:
-        to: done
-        description: Loops back.
+    next:
+      - done: "Loops back."
+      - start: "Go to start."
 "#;
 
 #[test]
@@ -286,10 +280,9 @@ fn run_graph_flow_routes_through_graph_runtime() {
 version: "1"
 name: final-only
 initial: done
-states:
+graph:
   done:
-    kind: final
-    description: Trivial single-state graph for the routing smoke test.
+    final: "Trivial single-state graph for the routing smoke test."
 "#;
 
     let tmp = tempfile::tempdir().unwrap();
@@ -340,17 +333,15 @@ fn validate_reports_missing_task_file_with_flow_path_and_state_id() {
 version: "1"
 name: missing-task-file
 initial: design
-states:
+graph:
   design:
     role: developer
     task_file: prompts/design.md
-    edges:
-      ok:
-        to: done
-        description: Move on.
+    next:
+      - done: "Move on."
+      - design: "Retry."
   done:
-    kind: final
-    description: Done.
+    final: "Done."
 "#;
 
     let tmp = tempfile::tempdir().unwrap();

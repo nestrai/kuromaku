@@ -144,24 +144,21 @@ const GRAPH_3STATE: &str = r#"version: "1"
 name: three-state
 prompt: "drive the test graph"
 initial: start
-states:
+graph:
   start:
     role: dev
     task: "say hi"
-    edges:
-      go:
-        to: middle
-        description: Move to the middle state.
+    next:
+      - middle: "Move to the middle state."
+      - done: "Skip to done."
   middle:
     role: dev
     task: "look around"
-    edges:
-      finish:
-        to: done
-        description: Move to the final state.
+    next:
+      - done: "Move to the final state."
+      - start: "Go back."
   done:
-    kind: final
-    description: Three-state graph reached its terminal state.
+    final: "Three-state graph reached its terminal state."
 "#;
 
 #[test]
@@ -184,10 +181,10 @@ fn three_state_graph_runs_to_completion() {
     let (_shim_dir, shim, log) = install_shim(
         r#"case "$PROMPT" in
   *'state `start`'*)
-    printf '{"transition": "go", "reason": "moving to middle as instructed"}\n'
+    printf '{"transition": "middle", "reason": "moving to middle as instructed"}\n'
     ;;
   *'state `middle`'*)
-    printf '{"transition": "finish", "reason": "wrapping up"}\n'
+    printf '{"transition": "done", "reason": "wrapping up"}\n'
     ;;
   *)
     printf 'unknown prompt\n' >&2
@@ -239,27 +236,18 @@ esac
     // audit trail shows what the agent actually said.
     let body = std::fs::read_to_string(&start_md).unwrap();
     assert!(
-        body.contains("\"transition\": \"go\""),
+        body.contains("\"transition\": \"middle\""),
         "start step content must contain agent's reply, got:\n{body}"
     );
 
-    // The transition decision is also persisted into the structured
-    // meta.yaml so audit consumers (kuro show-output, MCP show_output,
-    // log parsers) do not have to re-parse the markdown body. Both the
-    // edge name the agent picked and the resolved next state must be
-    // present.
     let meta = std::fs::read_to_string(steps_dir.join("01-start.meta.yaml")).unwrap();
     assert!(
         meta.contains("graph_decision:"),
         "01-start.meta.yaml must carry graph_decision block, got:\n{meta}"
     );
     assert!(
-        meta.contains("transition: go"),
+        meta.contains("transition: middle"),
         "graph_decision must carry the picked transition, got:\n{meta}"
-    );
-    assert!(
-        meta.contains("next_state: middle"),
-        "graph_decision must carry the resolved next_state, got:\n{meta}"
     );
 }
 
@@ -286,10 +274,10 @@ fn malformed_first_reply_retries_and_succeeds() {
 fi
 case "$PROMPT" in
   *'state `start`'*)
-    printf '{"transition": "go", "reason": "now valid"}\n'
+    printf '{"transition": "middle", "reason": "now valid"}\n'
     ;;
   *'state `middle`'*)
-    printf '{"transition": "finish", "reason": "wrapping up"}\n'
+    printf '{"transition": "done", "reason": "wrapping up"}\n'
     ;;
 esac
 "#,
@@ -370,19 +358,17 @@ const GRAPH_LOOP: &str = r#"version: "1"
 name: looping
 prompt: "drive the loop graph"
 initial: a
-states:
+graph:
   a:
     role: dev
-    edges:
-      next:
-        to: b
-        description: go to b
+    next:
+      - b: "go to b"
+      - a: "stay"
   b:
     role: dev
-    edges:
-      back:
-        to: a
-        description: back to a
+    next:
+      - a: "back to a"
+      - b: "stay"
 "#;
 
 #[test]
@@ -400,10 +386,10 @@ fn per_state_visits_aborts_with_clear_error() {
     let (_shim_dir, shim, log) = install_shim(
         r#"case "$PROMPT" in
   *'state `a`'*)
-    printf '{"transition": "next", "reason": "loop"}\n'
+    printf '{"transition": "b", "reason": "loop"}\n'
     ;;
   *'state `b`'*)
-    printf '{"transition": "back", "reason": "loop"}\n'
+    printf '{"transition": "a", "reason": "loop"}\n'
     ;;
 esac
 "#,
