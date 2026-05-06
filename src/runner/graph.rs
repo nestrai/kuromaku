@@ -30,8 +30,8 @@ use std::time::Instant;
 
 use indexmap::IndexMap;
 
-use crate::config::{Agent, Backend, GraphEdge, GraphFlow, StateKind};
-use crate::executor::{self, ExecutionTask, ExecutorBoxed, OutputFormat};
+use crate::config::{Agent, Backend, EdgeOn, GraphEdge, GraphFlow, StateKind};
+use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorError, OutputFormat};
 use crate::stack::{self, GraphDecision, StepRecord};
 use crate::ui::{self, StepInfo, StepState};
 
@@ -248,6 +248,28 @@ pub async fn run_graph_flow(
                     "state '{current}' visited {visit} times (cap {DEFAULT_MAX_VISITS_PER_STATE}); flow is stuck in a loop -- agents are not converging"
                 ),
             });
+        }
+
+        // Shell state (issue #310): deterministic, exit-code-routed gate,
+        // no LLM call. Counts toward step_num and visits like an agent
+        // state so an `implement <-> verify` ping-pong still trips the
+        // visit cap. Dispatch through the same executor the linear
+        // shell-step path uses so the on-disk artifact shape matches
+        // (kind: shell, exit_code, duration_ms in StepRecord).
+        if matches!(state.kind, Some(StateKind::Shell)) {
+            let shell_outcome = run_shell_state(
+                executor.as_ref(),
+                &current,
+                edges,
+                state.command.as_deref().unwrap_or(""),
+                ctx,
+                step_num,
+            )
+            .await?;
+            results.push(shell_outcome.result);
+            prior_state = Some(current.clone());
+            current = shell_outcome.next_state;
+            continue;
         }
 
         // Resolve agent for this state. Missing means the role had no
@@ -624,6 +646,268 @@ async fn run_state_via_executor(
     Ok(output.stdout)
 }
 
+/// Outcome of a single `kind: shell` state execution: the recorded step
+/// (so the caller can append it to `results`) plus the resolved next
+/// state ID. Lives next to [`run_shell_state`] because nothing else needs
+/// the shape -- the caller just splats both fields back into its own
+/// loop variables.
+#[derive(Debug)]
+struct ShellStateOutcome {
+    result: StepRunResult,
+    next_state: String,
+}
+
+/// Drive a single `kind: shell` state (issue #310).
+///
+/// Spawns the configured `command` via `sh -c` through the local
+/// executor, captures stdout / stderr / exit code / duration, persists a
+/// `kind: shell` step record under `<run>/steps/NN-<state>.txt`, picks
+/// the outgoing edge by exit code (`0` -> first `on: pass`, non-zero ->
+/// first `on: fail`), and returns the persisted result + next state.
+///
+/// The on-disk artifact mirrors the synthesized framing block injected
+/// into the next agent's prompt (`$ <command>`, exit code, stdout,
+/// stderr) so a developer reading `kuro show-output` sees the same
+/// payload the next state's agent saw via `prior_context`. Stderr is
+/// also surfaced live to the user (matching the linear-shell-step
+/// contract from issue #23).
+///
+/// Edge selection deliberately walks edges in declaration order with an
+/// explicit `on:` tag check rather than positional convention: reordering
+/// YAML keys would otherwise silently re-route the run. Validation in
+/// `validate_shell_state_semantics` guarantees at least one `on: pass`
+/// and one `on: fail` edge exist, but the runtime defends against
+/// missing tags as well in case an unvalidated `GraphFlow` is built
+/// programmatically.
+async fn run_shell_state(
+    executor: &dyn ExecutorBoxed,
+    state_id: &str,
+    edges: &IndexMap<String, GraphEdge>,
+    command: &str,
+    ctx: &RunContext,
+    step_num: usize,
+) -> Result<ShellStateOutcome, RunError> {
+    if command.trim().is_empty() {
+        return Err(RunError::GraphRuntime {
+            state: state_id.to_string(),
+            reason: "shell state has no command to run".to_string(),
+        });
+    }
+
+    ui::print_shell_step_banner(step_num, DEFAULT_MAX_STEPS, state_id, command, &[]);
+
+    // Output filename mirrors the linear shell-step convention (`.txt`,
+    // not `.md`) so `kuro show-output` and `print_output: true` do not
+    // try to render shell stdout through termimad.
+    let content_filename = stack::step_content_filename(step_num, state_id, "txt");
+    let output_path = ctx
+        .run_path
+        .join(stack::STEPS_SUBDIR)
+        .join(&content_filename);
+    if let Some(parent) = output_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let output_file = format!(
+        "{}/{}/{}",
+        ctx.run_id,
+        stack::STEPS_SUBDIR,
+        content_filename
+    );
+
+    let project = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+        .unwrap_or_else(|| "unknown".to_string());
+    let short_id = &chrono::Utc::now().timestamp_millis().to_string()[8..];
+    let task_id = format!(
+        "kuro-{project}-{}-graph-{state_id}-shell-{short_id}",
+        ctx.flow_name
+    );
+
+    let task = ExecutionTask {
+        id: task_id,
+        command: command.to_string(),
+        env: HashMap::new(),
+        // Stream stdout to the artifact file so users can `tail -f` a
+        // long-running `just test`. We rewrite the file below to fold
+        // stderr + exit code into the same body, but streaming during
+        // execution still gives a live view of what the command emitted.
+        stdout_file: Some(output_path.to_path_buf()),
+        output_format: OutputFormat::Raw,
+    };
+
+    let start = Instant::now();
+    let started_at = chrono::Utc::now();
+    let spinner = ui::start_spinner();
+
+    let handle = executor
+        .spawn_boxed(task)
+        .await
+        .map_err(|e| RunError::ExecutorFailed {
+            step: state_id.to_string(),
+            source: e,
+        })?;
+
+    // The executor's `wait` contract treats any non-zero exit as an error
+    // (`ExecutorError::Failed { code, message }`) so the linear runner can
+    // bail on a failing shell step. The shell-state contract is the
+    // opposite: a non-zero exit is the routing signal we explicitly want
+    // to fork on, so we recover the failed-but-completed case here and
+    // synthesise an `ExecutionOutput` from what survives.
+    //
+    // What the Err path discards:
+    // - stdout: still on disk because we passed `stdout_file:` -- read it
+    //   back from `output_path`. Empty file is fine (commands often emit
+    //   nothing when they fail with a clear error to stderr).
+    // - stderr: prefixed into `message` as `"process exited with code N: <stderr>"`.
+    //   Strip the prefix back off so the artifact body shows the real
+    //   stderr instead of leaking the executor's internal wording.
+    let (stdout, stderr, exit_code) = match executor.wait_boxed(&handle).await {
+        Ok(out) => (out.stdout, out.stderr, out.exit_code),
+        Err(ExecutorError::Failed { code, message }) => {
+            let stdout = std::fs::read_to_string(&output_path)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            let prefix = format!("process exited with code {code}: ");
+            let stderr = message
+                .strip_prefix(&prefix)
+                .unwrap_or(&message)
+                .to_string();
+            (stdout, stderr, code)
+        }
+        Err(e) => {
+            return Err(RunError::ExecutorFailed {
+                step: state_id.to_string(),
+                source: e,
+            });
+        }
+    };
+
+    spinner.stop();
+    let duration = start.elapsed();
+
+    if !stderr.is_empty() {
+        eprintln!("{}", stderr.trim_end());
+    }
+
+    // Pick the next edge from the exit code BEFORE persisting the step
+    // so the StepRecord can carry the resolved next_state -- audit
+    // consumers (`kuro show-output`, the MCP `show_output` tool) should
+    // not have to re-derive routing from the edge map.
+    let want = if exit_code == 0 {
+        EdgeOn::Pass
+    } else {
+        EdgeOn::Fail
+    };
+    let (transition_name, edge) =
+        edges
+            .iter()
+            .find(|(_, e)| e.on == Some(want))
+            .ok_or_else(|| RunError::GraphRuntime {
+                state: state_id.to_string(),
+                reason: format!(
+                    "shell state exited with code {} but no edge declares `on: {}`",
+                    exit_code,
+                    match want {
+                        EdgeOn::Pass => "pass",
+                        EdgeOn::Fail => "fail",
+                    }
+                ),
+            })?;
+    let transition_name = transition_name.clone();
+    let next_state = edge.to.clone();
+
+    // Synthesize the body that lands on disk AND in the next state's
+    // prior_context. Includes the command, exit code, stdout, and stderr
+    // so a downstream agent (e.g. Noah re-reading a failing `just test`)
+    // does not have to read the manifest separately to see what failed.
+    let body = render_shell_artifact(command, exit_code, &stdout, &stderr);
+
+    let record = StepRecord {
+        step_id: state_id.to_string(),
+        kind: "shell".to_string(),
+        agent: None,
+        model_requested: None,
+        model_actual: None,
+        backend: "shell".to_string(),
+        tokens_in: None,
+        tokens_out: None,
+        duration_ms: duration.as_millis(),
+        started_at: started_at.to_rfc3339(),
+        exit_code,
+        input_steps: Vec::new(),
+        output_file: content_filename.clone(),
+        participants: Vec::new(),
+        turns: None,
+        messages: None,
+        terminated_by: None,
+        graph_decision: Some(GraphDecision {
+            transition: transition_name.clone(),
+            reason: format!("exit code {exit_code}"),
+            next_state: next_state.clone(),
+        }),
+    };
+    stack::write_run_step(&ctx.run_path, step_num, &record, &body).map_err(|e| {
+        RunError::Stack {
+            step: state_id.to_string(),
+            source: e,
+        }
+    })?;
+
+    let display_path = output_path
+        .canonicalize()
+        .unwrap_or(output_path.clone())
+        .display()
+        .to_string();
+    ui::print_step_done(&format_duration(duration), "—", "—", &display_path);
+    ui::print_graph_transition(
+        &transition_name,
+        &next_state,
+        &format!("exit code {exit_code}"),
+    );
+
+    let result = StepRunResult {
+        step_id: state_id.to_string(),
+        agent_name: "shell".to_string(),
+        backend: "shell".to_string(),
+        duration,
+        tokens_in: None,
+        tokens_out: None,
+        output_file,
+        print_output: false,
+        record,
+    };
+
+    Ok(ShellStateOutcome { result, next_state })
+}
+
+/// Build the on-disk + prior-context payload for a shell state.
+///
+/// The format is intentionally explicit so the next state's agent (e.g.
+/// Noah after a failing `just test`) sees three labelled blocks rather
+/// than guessing what got concatenated. Stderr is included verbatim --
+/// failing test output frequently lives there, and dropping it would
+/// defeat the whole point of the verify gate.
+fn render_shell_artifact(command: &str, exit_code: i32, stdout: &str, stderr: &str) -> String {
+    let mut out = String::new();
+    out.push_str("$ ");
+    out.push_str(command);
+    out.push('\n');
+    out.push_str(&format!("exit code: {exit_code}\n"));
+    out.push_str("--- stdout ---\n");
+    out.push_str(stdout);
+    if !stdout.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("--- stderr ---\n");
+    out.push_str(stderr);
+    if !stderr.is_empty() && !stderr.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -637,6 +921,7 @@ mod tests {
                 GraphEdge {
                     to: (*to).to_string(),
                     description: (*desc).to_string(),
+                    on: None,
                 },
             );
         }
@@ -732,5 +1017,202 @@ mod tests {
         let note = malformed_retry_note(&err);
         assert!(note.contains("malformed"));
         assert!(note.contains("Reply again with a JSON object"));
+    }
+
+    #[test]
+    fn render_shell_artifact_labels_three_blocks() {
+        // Acceptance: the artifact body must be self-describing so a
+        // downstream agent reading prior_context can tell command, exit
+        // code, stdout, and stderr apart without inferring from layout.
+        let body = render_shell_artifact("just test", 1, "test 5 ok\n", "test 6 FAILED\n");
+        assert!(body.starts_with("$ just test\n"));
+        assert!(body.contains("exit code: 1\n"));
+        assert!(body.contains("--- stdout ---\ntest 5 ok\n"));
+        assert!(body.contains("--- stderr ---\ntest 6 FAILED\n"));
+    }
+
+    #[test]
+    fn render_shell_artifact_handles_missing_trailing_newlines() {
+        // Streamed shell output frequently lacks a final newline; the
+        // artifact must still be readable rather than mashing the next
+        // section onto the same line.
+        let body = render_shell_artifact("echo hi", 0, "hi", "");
+        assert!(body.contains("hi\n--- stderr ---"));
+        // Empty stderr does not get an extra trailing newline appended.
+        assert!(body.ends_with("--- stderr ---\n"));
+    }
+
+    // --- Shell-state driver tests (issue #310) --------------------------
+    //
+    // These exercise `run_shell_state` against the real `LocalExecutor`
+    // because the executor's wait/error contract is half of what we are
+    // verifying (non-zero exit -> ExecutorError::Failed -> recovered into
+    // an Ok routing decision). A mock would just re-encode the contract
+    // we want to pin.
+
+    use crate::executor;
+    use crate::runner::RunContext;
+    use std::collections::HashMap;
+
+    fn shell_state_ctx(stack_path: std::path::PathBuf) -> RunContext {
+        RunContext::new(
+            "test-graph".to_string(),
+            "irrelevant for shell states".to_string(),
+            stack_path,
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+    }
+
+    fn pass_fail_edges() -> IndexMap<String, GraphEdge> {
+        let mut m = IndexMap::new();
+        m.insert(
+            "ok".to_string(),
+            GraphEdge {
+                to: "next_pass".to_string(),
+                description: "green".to_string(),
+                on: Some(EdgeOn::Pass),
+            },
+        );
+        m.insert(
+            "bad".to_string(),
+            GraphEdge {
+                to: "next_fail".to_string(),
+                description: "red".to_string(),
+                on: Some(EdgeOn::Fail),
+            },
+        );
+        m
+    }
+
+    #[tokio::test]
+    async fn shell_state_routes_pass_on_exit_zero() {
+        // Acceptance: exit code 0 selects the first edge tagged `on: pass`
+        // and persists a step record carrying the resolved next state.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_state_ctx(dir.path().to_path_buf());
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+        let executor = executor::create_executor();
+        let edges = pass_fail_edges();
+
+        let outcome = run_shell_state(executor.as_ref(), "verify", &edges, "true", &ctx, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome.next_state, "next_pass");
+        assert_eq!(outcome.result.record.exit_code, 0);
+        let decision = outcome.result.record.graph_decision.as_ref().unwrap();
+        assert_eq!(decision.transition, "ok");
+        assert_eq!(decision.next_state, "next_pass");
+    }
+
+    #[tokio::test]
+    async fn shell_state_routes_fail_on_nonzero_exit() {
+        // Acceptance: non-zero exit selects the first `on: fail` edge.
+        // The executor signals non-zero exits via `ExecutorError::Failed`,
+        // which the shell-state driver must recover from rather than
+        // propagating -- the whole point of the verify gate.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_state_ctx(dir.path().to_path_buf());
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+        let executor = executor::create_executor();
+        let edges = pass_fail_edges();
+
+        let outcome = run_shell_state(
+            executor.as_ref(),
+            "verify",
+            &edges,
+            "echo boom 1>&2; exit 7",
+            &ctx,
+            1,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.next_state, "next_fail");
+        assert_eq!(outcome.result.record.exit_code, 7);
+        let decision = outcome.result.record.graph_decision.as_ref().unwrap();
+        assert_eq!(decision.transition, "bad");
+    }
+
+    #[tokio::test]
+    async fn shell_state_persists_artifact_with_command_and_exit() {
+        // The artifact written under steps/NN-<id>.txt is the same body
+        // injected into the next state's prior_context. Verify the
+        // command, exit code, and captured stdout / stderr land in it.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_state_ctx(dir.path().to_path_buf());
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+        let executor = executor::create_executor();
+        let edges = pass_fail_edges();
+
+        run_shell_state(
+            executor.as_ref(),
+            "verify",
+            &edges,
+            "printf out; printf err 1>&2; exit 3",
+            &ctx,
+            2,
+        )
+        .await
+        .unwrap();
+
+        let body = stack::read_run_step_content(&ctx.run_path, "verify").unwrap();
+        assert!(body.contains("$ printf out; printf err 1>&2; exit 3"));
+        assert!(body.contains("exit code: 3"));
+        assert!(body.contains("--- stdout ---"));
+        assert!(body.contains("out"));
+        assert!(body.contains("--- stderr ---"));
+        assert!(body.contains("err"));
+    }
+
+    #[tokio::test]
+    async fn shell_state_rejects_empty_command_at_runtime() {
+        // The schema validator already blocks empty commands, but the
+        // driver also defends against a programmatically-built GraphFlow
+        // skipping validation -- otherwise an empty command would be
+        // silently passed to `sh -c` and route as success.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_state_ctx(dir.path().to_path_buf());
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+        let executor = executor::create_executor();
+        let edges = pass_fail_edges();
+
+        let err = run_shell_state(executor.as_ref(), "verify", &edges, "   ", &ctx, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RunError::GraphRuntime { .. }));
+        assert!(err.to_string().contains("no command"));
+    }
+
+    #[tokio::test]
+    async fn shell_state_errors_when_no_edge_matches_exit() {
+        // Programmatic GraphFlow with only an `on: pass` edge: a non-zero
+        // exit has nowhere to route, so the driver bails with a clear
+        // GraphRuntime error rather than picking an arbitrary edge.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = shell_state_ctx(dir.path().to_path_buf());
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+        let executor = executor::create_executor();
+        let mut edges: IndexMap<String, GraphEdge> = IndexMap::new();
+        edges.insert(
+            "ok".to_string(),
+            GraphEdge {
+                to: "done".to_string(),
+                description: "green".to_string(),
+                on: Some(EdgeOn::Pass),
+            },
+        );
+
+        let err = run_shell_state(executor.as_ref(), "verify", &edges, "exit 1", &ctx, 1)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("on: fail"),
+            "expected message naming on: fail, got: {msg}"
+        );
     }
 }

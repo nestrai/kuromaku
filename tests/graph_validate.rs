@@ -243,6 +243,7 @@ fn run_dead_end_graph_refuses_before_spawn() {
     // alone cannot prove.
     let tmp = tempfile::tempdir().unwrap();
     let flow = write_flow(tmp.path(), "dead.yaml", DEAD_END_GRAPH);
+    let home = tempfile::tempdir().unwrap();
 
     let out = Command::new(kuro_bin())
         .arg("run")
@@ -250,6 +251,8 @@ fn run_dead_end_graph_refuses_before_spawn() {
         .arg(&flow)
         .arg("-t")
         .arg("ignored")
+        .env("HOME", home.path())
+        .current_dir(tmp.path())
         .output()
         .expect("spawn kuro run");
 

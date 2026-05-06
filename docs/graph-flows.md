@@ -176,6 +176,129 @@ When to split:
   diff in `prompts/<state>.md` reads better than a diff buried in
   the YAML.
 
+## Deterministic shell gates: `kind: shell`
+
+A graph state can run a shell command instead of an agent. The exit
+code routes the next transition: `0` follows the `on: pass` edge,
+non-zero follows the `on: fail` edge. No LLM call, no JSON parsing --
+the shell is the source of truth for "does it compile, do tests pass".
+
+```yaml
+states:
+  review:
+    role: reviewer
+    task: ...
+    edges:
+      approved: { to: verify, description: PASS }
+      rework:   { to: implement, description: FAIL }
+
+  verify:
+    kind: shell
+    command: "just lint && just test"
+    description: Deterministic gate -- exit code routes the next state.
+    edges:
+      verify_passed:
+        to: pr
+        on: pass
+        description: All checks green.
+      verify_failed:
+        to: implement
+        on: fail
+        description: Lint or tests failed -- output is threaded back.
+
+  pr:
+    role: developer
+    task: ...
+    edges:
+      pr_created: { to: done, description: PR opened. }
+```
+
+Use a shell state when the question is mechanical and binary:
+
+- "Does the code compile and do the tests pass?" -- `just lint && just test`
+- "Is the workspace clean?" -- `git diff --quiet`
+- "Does the seed file match the project copy?" -- `diff -q a b`
+
+Don't use a shell state for judgement calls (code quality, design
+review). Those need an agent and a verdict in `{transition, reason}`
+JSON.
+
+### Shell-state schema
+
+| Field | Required | Notes |
+|--|--|--|
+| `kind: shell` | yes | Marks the state as a shell gate. |
+| `command:` | yes | The shell command, run via `sh -c`. |
+| `edges:` | yes | Must include at least one `on: pass` and one `on: fail`. |
+| `role:`, `task:`, `task_file:` | rejected | Shell states have no agent. |
+| `description:` | optional | Same convention as agent states. |
+
+Each edge under a shell state must declare an `on:` tag. Edge
+selection walks edges in declaration order: the first edge whose `on:`
+matches the exit-code outcome wins. Reordering YAML keys does not
+silently re-route the run because the routing depends on the explicit
+tag, not on position.
+
+The `on:` field is **only** valid on edges of a `kind: shell` state --
+declaring `on:` on an agent-state edge is a validation error. Same
+rule applies to `command:` on non-shell states. `kuro validate`
+catches both before the run starts.
+
+Self-loops on shell states are rejected: a shell command cannot
+recover from its own non-zero exit. Route to a different state
+(typically the implementer) to fix the failure.
+
+### What the next state sees
+
+The shell state writes a self-describing artifact to the run
+directory under `<run>/steps/NN-<id>.txt`:
+
+```
+$ just lint && just test
+exit code: 1
+--- stdout ---
+running 42 tests
+test foo::bar ... FAILED
+--- stderr ---
+thread 'main' panicked at ...
+```
+
+The same body is injected into the next state's `prior_context`, so
+an implementer routed back from a failing `verify` sees the actual
+test failure instead of a paraphrased restatement. Stdout is also
+streamed live to the artifact file during execution -- a long-running
+`just test` is `tail -f`-able while it runs.
+
+The persisted `StepRecord` carries `kind: "shell"`, the actual exit
+code (not just the routed-on category), the resolved next state, and
+the wall-clock duration so `kuro show-output` and the audit trail
+stay shape-uniform with agent steps.
+
+### Variable substitution
+
+`{{vars.X}}` substitution applies to `command:` the same way it does
+to `task:` strings, so a flow can parameterize the gate:
+
+```yaml
+verify:
+  kind: shell
+  command: "cargo test --test {{vars.suite}}"
+  edges:
+    verify_passed: { to: pr, on: pass, description: green }
+    verify_failed: { to: implement, on: fail, description: red }
+```
+
+`{{roles.X}}` does not apply -- a shell command does not address an
+agent, so role substitution would have no useful target.
+
+### Loop guards
+
+A shell state counts against the same per-state visit cap as any
+other state (`DEFAULT_MAX_VISITS_PER_STATE`, currently 5). A flow
+that ping-pongs `verify <-> implement` because the implementer can't
+get the tests green hits the cap after a few rounds and aborts loud
+rather than burning through the full `DEFAULT_MAX_STEPS` budget.
+
 ## Role-bound names: `{{roles.<role>}}`
 
 Prompts often need to reference *another* role's agent by name --
