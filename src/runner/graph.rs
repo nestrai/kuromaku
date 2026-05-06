@@ -28,9 +28,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use indexmap::IndexMap;
-
-use crate::config::{Agent, Backend, EdgeOn, GraphEdge, GraphFlow, StateKind};
+use crate::config::{Agent, Backend, GraphFlow, SelectEntry};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorError, OutputFormat};
 use crate::stack::{self, GraphDecision, StepRecord};
 use crate::ui::{self, StepInfo, StepState};
@@ -79,17 +77,22 @@ pub const DEFAULT_MAX_VISITS_PER_STATE: usize = 5;
 /// not need to change. The downstream context-handoff (see [`run_graph_flow`])
 /// reads the saved file verbatim, so prose + JSON survives intact across
 /// the next state's prompt.
-pub fn build_menu(state_id: &str, edges: &IndexMap<String, GraphEdge>) -> String {
+pub fn build_menu(state_id: &str, entries: &[SelectEntry]) -> String {
     let mut s = String::new();
     s.push_str(&format!(
         "You are at state `{state_id}`. Complete the task above as your main reply -- produce the full artifact (design plan, review, code summary, etc.) so the next agent in the graph can build on your work. After the artifact, end your reply with a single JSON object choosing one transition:\n\n",
     ));
     s.push_str(
-        "{\"transition\": \"<edge-name>\", \"reason\": \"<one to two sentences explaining why>\"}\n\n",
+        "{\"transition\": \"<target-state>\", \"reason\": \"<one to two sentences explaining why>\"}\n\n",
     );
     s.push_str("Available transitions:\n");
-    for (name, edge) in edges {
-        s.push_str(&format!("- `{name}`: {}\n", edge.description));
+    for entry in entries {
+        let reason = entry
+            .reason
+            .as_ref()
+            .map(|r| r.display())
+            .unwrap_or_default();
+        s.push_str(&format!("- `{}`: {}\n", entry.target, reason));
     }
     s.push('\n');
     s.push_str("The JSON object must appear exactly once, on its own line at the end of your reply. Pick one of the transitions listed -- do not invent new ones.");
@@ -174,24 +177,17 @@ pub async fn run_graph_flow(
     let mut visits: HashMap<String, usize> = HashMap::new();
 
     loop {
-        let state = graph.states.get(&current).ok_or_else(|| {
-            // Schema/reachability validation should make this unreachable;
-            // surface it as a runtime error rather than panicking so the
-            // user gets a clear message if they ever construct a malformed
-            // GraphFlow programmatically.
-            RunError::GraphRuntime {
+        let state = graph
+            .graph
+            .get(&current)
+            .ok_or_else(|| RunError::GraphRuntime {
                 state: current.clone(),
                 reason: format!("state '{current}' not found in graph"),
-            }
-        })?;
+            })?;
 
-        // Final state: terminate cleanly. We do NOT count terminal states
-        // toward step_num so a `start -> final` graph runs exactly one step.
-        if matches!(state.kind, Some(StateKind::Final)) {
+        // Final state: terminate cleanly.
+        if state.is_final() {
             ui::print_graph_final(&current);
-            // Hand the terminal state ID back to the caller so it can land
-            // in the run's `manifest.yaml` (issue #257). Audit consumers
-            // pull it from there to tell `done` apart from `aborted`.
             return Ok(GraphRunOutcome {
                 steps: results,
                 final_state: current,
@@ -199,28 +195,28 @@ pub async fn run_graph_flow(
         }
 
         // Human-handoff is accepted at the schema level but the prototype
-        // runtime does not know how to drive it. Refuse loudly rather than
-        // silently treating it as a final state.
-        if matches!(state.kind, Some(StateKind::Human)) {
+        // runtime does not know how to drive it.
+        if state.is_human() {
             return Err(RunError::GraphRuntime {
                 state: current.clone(),
                 reason:
-                    "kind: human handoff is accepted by the schema but not supported by the prototype runtime"
+                    "human handoff is accepted by the schema but not supported by the prototype runtime"
                         .to_string(),
             });
         }
 
-        // Non-terminal state must have edges -- the reachability validator
-        // catches "no edges and no kind" as a dead end before we get here,
-        // but defend against an unvalidated GraphFlow anyway.
-        let edges = state.edges.as_ref().ok_or_else(|| RunError::GraphRuntime {
-            state: current.clone(),
-            reason: "non-terminal state has no edges".to_string(),
-        })?;
-        if edges.is_empty() {
+        // Non-terminal state must have select entries.
+        let entries = state
+            .select
+            .as_ref()
+            .ok_or_else(|| RunError::GraphRuntime {
+                state: current.clone(),
+                reason: "non-terminal state has no select entries".to_string(),
+            })?;
+        if entries.is_empty() {
             return Err(RunError::GraphRuntime {
                 state: current.clone(),
-                reason: "non-terminal state has an empty edge set".to_string(),
+                reason: "non-terminal state has an empty select list".to_string(),
             });
         }
 
@@ -250,18 +246,14 @@ pub async fn run_graph_flow(
             });
         }
 
-        // Shell state (issue #310): deterministic, exit-code-routed gate,
-        // no LLM call. Counts toward step_num and visits like an agent
-        // state so an `implement <-> verify` ping-pong still trips the
-        // visit cap. Dispatch through the same executor the linear
-        // shell-step path uses so the on-disk artifact shape matches
-        // (kind: shell, exit_code, duration_ms in StepRecord).
-        if matches!(state.kind, Some(StateKind::Shell)) {
+        // Shell state: deterministic, exit-code-routed gate,
+        // no LLM call.
+        if state.is_shell() {
             let shell_outcome = run_shell_state(
                 executor.as_ref(),
                 &current,
-                edges,
-                state.command.as_deref().unwrap_or(""),
+                entries,
+                state.run.as_deref().unwrap_or(""),
                 ctx,
                 step_num,
             )
@@ -328,9 +320,9 @@ pub async fn run_graph_flow(
         };
 
         // Build the user prompt: top-level prompt (from ctx.task), per-state
-        // task, prior-state context (if any), then the deterministic edge menu.
+        // task, prior-state context (if any), then the deterministic select menu.
         // ctx.task is already var-substituted by the caller.
-        let menu = build_menu(&current, edges);
+        let menu = build_menu(&current, entries);
         let base_prompt = build_state_user_prompt(
             &ctx.task,
             state.task.as_deref(),
@@ -345,7 +337,7 @@ pub async fn run_graph_flow(
         // First attempt + at most one retry. The retry note is empty on
         // attempt 1, so the same code path produces the canonical prompt
         // first and the retry-augmented prompt second.
-        let allowed_keys: Vec<&str> = edges.keys().map(String::as_str).collect();
+        let allowed_keys: Vec<&str> = entries.iter().map(|e| e.target.as_str()).collect();
         let allowed_owned: Vec<String> = allowed_keys.iter().map(|s| s.to_string()).collect();
         let mut retry_note: Option<String> = None;
         let attempt_start = Instant::now();
@@ -446,22 +438,15 @@ pub async fn run_graph_flow(
         spinner.stop();
         let duration = attempt_start.elapsed();
 
-        // Resolve the next state BEFORE persisting the step record so the
-        // record can include the resolved target alongside the agent's
-        // raw decision -- audit consumers should not have to re-derive
-        // `next_state` from the edge map.
-        let next = edges
-            .get(&decision.transition)
-            .map(|e| e.to.clone())
-            .ok_or_else(|| RunError::GraphRuntime {
-                // validate_transition guarantees the key exists; this arm
-                // is defensive.
-                state: current.clone(),
-                reason: format!(
-                    "internal: transition '{}' missing from edge set",
-                    decision.transition
-                ),
-            })?;
+        // In the new schema, the transition IS the target state name.
+        // Look up the reason from the select entry for audit records.
+        let next = decision.transition.clone();
+        let _matched_reason = entries
+            .iter()
+            .find(|e| e.target == decision.transition)
+            .and_then(|e| e.reason.as_ref())
+            .map(|r| r.display())
+            .unwrap_or_default();
 
         // Persist the per-step output. `raw_content` is the full agent reply
         // including the JSON envelope; we keep it verbatim so the audit
@@ -489,7 +474,6 @@ pub async fn run_graph_flow(
             graph_decision: Some(GraphDecision {
                 transition: decision.transition.clone(),
                 reason: decision.reason.clone(),
-                next_state: next.clone(),
             }),
         };
         stack::write_run_step(&ctx.run_path, step_num, &record, &raw_content).map_err(|e| {
@@ -682,7 +666,7 @@ struct ShellStateOutcome {
 async fn run_shell_state(
     executor: &dyn ExecutorBoxed,
     state_id: &str,
-    edges: &IndexMap<String, GraphEdge>,
+    entries: &[SelectEntry],
     command: &str,
     ctx: &RunContext,
     step_num: usize,
@@ -791,32 +775,19 @@ async fn run_shell_state(
         eprintln!("{}", stderr.trim_end());
     }
 
-    // Pick the next edge from the exit code BEFORE persisting the step
-    // so the StepRecord can carry the resolved next_state -- audit
-    // consumers (`kuro show-output`, the MCP `show_output` tool) should
-    // not have to re-derive routing from the edge map.
-    let want = if exit_code == 0 {
-        EdgeOn::Pass
-    } else {
-        EdgeOn::Fail
-    };
-    let (transition_name, edge) =
-        edges
-            .iter()
-            .find(|(_, e)| e.on == Some(want))
-            .ok_or_else(|| RunError::GraphRuntime {
-                state: state_id.to_string(),
-                reason: format!(
-                    "shell state exited with code {} but no edge declares `on: {}`",
-                    exit_code,
-                    match want {
-                        EdgeOn::Pass => "pass",
-                        EdgeOn::Fail => "fail",
-                    }
-                ),
-            })?;
-    let transition_name = transition_name.clone();
-    let next_state = edge.to.clone();
+    // Pick the next state from the exit code BEFORE persisting the step.
+    let want = if exit_code == 0 { "pass" } else { "fail" };
+    let entry = entries
+        .iter()
+        .find(|e| e.reason.as_ref().map(|r| r.display()).unwrap_or_default() == want)
+        .ok_or_else(|| RunError::GraphRuntime {
+            state: state_id.to_string(),
+            reason: format!(
+                "shell state exited with code {exit_code} but no select entry has reason '{want}'"
+            ),
+        })?;
+    let transition_name = entry.target.clone();
+    let next_state = entry.target.clone();
 
     // Synthesize the body that lands on disk AND in the next state's
     // prior_context. Includes the command, exit code, stdout, and stderr
@@ -845,7 +816,6 @@ async fn run_shell_state(
         graph_decision: Some(GraphDecision {
             transition: transition_name.clone(),
             reason: format!("exit code {exit_code}"),
-            next_state: next_state.clone(),
         }),
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &body).map_err(|e| {
@@ -911,54 +881,45 @@ fn render_shell_artifact(command: &str, exit_code: i32, stdout: &str, stderr: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use indexmap::IndexMap;
+    use crate::config::SelectReason;
 
-    fn edges(pairs: &[(&str, &str, &str)]) -> IndexMap<String, GraphEdge> {
-        let mut m = IndexMap::new();
-        for (name, to, desc) in pairs {
-            m.insert(
-                (*name).to_string(),
-                GraphEdge {
-                    to: (*to).to_string(),
-                    description: (*desc).to_string(),
-                    on: None,
+    fn select_entries(pairs: &[(&str, &str)]) -> Vec<SelectEntry> {
+        pairs
+            .iter()
+            .map(|(target, reason)| SelectEntry {
+                target: (*target).to_string(),
+                reason: if reason.is_empty() {
+                    None
+                } else {
+                    Some(SelectReason::Single((*reason).to_string()))
                 },
-            );
-        }
-        m
+            })
+            .collect()
     }
 
     #[test]
     fn build_menu_renders_canonical_format() {
-        let e = edges(&[
-            ("approved", "merge", "All checks pass."),
-            ("rework", "fix", "Tests are red."),
-        ]);
+        let e = select_entries(&[("merge", "All checks pass."), ("fix", "Tests are red.")]);
         let s = build_menu("review", &e);
         assert!(s.contains("You are at state `review`."));
         assert!(s.contains(
-            "{\"transition\": \"<edge-name>\", \"reason\": \"<one to two sentences explaining why>\"}"
+            "{\"transition\": \"<target-state>\", \"reason\": \"<one to two sentences explaining why>\"}"
         ));
-        assert!(s.contains("- `approved`: All checks pass."));
-        assert!(s.contains("- `rework`: Tests are red."));
+        assert!(s.contains("- `merge`: All checks pass."));
+        assert!(s.contains("- `fix`: Tests are red."));
         assert!(s.contains("produce the full artifact"));
         assert!(s.contains("appear exactly once"));
     }
 
     #[test]
-    fn build_menu_preserves_edge_declaration_order() {
-        // IndexMap insertion order matters: the agent must see edges in
-        // the order the YAML declared them, not lexicographic.
-        let e = edges(&[
-            ("zeta", "z", "last in alphabet"),
-            ("alpha", "a", "first in alphabet"),
-        ]);
+    fn build_menu_preserves_select_order() {
+        let e = select_entries(&[("zeta", "last in alphabet"), ("alpha", "first in alphabet")]);
         let s = build_menu("s", &e);
         let zeta_idx = s.find("`zeta`").expect("zeta listed");
         let alpha_idx = s.find("`alpha`").expect("alpha listed");
         assert!(
             zeta_idx < alpha_idx,
-            "menu must list edges in IndexMap order, got:\n{s}"
+            "menu must list select entries in order, got:\n{s}"
         );
     }
 
@@ -1066,25 +1027,17 @@ mod tests {
         )
     }
 
-    fn pass_fail_edges() -> IndexMap<String, GraphEdge> {
-        let mut m = IndexMap::new();
-        m.insert(
-            "ok".to_string(),
-            GraphEdge {
-                to: "next_pass".to_string(),
-                description: "green".to_string(),
-                on: Some(EdgeOn::Pass),
+    fn pass_fail_entries() -> Vec<SelectEntry> {
+        vec![
+            SelectEntry {
+                target: "next_pass".to_string(),
+                reason: Some(SelectReason::Single("pass".to_string())),
             },
-        );
-        m.insert(
-            "bad".to_string(),
-            GraphEdge {
-                to: "next_fail".to_string(),
-                description: "red".to_string(),
-                on: Some(EdgeOn::Fail),
+            SelectEntry {
+                target: "next_fail".to_string(),
+                reason: Some(SelectReason::Single("fail".to_string())),
             },
-        );
-        m
+        ]
     }
 
     #[tokio::test]
@@ -1095,17 +1048,16 @@ mod tests {
         let ctx = shell_state_ctx(dir.path().to_path_buf());
         std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
         let executor = executor::create_executor();
-        let edges = pass_fail_edges();
+        let entries = pass_fail_entries();
 
-        let outcome = run_shell_state(executor.as_ref(), "verify", &edges, "true", &ctx, 1)
+        let outcome = run_shell_state(executor.as_ref(), "verify", &entries, "true", &ctx, 1)
             .await
             .unwrap();
 
         assert_eq!(outcome.next_state, "next_pass");
         assert_eq!(outcome.result.record.exit_code, 0);
         let decision = outcome.result.record.graph_decision.as_ref().unwrap();
-        assert_eq!(decision.transition, "ok");
-        assert_eq!(decision.next_state, "next_pass");
+        assert_eq!(decision.transition, "next_pass");
     }
 
     #[tokio::test]
@@ -1118,12 +1070,12 @@ mod tests {
         let ctx = shell_state_ctx(dir.path().to_path_buf());
         std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
         let executor = executor::create_executor();
-        let edges = pass_fail_edges();
+        let entries = pass_fail_entries();
 
         let outcome = run_shell_state(
             executor.as_ref(),
             "verify",
-            &edges,
+            &entries,
             "echo boom 1>&2; exit 7",
             &ctx,
             1,
@@ -1134,7 +1086,7 @@ mod tests {
         assert_eq!(outcome.next_state, "next_fail");
         assert_eq!(outcome.result.record.exit_code, 7);
         let decision = outcome.result.record.graph_decision.as_ref().unwrap();
-        assert_eq!(decision.transition, "bad");
+        assert_eq!(decision.transition, "next_fail");
     }
 
     #[tokio::test]
@@ -1146,12 +1098,12 @@ mod tests {
         let ctx = shell_state_ctx(dir.path().to_path_buf());
         std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
         let executor = executor::create_executor();
-        let edges = pass_fail_edges();
+        let entries = pass_fail_entries();
 
         run_shell_state(
             executor.as_ref(),
             "verify",
-            &edges,
+            &entries,
             "printf out; printf err 1>&2; exit 3",
             &ctx,
             2,
@@ -1178,9 +1130,9 @@ mod tests {
         let ctx = shell_state_ctx(dir.path().to_path_buf());
         std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
         let executor = executor::create_executor();
-        let edges = pass_fail_edges();
+        let entries = pass_fail_entries();
 
-        let err = run_shell_state(executor.as_ref(), "verify", &edges, "   ", &ctx, 1)
+        let err = run_shell_state(executor.as_ref(), "verify", &entries, "   ", &ctx, 1)
             .await
             .unwrap_err();
         assert!(matches!(err, RunError::GraphRuntime { .. }));
@@ -1196,23 +1148,18 @@ mod tests {
         let ctx = shell_state_ctx(dir.path().to_path_buf());
         std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
         let executor = executor::create_executor();
-        let mut edges: IndexMap<String, GraphEdge> = IndexMap::new();
-        edges.insert(
-            "ok".to_string(),
-            GraphEdge {
-                to: "done".to_string(),
-                description: "green".to_string(),
-                on: Some(EdgeOn::Pass),
-            },
-        );
+        let entries = vec![SelectEntry {
+            target: "done".to_string(),
+            reason: Some(SelectReason::Single("pass".to_string())),
+        }];
 
-        let err = run_shell_state(executor.as_ref(), "verify", &edges, "exit 1", &ctx, 1)
+        let err = run_shell_state(executor.as_ref(), "verify", &entries, "exit 1", &ctx, 1)
             .await
             .unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("on: fail"),
-            "expected message naming on: fail, got: {msg}"
+            msg.contains("'fail'"),
+            "expected message naming 'fail', got: {msg}"
         );
     }
 }

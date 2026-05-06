@@ -29,57 +29,104 @@ Use a linear flow when:
 - A FAIL outcome means "stop and tell the user", not "retry differently".
 - You want predictable run shape and simple manifests.
 
-## `states:` -- graph
+## `graph:` -- state graph
 
 ```yaml
 version: "1"
 name: implement-issue
 initial: design
-states:
+graph:
   design:
     role: architect
     task: ...
-    edges:
-      design_complete: { to: implement, description: ... }
-      blocked:         { to: aborted,   description: ... }
+    select:
+      - implement: "plan complete"
+      - aborted: "missing context, cannot plan"
   implement:
     role: developer
     task: ...
-    edges:
-      implementation_complete: { to: review,  description: ... }
-      design_problem:          { to: design,  description: ... }
-      blocked:                 { to: aborted, description: ... }
+    select:
+      - review: "all design items implemented"
+      - design: "design flaw found, need to revisit"
+      - aborted: "cannot proceed safely"
   done:
-    kind: final
-    description: Happy-path exit -- implementation reviewed and PR opened.
+    final: "Happy-path exit -- implementation reviewed and PR opened."
   aborted:
-    kind: final
-    description: Early exit because a step could not proceed safely.
+    final: "Early exit because a step could not proceed safely."
 ```
 
-### `description:` on states
-
-States accept an optional `description:` field. It is free-form text
-that documents *intent* -- what the state means in the flow, not what
-the agent should do (that is `task:`).
-
-`description:` is optional everywhere, but `kuro validate` warns when a
-terminal state (`kind: final` or `kind: human`) omits it. Audit
-consumers (#257 records the resolved `final_state:` in the manifest)
-and human operators have to tell `done` apart from `aborted` without
-guessing from the name -- the warning nudges flow authors to make that
-intent visible. Non-terminal states do not warn; descriptions there
-are still encouraged for graphs that grow past five or six nodes, but
-the validator stays quiet to avoid flooding existing flows.
-
-A future Mermaid exporter renders the description as the node label.
-
 A graph flow is a state machine. The runtime starts at `initial:`,
-shows the agent the outgoing edges of the current state, and the agent
-replies with `{"transition": "<edge-name>", "reason": "..."}`. The
-runtime jumps to the target state and repeats. The run terminates at a
-state with `kind: final`, or aborts after the configured `max_steps`
+shows the agent the `select:` targets of the current state, and the
+agent replies with `{"transition": "<target-state>", "reason": "..."}`.
+The runtime jumps to the target state and repeats. The run terminates
+at a state with `final:`, or aborts after the configured `max_steps`
 budget (currently 30) to bound runaway loops.
+
+### State shapes
+
+**Agent state** -- has `role:`, `task:`, and `select:`:
+
+```yaml
+design:
+  role: architect
+  task: |
+    Read the issue, produce a plan.
+  select:
+    - implement: "plan complete"
+    - aborted: "cannot plan"
+```
+
+**Shell state** -- has `run:` and `select:` with `pass`/`fail` reasons:
+
+```yaml
+verify:
+  run: just lint && just test
+  select:
+    - create-pr: pass
+    - implement: fail
+```
+
+**Final state** -- has `final: "<description>"`:
+
+```yaml
+done:
+  final: "Happy-path exit."
+```
+
+**Human state** -- has `human: true` (schema-accepted, not yet
+runtime-supported):
+
+```yaml
+operator:
+  human: true
+  select:
+    - middle: "Operator unblocks."
+    - aborted: "Operator aborts."
+```
+
+### `select:` entries
+
+Each entry in a state's `select:` list maps a target state to an
+optional reason. Supported formats:
+
+```yaml
+select:
+  - target                      # bare string, no reason
+  - target: "reason"            # single reason
+  - target: ["reason1", "r2"]   # list of reasons (OR-combined)
+  - target: |                   # multiline reason
+      A longer explanation
+      spanning multiple lines.
+```
+
+For shell states, `pass` and `fail` are reserved reason words.
+
+### `final:` description
+
+The `final:` field carries a non-empty description string documenting
+the state's intent. `kuro validate` warns when a final state has an
+empty description -- audit consumers need to tell `done` apart from
+`aborted`.
 
 Use a graph flow when:
 
@@ -93,17 +140,17 @@ Use a graph flow when:
 
 ## Tradeoffs
 
-| | Linear `flow:` | Graph `states:` |
+| | Linear `flow:` | Graph `graph:` |
 |--|--|--|
 | Run shape | Fixed | Variable |
-| Branching | No | Yes (named edges) |
+| Branching | No | Yes (select targets) |
 | Loops | No | Yes (with `max_steps` cap) |
 | Agent picks next step | No | Yes |
-| Manifest readability | High | Medium (edge log) |
+| Manifest readability | High | Medium (transition log) |
 | Validator | DAG cycles, role bindings | Reachability + dead-ends |
 
 Pick the smaller hammer. If a linear flow gets the job done, stay
-linear. Reach for `states:` when the user has been manually deciding
+linear. Reach for `graph:` when the user has been manually deciding
 between two follow-up flows after each run -- that is the case the
 graph shape was added for.
 
@@ -121,20 +168,21 @@ version: "1"
 name: implement-issue
 prompt_file: prompts/implement-issue.md   # top-level
 initial: design
-states:
+graph:
   design:
     role: architect
     task_file: prompts/design.md          # per-state
-    edges:
-      design_complete: { to: implement, description: ... }
+    select:
+      - implement: "plan complete"
+      - aborted: "cannot plan"
   implement:
     role: developer
     task_file: prompts/implement.md
-    edges:
-      implementation_complete: { to: done, description: ... }
+    select:
+      - done: "all items done"
+      - design: "design flaw"
   done:
-    kind: final
-    description: Happy-path exit.
+    final: "Happy-path exit."
 ```
 
 ```
@@ -176,41 +224,34 @@ When to split:
   diff in `prompts/<state>.md` reads better than a diff buried in
   the YAML.
 
-## Deterministic shell gates: `kind: shell`
+## Deterministic shell gates: `run:`
 
 A graph state can run a shell command instead of an agent. The exit
-code routes the next transition: `0` follows the `on: pass` edge,
-non-zero follows the `on: fail` edge. No LLM call, no JSON parsing --
+code routes the next transition: `0` follows the `pass` entry,
+non-zero follows the `fail` entry. No LLM call, no JSON parsing --
 the shell is the source of truth for "does it compile, do tests pass".
 
 ```yaml
-states:
+graph:
   review:
     role: reviewer
     task: ...
-    edges:
-      approved: { to: verify, description: PASS }
-      rework:   { to: implement, description: FAIL }
+    select:
+      - verify: "all criteria met"
+      - implement: "code-level changes needed"
 
   verify:
-    kind: shell
-    command: "just lint && just test"
-    description: Deterministic gate -- exit code routes the next state.
-    edges:
-      verify_passed:
-        to: pr
-        on: pass
-        description: All checks green.
-      verify_failed:
-        to: implement
-        on: fail
-        description: Lint or tests failed -- output is threaded back.
+    run: just lint && just test
+    select:
+      - create-pr: pass
+      - implement: fail
 
-  pr:
+  create-pr:
     role: developer
     task: ...
-    edges:
-      pr_created: { to: done, description: PR opened. }
+    select:
+      - done: "PR opened"
+      - aborted: "PR creation failed"
 ```
 
 Use a shell state when the question is mechanical and binary:
@@ -227,22 +268,9 @@ JSON.
 
 | Field | Required | Notes |
 |--|--|--|
-| `kind: shell` | yes | Marks the state as a shell gate. |
-| `command:` | yes | The shell command, run via `sh -c`. |
-| `edges:` | yes | Must include at least one `on: pass` and one `on: fail`. |
+| `run:` | yes | The shell command, run via `sh -c`. |
+| `select:` | yes | Exactly 2 entries: one `pass`, one `fail`. |
 | `role:`, `task:`, `task_file:` | rejected | Shell states have no agent. |
-| `description:` | optional | Same convention as agent states. |
-
-Each edge under a shell state must declare an `on:` tag. Edge
-selection walks edges in declaration order: the first edge whose `on:`
-matches the exit-code outcome wins. Reordering YAML keys does not
-silently re-route the run because the routing depends on the explicit
-tag, not on position.
-
-The `on:` field is **only** valid on edges of a `kind: shell` state --
-declaring `on:` on an agent-state edge is a validation error. Same
-rule applies to `command:` on non-shell states. `kuro validate`
-catches both before the run starts.
 
 Self-loops on shell states are rejected: a shell command cannot
 recover from its own non-zero exit. Route to a different state
@@ -269,23 +297,17 @@ test failure instead of a paraphrased restatement. Stdout is also
 streamed live to the artifact file during execution -- a long-running
 `just test` is `tail -f`-able while it runs.
 
-The persisted `StepRecord` carries `kind: "shell"`, the actual exit
-code (not just the routed-on category), the resolved next state, and
-the wall-clock duration so `kuro show-output` and the audit trail
-stay shape-uniform with agent steps.
-
 ### Variable substitution
 
-`{{vars.X}}` substitution applies to `command:` the same way it does
+`{{vars.X}}` substitution applies to `run:` the same way it does
 to `task:` strings, so a flow can parameterize the gate:
 
 ```yaml
 verify:
-  kind: shell
-  command: "cargo test --test {{vars.suite}}"
-  edges:
-    verify_passed: { to: pr, on: pass, description: green }
-    verify_failed: { to: implement, on: fail, description: red }
+  run: "cargo test --test {{vars.suite}}"
+  select:
+    - pr: pass
+    - implement: fail
 ```
 
 `{{roles.X}}` does not apply -- a shell command does not address an
@@ -308,7 +330,7 @@ will pick up". Hard-coding the agent name in the flow file works
 until a project remaps the role. Use the `roles` namespace instead:
 
 ```yaml
-states:
+graph:
   steer_design:
     role: steering
     task: |

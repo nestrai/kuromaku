@@ -2129,7 +2129,7 @@ mod flow_api {
                 Box::new(move |id| ids.iter().any(|s| s == id))
             }
             config::Flow::Graph(graph) => {
-                let ids: Vec<String> = graph.states.keys().cloned().collect();
+                let ids: Vec<String> = graph.graph.keys().cloned().collect();
                 Box::new(move |id| ids.iter().any(|s| s == id))
             }
         };
@@ -2896,7 +2896,7 @@ mod flow_api {
         flow_contents: String,
         flow_start: Instant,
     ) -> Result<RunHandle> {
-        use crate::config::{Defaults, StateKind, load_agent_file_with_seeds};
+        use crate::config::{Defaults, load_agent_file_with_seeds};
         use std::sync::Arc;
 
         // ---- Effective vars: project + CLI override --------------------
@@ -2922,7 +2922,7 @@ mod flow_api {
             "graph.prompt_file should be resolved before execute_graph_flow_setup"
         );
         debug_assert!(
-            graph.states.values().all(|s| s.task_file.is_none()),
+            graph.graph.values().all(|s| s.task_file.is_none()),
             "every state's task_file should be resolved before execute_graph_flow_setup"
         );
         // ---- Resolve role -> agent_id for every non-terminal state -----
@@ -2938,16 +2938,10 @@ mod flow_api {
         // perspective) and lets `substitute_roles` reuse the same map.
         let project_roles = koto_config.map(|c| &c.roles);
         let mut state_to_agent: HashMap<String, String> = HashMap::new();
-        for (state_id, state) in &graph.states {
-            match state.kind {
-                Some(StateKind::Final) => continue,
-                Some(StateKind::Human) => continue,
-                // Shell states are deterministic command runners with no
-                // agent binding -- skip role resolution (issue #310). The
-                // graph driver dispatches them through the executor
-                // instead of `run_state_via_executor`.
-                Some(StateKind::Shell) => continue,
-                None => {}
+        for (state_id, state) in &graph.graph {
+            // Skip terminal, human, and shell states -- they have no agent.
+            if state.is_final() || state.is_human() || state.is_shell() {
+                continue;
             }
             let role_name = state.role.as_deref().ok_or_else(|| {
                 eyre!(
@@ -2982,7 +2976,7 @@ mod flow_api {
             // state_to_agent is keyed by state_id, but the cascade-resolved
             // value already reflects per-state role + CLI overrides. Look
             // up the role name from the state to key the map by role.
-            if let Some(state) = graph.states.get(state_id)
+            if let Some(state) = graph.graph.get(state_id)
                 && let Some(role_name) = state.role.as_deref()
             {
                 roles_map.insert(role_name.to_string(), agent_id.clone());
@@ -3003,19 +2997,17 @@ mod flow_api {
             *prompt = super::flow_api::substitute_vars(prompt, &effective_vars)?;
             *prompt = super::flow_api::substitute_roles(prompt, &roles_map, "graph prompt")?;
         }
-        for (state_id, state) in graph.states.iter_mut() {
+        for (state_id, state) in graph.graph.iter_mut() {
             if let Some(task) = state.task.as_mut() {
                 *task = super::flow_api::substitute_vars(task, &effective_vars)?;
                 let ctx = format!("state '{state_id}'");
                 *task = super::flow_api::substitute_roles(task, &roles_map, &ctx)?;
             }
-            // Shell-state commands (issue #310) get the same var
-            // substitution as `task:`. Roles do not apply -- a shell
-            // command does not address an agent. Substituting now keeps
-            // the runtime free of var-aware string handling on the
-            // shell-dispatch path.
-            if let Some(command) = state.command.as_mut() {
-                *command = super::flow_api::substitute_vars(command, &effective_vars)?;
+            // Shell-state `run:` commands get the same var substitution
+            // as `task:`. Roles do not apply -- a shell command does not
+            // address an agent.
+            if let Some(run_cmd) = state.run.as_mut() {
+                *run_cmd = super::flow_api::substitute_vars(run_cmd, &effective_vars)?;
             }
         }
 
@@ -3091,7 +3083,7 @@ mod flow_api {
         ui::print_flow_start(
             &graph.name,
             &display_path_str,
-            graph.states.len(),
+            graph.graph.len(),
             agents_by_id.len(),
         );
         super::try_print_issue_banner(&effective_vars);

@@ -2,12 +2,12 @@
 #
 # Read an issue, implement it, review, open a draft PR -- expressed as a
 # state graph: each agent picks the next state from a closed set of
-# edges. The reviewer can route back to `implement` or back to `design`
-# depending on what they actually found, instead of a linear PASS/FAIL
-# split.
+# select entries. The reviewer can route back to `implement` or back to
+# `design` depending on what they actually found, instead of a linear
+# PASS/FAIL split.
 #
 # Usage: kuro run implement-issue --var id=42
-# See docs/graph-flows.md for when to pick `flow:` vs `states:`.
+# See docs/graph-flows.md for when to pick `flow:` vs `graph:`.
 version: "1"
 name: implement-issue
 prompt: |
@@ -16,94 +16,58 @@ prompt: |
 
 initial: design
 
-states:
+graph:
   design:
     role: architect
     task: |
       Read issue #{{vars.id}} (`gh issue view {{vars.id}} --comments`). Produce a
       short design plan: affected files, interfaces, tests. Do not modify
       code.
-    edges:
-      design_complete:
-        to: implement
-        description: Plan is complete, ready to implement.
-      blocked:
-        to: aborted
-        description: Cannot produce a design (missing context, ambiguity).
+    select:
+      - implement: "plan complete, ready to implement"
+      - aborted: "missing context, cannot plan"
 
   implement:
     role: developer
     task: |
       Implement the design from the previous step. Conventional commits,
       feature branch, never main. Add or update tests.
-    edges:
-      implementation_complete:
-        to: review
-        description: All design items implemented and committed.
-      design_problem:
-        to: design
-        description: Implementation revealed a design flaw, need to revisit.
-      blocked:
-        to: aborted
-        description: Cannot proceed safely.
+    select:
+      - review: "all design items implemented and committed"
+      - design: "implementation revealed a design flaw, need to revisit"
+      - aborted: "cannot proceed safely"
 
   review:
     role: reviewer
     task: |
       Review the implementation against the issue's acceptance criteria.
-    edges:
-      approved:
-        to: verify
-        description: All acceptance criteria met, code quality acceptable.
-      changes_implementation:
-        to: implement
-        description: Code-level changes needed (naming, refactor, missing test).
-      changes_design:
-        to: design
-        description: Implementation revealed the design itself is wrong.
-      blocked:
-        to: aborted
-        description: Review cannot complete.
+    select:
+      - verify: "all acceptance criteria met, code quality acceptable"
+      - implement: "code-level changes needed (naming, refactor, missing test)"
+      - design: "implementation revealed the design itself is wrong"
+      - aborted: "review cannot complete"
 
-  # Deterministic verify gate (issue #310): runs the project's lint and
-  # test commands, routes on the exit code, no LLM call. The shell is
-  # the source of truth for "does it compile and tests pass" -- the
-  # reviewer is left to judge meaning, not correctness. The captured
-  # output is threaded into the next state's prior_context so a failing
-  # test routes back to `implement` with the real failure in view.
+  # Deterministic verify gate: runs the project's lint and test commands,
+  # routes on the exit code, no LLM call. The captured output is threaded
+  # into the next state's prior_context so a failing test routes back to
+  # `implement` with the real failure in view.
   verify:
-    kind: shell
-    command: "just lint && just test"
-    description: |
-      Deterministic gate -- shell exit code routes the next state.
-      No model call.
-    edges:
-      verify_passed:
-        to: create_pr
-        on: pass
-        description: All checks green, ready to open the PR.
-      verify_failed:
-        to: implement
-        on: fail
-        description: Lint or tests failed -- captured output is injected into the implementer's next prompt.
+    run: just lint && just test
+    select:
+      - create-pr: pass
+      - implement: fail
 
-  create_pr:
+  create-pr:
     role: developer
     task: |
       Push the branch and open a draft PR with `Closes #{{vars.id}}`. Output
       the URL.
-    edges:
-      pr_created:
-        to: done
-        description: PR opened.
-      failed:
-        to: aborted
-        description: PR creation failed.
+    select:
+      - done: "PR opened"
+      - aborted: "PR creation failed"
 
   done:
-    kind: final
-    description: Happy-path exit -- implementation reviewed and a draft PR is open.
+    final: "Happy-path exit -- implementation reviewed and a draft PR is open."
 
   aborted:
-    kind: final
-    description: Early exit because a step could not proceed safely (missing context, design flaw it cannot resolve, PR push failed).
+    final: "Early exit because a step could not proceed safely (missing context, design flaw it cannot resolve, PR push failed)."

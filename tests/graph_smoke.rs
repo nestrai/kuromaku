@@ -193,16 +193,16 @@ fn happy_path_walks_design_to_done() {
     let (_shim_dir, shim, log) = install_shim(
         r#"case "$PROMPT" in
   *'state `design`'*)
-    printf '{"transition": "design_complete", "reason": "plan ready"}\n'
+    printf '{"transition": "implement", "reason": "plan ready"}\n'
     ;;
   *'state `implement`'*)
-    printf '{"transition": "implementation_complete", "reason": "code in"}\n'
+    printf '{"transition": "review", "reason": "code in"}\n'
     ;;
   *'state `review`'*)
-    printf '{"transition": "approved", "reason": "criteria met"}\n'
+    printf '{"transition": "verify", "reason": "criteria met"}\n'
     ;;
-  *'state `create_pr`'*)
-    printf '{"transition": "pr_created", "reason": "draft pr opened"}\n'
+  *'state `create-pr`'*)
+    printf '{"transition": "done", "reason": "draft pr opened"}\n'
     ;;
   *)
     printf 'unexpected prompt\n' >&2
@@ -212,7 +212,7 @@ esac
 "#,
     );
 
-    // Green CI: `just` exits 0 so `verify` routes via `on: pass`.
+    // Green CI: `just` exits 0 so `verify` routes via pass.
     let (_just_dir, just_shim) = install_just_shim(0);
     let just_dir = just_shim.parent().unwrap();
 
@@ -237,7 +237,7 @@ esac
     // is included to lock in that the deterministic gate (#310) shows up
     // alongside agent steps in the manifest.
     let manifest = read_manifest(home.path(), &project_name);
-    for state in ["design", "implement", "review", "verify", "create_pr"] {
+    for state in ["design", "implement", "review", "verify", "create-pr"] {
         assert!(
             manifest.contains(state),
             "manifest must reference state '{state}', got:\n{manifest}"
@@ -269,16 +269,16 @@ fn verify_failure_loops_back_to_implement() {
     let (_shim_dir, shim, _log) = install_shim(
         r#"case "$PROMPT" in
   *'state `design`'*)
-    printf '{"transition": "design_complete", "reason": "plan ready"}\n'
+    printf '{"transition": "implement", "reason": "plan ready"}\n'
     ;;
   *'state `implement`'*)
-    printf '{"transition": "implementation_complete", "reason": "code in"}\n'
+    printf '{"transition": "review", "reason": "code in"}\n'
     ;;
   *'state `review`'*)
-    printf '{"transition": "approved", "reason": "criteria met"}\n'
+    printf '{"transition": "verify", "reason": "criteria met"}\n'
     ;;
-  *'state `create_pr`'*)
-    printf '{"transition": "pr_created", "reason": "draft pr opened"}\n'
+  *'state `create-pr`'*)
+    printf '{"transition": "done", "reason": "draft pr opened"}\n'
     ;;
   *)
     printf 'unexpected prompt\n' >&2
@@ -361,7 +361,7 @@ fn blocked_at_design_lands_at_aborted() {
     let (_shim_dir, shim, log) = install_shim(
         r#"case "$PROMPT" in
   *'state `design`'*)
-    printf '{"transition": "blocked", "reason": "issue is too ambiguous"}\n'
+    printf '{"transition": "aborted", "reason": "issue is too ambiguous"}\n'
     ;;
   *)
     printf 'unexpected prompt; only design should run\n' >&2

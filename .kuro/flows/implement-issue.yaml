@@ -1,16 +1,11 @@
 # Project-local override of the canonical implement-issue graph.
 #
-# A steering checkpoint between design and implement was tried (Babis as
-# critic) but produced a design <-> steer_design ping-pong loop because the
-# critic had no convergence mechanism. Reintroduce only after either #284
-# (`once: true` edges) or #283 (multi-round critic convergence) lands.
-#
 # Topology:
-#   design (architect) --design_complete--> implement (developer)
-#   implement --implementation_complete--> review (reviewer)
-#   review   --approved--> verify (shell: just lint && just test)
-#   verify   --verify_passed--> pr --pr_created--> done
-#   verify   --verify_failed--> implement (with captured output as context)
+#   design (architect) --> implement (developer)
+#   implement --> review (reviewer)
+#   review   --> verify (shell: just lint && just test)
+#   verify   --> pr (pass) or implement (fail, with captured output)
+#   pr       --> done
 #
 # Usage: kuro run implement-issue --var id=42
 version: "1"
@@ -21,36 +16,26 @@ prompt: |
 
 initial: design
 
-states:
+graph:
   design:
     role: architect
     task: |
       Read issue #{{vars.id}} (`gh issue view {{vars.id}} --comments`). Produce a
       short design plan: affected files, interfaces, tests. Do not modify
       code.
-    edges:
-      design_complete:
-        to: implement
-        description: Plan is complete, ready to build.
-      blocked:
-        to: aborted
-        description: Cannot produce a design (missing context, ambiguity).
+    select:
+      - implement: "plan complete, ready to build"
+      - aborted: "missing context, cannot plan"
 
   implement:
     role: developer
     task: |
       Implement the design from the previous step. Conventional commits,
       feature branch, never main. Add or update tests.
-    edges:
-      implementation_complete:
-        to: review
-        description: All design items implemented and committed.
-      design_problem:
-        to: design
-        description: Implementation revealed a design flaw, need to revisit.
-      blocked:
-        to: aborted
-        description: Cannot proceed safely.
+    select:
+      - review: "all design items implemented and committed"
+      - design: "implementation revealed a design flaw, need to revisit"
+      - aborted: "cannot proceed safely"
 
   review:
     role: reviewer
@@ -67,68 +52,35 @@ states:
 
       The `FINAL_VERDICT:` line must appear exactly once on its own
       line. If the implementation solved the wrong problem, FAIL
-      regardless of code quality. Pick `approved` only when the verdict
+      regardless of code quality. Pick `verify` only when the verdict
       is PASS.
-    edges:
-      approved:
-        to: verify
-        description: All acceptance criteria met, code quality acceptable.
-      changes_implementation:
-        to: implement
-        description: Code-level changes needed (naming, refactor, missing test).
-      changes_design:
-        to: design
-        description: Implementation revealed the design itself is wrong.
-      blocked:
-        to: aborted
-        description: Review cannot complete.
+    select:
+      - verify: "all acceptance criteria met, code quality acceptable"
+      - implement: "code-level changes needed (naming, refactor, missing test)"
+      - design: "implementation revealed the design itself is wrong"
+      - aborted: "review cannot complete"
 
-  # Deterministic verify gate (issue #310). No agent, no LLM call --
-  # exit code from `just lint && just test` decides routing. The captured
-  # stdout/stderr/exit-code is threaded into Noah's next prompt verbatim
-  # via the graph driver's prior_context plumbing, so a failing test
-  # routes back to `implement` with the real failure in context instead
-  # of a Bella-paraphrased restatement.
+  # Deterministic verify gate. No agent, no LLM call -- exit code from
+  # `just lint && just test` decides routing. The captured output is
+  # threaded into the implementer's next prompt via prior_context.
   verify:
-    kind: shell
-    command: "just lint && just test"
-    description: |
-      Deterministic gate -- shell exit code routes the next state.
-      No model call.
-    edges:
-      verify_passed:
-        to: pr
-        on: pass
-        description: All checks green, ready to open the PR.
-      verify_failed:
-        to: implement
-        on: fail
-        description: Lint or tests failed -- captured output is injected into the implementer's next prompt.
+    run: just lint && just test
+    select:
+      - pr: pass
+      - implement: fail
 
-  # Step id `pr` (not `create_pr`) so the `implement_issue` MCP tool's
-  # REQUIRED_STEP_IDS pre-flight matches both this graph and the linear
-  # seed (#268 keeps the verify check shape-agnostic; the tool still
-  # keys off the same name).
   pr:
     role: developer
     task: |
       Push the branch and open a draft PR with `Closes #{{vars.id}}`.
       Output the PR URL on its own line so downstream tooling can
       extract it.
-    edges:
-      pr_created:
-        to: done
-        description: PR opened.
-      failed:
-        to: aborted
-        description: PR creation failed.
+    select:
+      - done: "PR opened"
+      - aborted: "PR creation failed"
 
-  # Terminal states. The schema currently has no `description:` on a state
-  # (issue #260), so the meaning is convention only:
-  #   done    -- happy-path exit: implementation reviewed and PR opened
-  #   aborted -- early exit because some step routed to `blocked` or `failed`
   done:
-    kind: final
+    final: "Happy-path exit -- implementation reviewed and PR opened."
 
   aborted:
-    kind: final
+    final: "Early exit because a step could not proceed safely."
