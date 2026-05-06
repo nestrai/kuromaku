@@ -90,7 +90,7 @@ fn install_shim(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
     let log = dir.path().join("log.txt");
     let shim = dir.path().join("ollama");
     let script = format!(
-        "#!/bin/sh\n\
+        "#!/usr/bin/env bash\n\
          set -eu\n\
          LOG='{}'\n\
          PROMPT=\"${{@: -1}}\"\n\
