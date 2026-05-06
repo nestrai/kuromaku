@@ -913,18 +913,7 @@ mod tests {
             id: id.to_string(),
             agent: agent.to_string(),
             role: role.map(String::from),
-            task: None,
-            run: None,
-            input: vec![],
-            needs: vec![],
-            model: None,
-            backend: None,
-            print_output: false,
-            post_comment: None,
-            agents: Vec::new(),
-            max_turns: None,
-            turn_timeout: None,
-            extra_args: std::collections::HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -935,7 +924,6 @@ mod tests {
         config::FlowConfig {
             version: "1".to_string(),
             name: "test".to_string(),
-            prompt: None,
             defaults: config::Defaults {
                 model: "claude-sonnet-4-5".to_string(),
                 backend: config::Backend::ClaudeCli,
@@ -949,6 +937,7 @@ mod tests {
                 backend: "local".to_string(),
                 path: String::new(),
             },
+            ..Default::default()
         }
     }
 

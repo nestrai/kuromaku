@@ -175,33 +175,21 @@ flow:
         let config = FlowConfig {
             version: "1".to_string(),
             name: "test".to_string(),
-            prompt: None,
             defaults: crate::config::Defaults {
                 model: "m".to_string(),
                 backend: crate::config::Backend::Api,
             },
-            roles: std::collections::HashMap::new(),
             steps: vec![Step {
                 id: "a".to_string(),
                 agent: "dev".to_string(),
-                role: None,
-                task: None,
-                run: None,
-                input: vec![],
                 needs: vec!["nonexistent".to_string()],
-                model: None,
-                backend: None,
-                print_output: false,
-                post_comment: None,
-                agents: Vec::new(),
-                max_turns: None,
-                turn_timeout: None,
-                extra_args: std::collections::HashMap::new(),
+                ..Default::default()
             }],
             stack: crate::config::StackConfig {
                 backend: "local".to_string(),
                 path: String::new(),
             },
+            ..Default::default()
         };
         let err = validate_dag(&config).unwrap_err();
         assert!(
