@@ -22,10 +22,15 @@ pub enum ConfigError {
 
 // --- Types ---
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Backend {
     Api,
+    /// `claude-cli` is the project's primary backend (matches the agent
+    /// defaults shipped under `.kuro/agents/`). It is the `Default` variant
+    /// so downstream `Default` derives on `Defaults`/`Step`/`FlowConfig`
+    /// produce values that match the runtime's effective default backend.
+    #[default]
     ClaudeCli,
     Codex,
     Ollama,
@@ -74,7 +79,7 @@ pub enum PostCommentTarget {
 }
 
 /// Accepts both `"1"` (string) and `1` (integer) in YAML.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Version(pub String);
 
 impl<'de> Deserialize<'de> for Version {
@@ -258,7 +263,7 @@ pub struct RawStackConfig {
 
 // --- Resolved structs (after validation and defaults) ---
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FlowConfig {
     pub version: String,
     pub name: String,
@@ -269,7 +274,7 @@ pub struct FlowConfig {
     pub stack: StackConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Defaults {
     pub model: String,
     pub backend: Backend,
@@ -296,7 +301,7 @@ pub struct Agent {
     pub extra_args: HashMap<Backend, Vec<String>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Step {
     pub id: String,
     /// Agent ID for LLM-backed steps. Empty string for shell steps (where
@@ -353,7 +358,7 @@ impl Step {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StackConfig {
     pub backend: String,
     pub path: String,
@@ -380,7 +385,7 @@ pub enum Flow {
 /// behaviour live in follow-up issues. Validation here covers structural
 /// references only -- `initial:` exists, every `edge.to:` exists, and each
 /// state has either outgoing edges or a `kind:`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphFlow {
     pub version: Version,
@@ -424,7 +429,7 @@ pub struct GraphFlow {
 /// emits a warning (not an error) when a terminal state -- where intent
 /// matters most for audit consumers and operators -- has no description.
 /// A future Mermaid exporter renders the description as the node label.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -497,7 +502,7 @@ pub enum EdgeOn {
 /// `on:` is the routing tag for `kind: shell` edges (issue #310). The
 /// validator requires it on every edge of a shell state and rejects it
 /// on edges of any other state shape.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GraphEdge {
     pub to: String,
@@ -3969,10 +3974,9 @@ states:
         GraphFlow {
             version: Version("1".to_string()),
             name: "test".to_string(),
-            prompt: None,
-            prompt_file: None,
             initial: initial.to_string(),
             states: map,
+            ..Default::default()
         }
     }
 
@@ -3989,13 +3993,9 @@ states:
             );
         }
         GraphState {
-            kind: None,
             role: Some("developer".to_string()),
-            task: None,
-            task_file: None,
-            command: None,
-            description: None,
             edges: Some(map),
+            ..Default::default()
         }
     }
 
@@ -4006,12 +4006,8 @@ states:
     fn state_final() -> GraphState {
         GraphState {
             kind: Some(StateKind::Final),
-            role: None,
-            task: None,
-            task_file: None,
-            command: None,
             description: Some("Test terminal state.".to_string()),
-            edges: None,
+            ..Default::default()
         }
     }
 
@@ -4020,12 +4016,7 @@ states:
     fn state_final_no_description() -> GraphState {
         GraphState {
             kind: Some(StateKind::Final),
-            role: None,
-            task: None,
-            task_file: None,
-            command: None,
-            description: None,
-            edges: None,
+            ..Default::default()
         }
     }
 
@@ -4072,13 +4063,9 @@ states:
     #[test]
     fn validate_dead_end_state_errors() {
         let stuck = GraphState {
-            kind: None,
             role: Some("developer".to_string()),
-            task: None,
-            task_file: None,
-            command: None,
-            description: None,
-            edges: None, // no kind, no edges -- dead end
+            // no kind, no edges -- dead end
+            ..Default::default()
         };
         let g = graph(
             "start",
@@ -4223,13 +4210,8 @@ states:
     #[test]
     fn validate_multiple_dead_ends_all_reported() {
         let dead = GraphState {
-            kind: None,
             role: Some("developer".to_string()),
-            task: None,
-            task_file: None,
-            command: None,
-            description: None,
-            edges: None,
+            ..Default::default()
         };
         let g = graph(
             "start",
@@ -5168,5 +5150,93 @@ states:
         let edges = verify.edges.as_ref().unwrap();
         assert_eq!(edges["ok"].on, Some(EdgeOn::Pass));
         assert_eq!(edges["bad"].on, Some(EdgeOn::Fail));
+    }
+
+    // --- Default impl guards (issue #305) ---
+    //
+    // These tests pin two things:
+    //
+    // 1. Every type in the issue's list (and its transitive `Default`
+    //    dependencies) actually implements `Default`. If anyone removes a
+    //    derive, the build breaks here -- not in some downstream test
+    //    fixture with a confusing message.
+    //
+    // 2. `GraphState` / `GraphEdge` / `GraphFlow` -- the only types in the
+    //    list that derive serde -- round-trip cleanly when constructed via
+    //    `Default::default()`. A future field that is added without
+    //    `#[serde(skip_serializing_if = "Option::is_none")]` (or with a
+    //    `#[serde(default = "fn")]` whose return value diverges from the
+    //    `Default` derive) would silently change what
+    //    `GraphState::default()` emits. The round-trip equality check
+    //    catches that divergence.
+
+    /// Compile-time + runtime guard that every type the issue lists
+    /// (`Backend`, `Version`, `Defaults`, `StackConfig`, `Step`,
+    /// `FlowConfig`, `GraphFlow`, `GraphState`, `GraphEdge`) implements
+    /// `Default`. Removing any derive breaks this test before it breaks
+    /// less obvious downstream call sites.
+    #[test]
+    fn default_impls_present_for_listed_types() {
+        let _: Backend = Backend::default();
+        let _: Version = Version::default();
+        let _: Defaults = Defaults::default();
+        let _: StackConfig = StackConfig::default();
+        let _: Step = Step::default();
+        let _: FlowConfig = FlowConfig::default();
+        let _: GraphFlow = GraphFlow::default();
+        let _: GraphState = GraphState::default();
+        let _: GraphEdge = GraphEdge::default();
+    }
+
+    /// Backend default is `claude-cli`. Pin this so a future tier-zero
+    /// change cannot silently flip it -- `claude-cli` is what every
+    /// `Defaults::default()` and `Step::default()` resolves to today.
+    #[test]
+    fn backend_default_is_claude_cli() {
+        assert_eq!(Backend::default(), Backend::ClaudeCli);
+        assert_eq!(Defaults::default().backend, Backend::ClaudeCli);
+    }
+
+    /// Round-trip: `GraphState::default()` survives serialize +
+    /// deserialize unchanged. All current fields are `Option<_>` with
+    /// `skip_serializing_if = "Option::is_none"`, so the emitted YAML is
+    /// `{}`. Adding a non-`Option` field -- or an `Option` field without
+    /// `skip_serializing_if` -- would change the YAML shape, and the
+    /// re-parse would no longer equal the original (or would fail to
+    /// parse with `deny_unknown_fields`). Either way, this test is the
+    /// alarm.
+    #[test]
+    fn graph_state_default_serde_round_trip() {
+        let original = GraphState::default();
+        let yaml = serde_yaml::to_string(&original).expect("serialize");
+        let parsed: GraphState = serde_yaml::from_str(&yaml).expect("re-parse");
+        assert_eq!(original, parsed);
+    }
+
+    /// Round-trip: `GraphEdge::default()` -- both fields are required
+    /// (no `skip_serializing_if`), so the emitted YAML carries them as
+    /// empty strings and re-parse must match. This guards against future
+    /// `Default` divergence (e.g. someone adding a third required field
+    /// without updating this test) the same way the `GraphState` test
+    /// does.
+    #[test]
+    fn graph_edge_default_serde_round_trip() {
+        let original = GraphEdge::default();
+        let yaml = serde_yaml::to_string(&original).expect("serialize");
+        let parsed: GraphEdge = serde_yaml::from_str(&yaml).expect("re-parse");
+        assert_eq!(original, parsed);
+    }
+
+    /// Round-trip: `GraphFlow::default()`. `version`, `name`, and
+    /// `initial` are required -- they serialize to empty strings, and
+    /// `states` to an empty mapping. The reparse must equal the
+    /// original. Like the other round-trip tests, this fires when a
+    /// future field's `Default` and serde defaults disagree.
+    #[test]
+    fn graph_flow_default_serde_round_trip() {
+        let original = GraphFlow::default();
+        let yaml = serde_yaml::to_string(&original).expect("serialize");
+        let parsed: GraphFlow = serde_yaml::from_str(&yaml).expect("re-parse");
+        assert_eq!(original, parsed);
     }
 }

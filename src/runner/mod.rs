@@ -3734,20 +3734,8 @@ mod tests {
     fn shell_step(id: &str, command: &str) -> crate::config::Step {
         crate::config::Step {
             id: id.to_string(),
-            agent: String::new(),
-            role: None,
-            task: None,
             run: Some(command.to_string()),
-            input: vec![],
-            needs: vec![],
-            model: None,
-            backend: None,
-            print_output: false,
-            post_comment: None,
-            agents: Vec::new(),
-            max_turns: None,
-            turn_timeout: None,
-            extra_args: HashMap::new(),
+            ..Default::default()
         }
     }
 
@@ -3890,19 +3878,9 @@ mod tests {
         let downstream = crate::config::Step {
             id: "review".to_string(),
             agent: "Bella".to_string(),
-            role: None,
             task: Some("Review the diff".to_string()),
-            run: None,
             input: vec!["fetch".to_string()],
-            needs: vec![],
-            model: None,
-            backend: None,
-            print_output: false,
-            post_comment: None,
-            agents: Vec::new(),
-            max_turns: None,
-            turn_timeout: None,
-            extra_args: HashMap::new(),
+            ..Default::default()
         };
 
         let prompt = build_user_prompt("Top-level task", &downstream, &ctx.run_path).unwrap();
