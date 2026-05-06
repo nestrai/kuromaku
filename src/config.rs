@@ -955,6 +955,13 @@ pub fn load_flow_from_str_with_project_at(
 /// and validated, then [`resolve_graph_external_prompts`] folds the
 /// `*_file` fields in.
 pub fn load_flow_any_from_path(path: &Path) -> Result<Flow, ConfigError> {
+    // Markdown files are always graph flows -- skip the YAML probe.
+    if path.extension().and_then(|e| e.to_str()) == Some("md") {
+        let contents = std::fs::read_to_string(path)?;
+        let flow = crate::config_md::load_graph_flow_from_md(&contents)?;
+        return Ok(Flow::Graph(flow));
+    }
+
     let contents = std::fs::read_to_string(path)?;
     let probe: FlowShapeProbe = serde_yaml::from_str(&contents)?;
     let flow_path_display = path.display().to_string();
@@ -993,7 +1000,7 @@ pub fn load_flow_any_from_path(path: &Path) -> Result<Flow, ConfigError> {
 /// - agent states: at least 2 select entries, non-empty reasons
 /// - `final:` states must have non-empty description string
 /// - no self-loops on shell states
-fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
+pub(crate) fn validate_graph_flow(g: &GraphFlow) -> Result<(), ConfigError> {
     if g.version.0 != "1" {
         return Err(ConfigError::Validation(format!(
             "unsupported version '{}', expected '1'",

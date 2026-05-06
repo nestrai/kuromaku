@@ -1998,11 +1998,19 @@ mod flow_api {
                 Ok(p.clone())
             }
             FlowSource::Name(name) => {
-                let rel = std::path::Path::new("flows").join(format!("{name}.yaml"));
-                match seeds.find(&rel).map_err(|e| eyre!("{}", e.message()))? {
+                // Try .yaml first, then .md (issue #320: markdown flow format).
+                let rel_yaml = std::path::Path::new("flows").join(format!("{name}.yaml"));
+                if let Some((_, path)) = seeds
+                    .find(&rel_yaml)
+                    .map_err(|e| eyre!("{}", e.message()))?
+                {
+                    return Ok(path);
+                }
+                let rel_md = std::path::Path::new("flows").join(format!("{name}.md"));
+                match seeds.find(&rel_md).map_err(|e| eyre!("{}", e.message()))? {
                     Some((_, path)) => Ok(path),
                     None => Err(eyre!(
-                        "{}\n\nhint: create flows/{name}.yaml in one of the seeds, or use --file <path>",
+                        "{}\n\nhint: create flows/{name}.yaml (or .md) in one of the seeds, or use --file <path>",
                         seeds.not_found_message("flow", name)
                     )),
                 }
@@ -2021,13 +2029,18 @@ mod flow_api {
                     for entry in entries.flatten() {
                         let file_name = entry.file_name();
                         let name_str = file_name.to_string_lossy();
-                        if !(name_str.ends_with(".yaml") || name_str.ends_with(".yml")) {
+                        if !(name_str.ends_with(".yaml")
+                            || name_str.ends_with(".yml")
+                            || name_str.ends_with(".md"))
+                        {
                             continue;
                         }
                         let bare = name_str
                             .trim_end_matches(".yaml")
                             .trim_end_matches(".yml")
+                            .trim_end_matches(".md")
                             .to_string();
+                        // YAML takes precedence over .md for the same bare name
                         by_name
                             .entry(bare)
                             .or_insert_with(|| flows_dir.join(name_str.as_ref()));
@@ -2035,7 +2048,7 @@ mod flow_api {
                 }
                 if by_name.is_empty() {
                     return Err(eyre!(
-                        "no flows found in seeds: {}\n\nhint: create flows/<name>.yaml in one of the seed directories",
+                        "no flows found in seeds: {}\n\nhint: create flows/<name>.yaml (or .md) in one of the seed directories",
                         seeds.audit_line()
                     ));
                 }

@@ -23,7 +23,7 @@ graph:
       Read issue #{{vars.id}} (`gh issue view {{vars.id}} --comments`). Produce a
       short design plan: affected files, interfaces, tests. Do not modify
       code.
-    select:
+    next:
       - implement: "plan complete, ready to build"
       - aborted: "missing context, cannot plan"
 
@@ -32,7 +32,7 @@ graph:
     task: |
       Implement the design from the previous step. Conventional commits,
       feature branch, never main. Add or update tests.
-    select:
+    next:
       - review: "all design items implemented and committed"
       - design: "implementation revealed a design flaw, need to revisit"
       - aborted: "cannot proceed safely"
@@ -54,7 +54,7 @@ graph:
       line. If the implementation solved the wrong problem, FAIL
       regardless of code quality. Pick `verify` only when the verdict
       is PASS.
-    select:
+    next:
       - verify: "all acceptance criteria met, code quality acceptable"
       - implement: "code-level changes needed (naming, refactor, missing test)"
       - design: "implementation revealed the design itself is wrong"
@@ -65,7 +65,7 @@ graph:
   # threaded into the implementer's next prompt via prior_context.
   verify:
     run: just lint && just test
-    select:
+    next:
       - pr: pass
       - implement: fail
 
@@ -75,7 +75,7 @@ graph:
       Push the branch and open a draft PR with `Closes #{{vars.id}}`.
       Output the PR URL on its own line so downstream tooling can
       extract it.
-    select:
+    next:
       - done: "PR opened"
       - aborted: "PR creation failed"
 

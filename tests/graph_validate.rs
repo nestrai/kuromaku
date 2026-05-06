@@ -373,3 +373,96 @@ graph:
         "stderr must name the unresolved relative path; got:\n{stderr}"
     );
 }
+
+// --- Markdown flow format (issue #320) ---
+
+const CLEAN_GRAPH_MD: &str = r#"---
+format: kuromaku-flow/v1
+---
+
+# clean
+
+---
+
+## start
+*role: developer*
+
+Do something.
+
+-> done: looks good
+-> start: retry
+
+---
+
+## done
+*final: happy-path exit*
+"#;
+
+const INVALID_GRAPH_MD: &str = r#"---
+format: kuromaku-flow/v1
+---
+
+# bad
+
+---
+
+## start
+*role: developer*
+
+Do something.
+
+-> nowhere: this target does not exist
+-> start: retry
+
+---
+
+## done
+*final: end*
+"#;
+
+#[test]
+fn validate_clean_md_flow_exits_zero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let flow = write_flow(tmp.path(), "clean.md", CLEAN_GRAPH_MD);
+
+    let out = Command::new(kuro_bin())
+        .arg("validate")
+        .arg(&flow)
+        .output()
+        .expect("spawn kuro validate");
+
+    assert!(
+        out.status.success(),
+        "clean .md graph must exit zero; status={:?}, stderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("ok:"),
+        "stdout must report ok; got:\n{stdout}"
+    );
+}
+
+#[test]
+fn validate_invalid_md_flow_exits_nonzero() {
+    let tmp = tempfile::tempdir().unwrap();
+    let flow = write_flow(tmp.path(), "bad.md", INVALID_GRAPH_MD);
+
+    let out = Command::new(kuro_bin())
+        .arg("validate")
+        .arg(&flow)
+        .output()
+        .expect("spawn kuro validate");
+
+    assert!(
+        !out.status.success(),
+        "invalid .md graph must exit non-zero; status={:?}",
+        out.status
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("nowhere"),
+        "stderr must name the bad target; got:\n{stderr}"
+    );
+}
