@@ -441,12 +441,11 @@ pub async fn run_graph_flow(
         // In the new schema, the transition IS the target state name.
         // Look up the reason from the select entry for audit records.
         let next = decision.transition.clone();
-        let _matched_reason = entries
+        let matched_reason = entries
             .iter()
             .find(|e| e.target == decision.transition)
             .and_then(|e| e.reason.as_ref())
-            .map(|r| r.display())
-            .unwrap_or_default();
+            .map(|r| r.display());
 
         // Persist the per-step output. `raw_content` is the full agent reply
         // including the JSON envelope; we keep it verbatim so the audit
@@ -474,6 +473,7 @@ pub async fn run_graph_flow(
             graph_decision: Some(GraphDecision {
                 transition: decision.transition.clone(),
                 reason: decision.reason.clone(),
+                matched_reason,
             }),
         };
         stack::write_run_step(&ctx.run_path, step_num, &record, &raw_content).map_err(|e| {
@@ -816,6 +816,7 @@ async fn run_shell_state(
         graph_decision: Some(GraphDecision {
             transition: transition_name.clone(),
             reason: format!("exit code {exit_code}"),
+            matched_reason: Some(if exit_code == 0 { "pass".to_string() } else { "fail".to_string() }),
         }),
     };
     stack::write_run_step(&ctx.run_path, step_num, &record, &body).map_err(|e| {

@@ -106,12 +106,12 @@ operator:
 
 ### `next:` entries
 
-Each entry in a state's `next:` list maps a target state to an
-optional reason. Supported formats:
+Each entry in a state's `next:` list maps a target state to a
+reason string. Agent states require a reason on every entry.
+Supported formats:
 
 ```yaml
 next:
-  - target                      # bare string, no reason
   - target: "reason"            # single reason
   - target: ["reason1", "r2"]   # list of reasons (OR-combined)
   - target: |                   # multiline reason

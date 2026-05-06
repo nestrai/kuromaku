@@ -191,6 +191,9 @@ pub struct GraphDecision {
     pub transition: String,
     /// Justification from the agent's JSON reply or "exit code N" for shell states.
     pub reason: String,
+    /// Schema-defined reason from the `next:` entry, for audit trails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matched_reason: Option<String>,
 }
 
 /// One row of conversation-step participant statistics.
