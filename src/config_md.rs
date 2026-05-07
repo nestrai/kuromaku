@@ -12,7 +12,8 @@
 use indexmap::IndexMap;
 
 use crate::config::{
-    ConfigError, GraphFlow, GraphState, SelectEntry, SelectReason, Version, validate_graph_flow,
+    ConfigError, GraphFlow, GraphState, SelectEntry, SelectReason, Version,
+    normalize_graph_flow_strings, validate_graph_flow,
 };
 
 /// Main entry point: parse a Markdown flow file into a [`GraphFlow`].
@@ -20,7 +21,8 @@ use crate::config::{
 /// Validates the result through the same `validate_graph_flow()` and
 /// `validate_graph_reachability()` that the YAML parser uses.
 pub fn load_graph_flow_from_md(contents: &str) -> Result<GraphFlow, ConfigError> {
-    let flow = parse_md_flow(contents)?;
+    let mut flow = parse_md_flow(contents)?;
+    normalize_graph_flow_strings(&mut flow);
     validate_graph_flow(&flow)?;
     Ok(flow)
 }
@@ -782,6 +784,26 @@ Go.
         assert!(
             msg.contains("done") || msg.contains("final"),
             "error must reference the final state: {msg}"
+        );
+    }
+
+    #[test]
+    fn seed_yaml_md_equivalence() {
+        // Pins the contract from issue #327: both seed formats must
+        // produce identical GraphFlow structs. YAML is the canonical
+        // source (5+ consumers); MD mirrors it. If this fails, fix
+        // the MD seed -- do NOT touch the YAML.
+        let yaml = include_str!("../seeds/rust/flows/implement-issue.yaml");
+        let md = include_str!("../seeds/rust/flows/implement-issue.md");
+
+        let yaml_flow =
+            crate::config::load_graph_flow_from_str(yaml).expect("YAML seed must parse");
+        let md_flow = super::load_graph_flow_from_md(md).expect("MD seed must parse");
+
+        assert_eq!(
+            yaml_flow, md_flow,
+            "implement-issue.yaml and implement-issue.md must parse to \
+             identical GraphFlow structs (issue #327). YAML is canonical."
         );
     }
 

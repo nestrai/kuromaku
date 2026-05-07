@@ -698,9 +698,58 @@ pub fn load_flow_any_from_str(contents: &str) -> Result<Flow, ConfigError> {
 /// and dead-end checks are deferred to the validator issue.
 #[allow(dead_code)]
 pub fn load_graph_flow_from_str(contents: &str) -> Result<GraphFlow, ConfigError> {
-    let raw: GraphFlow = serde_yaml::from_str(contents)?;
+    let mut raw: GraphFlow = serde_yaml::from_str(contents)?;
+    normalize_graph_flow_strings(&mut raw);
     validate_graph_flow(&raw)?;
     Ok(raw)
+}
+
+/// Strip trailing whitespace (including newlines) from every prose
+/// field on a [`GraphFlow`].
+///
+/// Background: YAML block scalars (`task: |`) keep a trailing newline,
+/// the Markdown parser's `trim_block` strips it. Without normalization
+/// the two parsers produce structurally identical flows that disagree
+/// only on a single `\n` per field, which breaks the YAML/MD
+/// equivalence contract pinned by issue #327.
+///
+/// Normalizing at the parse boundary (rather than at the test) keeps
+/// downstream consumers from caring about which format the flow was
+/// authored in, and prevents future parser drift from going unnoticed.
+pub(crate) fn normalize_graph_flow_strings(g: &mut GraphFlow) {
+    fn trim_end_in_place(s: &mut String) {
+        let trimmed_len = s.trim_end().len();
+        s.truncate(trimmed_len);
+    }
+
+    if let Some(p) = g.prompt.as_mut() {
+        trim_end_in_place(p);
+    }
+
+    for state in g.graph.values_mut() {
+        if let Some(t) = state.task.as_mut() {
+            trim_end_in_place(t);
+        }
+        if let Some(r) = state.run.as_mut() {
+            trim_end_in_place(r);
+        }
+        if let Some(f) = state.final_desc.as_mut() {
+            trim_end_in_place(f);
+        }
+        if let Some(entries) = state.select.as_mut() {
+            for entry in entries {
+                match entry.reason.as_mut() {
+                    Some(SelectReason::Single(s)) => trim_end_in_place(s),
+                    Some(SelectReason::List(v)) => {
+                        for s in v {
+                            trim_end_in_place(s);
+                        }
+                    }
+                    None => {}
+                }
+            }
+        }
+    }
 }
 
 // --- External-prompt resolution (issue #258) ---
