@@ -993,6 +993,29 @@ pub fn print_run_saved(run_dir: &str, status: &str) {
     );
 }
 
+/// Print the resume banner -- which run is being adopted and the state
+/// the driver will re-enter (issue #338).
+///
+/// Stderr-side metadata, not part of any structured stdout artifact a
+/// caller may pipe downstream. Yellow for the resumed-state name
+/// matches [`print_graph_paused`] so an operator sees the same colour
+/// associated with "this is the human handoff" across the pause /
+/// resume lifecycle.
+pub fn print_run_resume(run_id: &str, paused_at_state: &str) {
+    let t = &DARK;
+    eprintln!();
+    eprintln!(
+        "      {} {} {} {} {}",
+        style::style("↻").with(t.cyan).attribute(Attribute::Bold),
+        style::style("resuming").with(t.dim),
+        style::style(run_id).with(t.fg),
+        style::style("from state").with(t.dim),
+        style::style(paused_at_state)
+            .with(t.yellow)
+            .attribute(Attribute::Bold),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

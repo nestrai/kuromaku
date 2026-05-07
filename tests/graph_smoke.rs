@@ -528,3 +528,331 @@ esac
         "no step file may exist for the paused human state, got: {names:?}"
     );
 }
+
+// --- `kuro resume` end-to-end (issue #338) ----------------------------
+//
+// Acceptance (#338) covered here:
+// 1. Happy path: `kuro run` pauses at a human state, `kuro resume <id>`
+//    advances and reaches a `kind: final`. Manifest no longer carries
+//    `status: paused`; `final_state:` is set.
+// 2. Error: `kuro resume <id>` with an unknown run-id exits non-zero
+//    with a clear message.
+// 3. Error: `kuro resume <id>` against a finished (non-paused) run exits
+//    non-zero with a clear message naming the actual status.
+//
+// `kuro resume` looks the flow up by name through the seed cascade, so
+// the test fixtures live under `.kuro/flows/<name>.yaml` (matching the
+// YAML's `name:` field) -- a `kuro run --file ...` original is allowed,
+// but resume does NOT see the `--file` arg and resolves by name.
+
+/// Write a resumable graph flow at `.kuro/flows/<name>.yaml` so the
+/// resume command can find it through the seed cascade. The flow walks
+/// `design (agent) -> ask (human, next: done) -> done (final)` so the
+/// pre-pause and post-resume phases are both exercised by a single
+/// fixture.
+fn write_resumable_flow(project: &Path) -> PathBuf {
+    let flow_dir = project.join(".kuro/flows");
+    std::fs::create_dir_all(&flow_dir).unwrap();
+    // The filename MUST match the YAML's `name:` field for the seed
+    // resolver to find it. resume() looks up by name.
+    let flow_path = flow_dir.join("resume-smoke.yaml");
+    std::fs::write(
+        &flow_path,
+        "version: \"1\"\n\
+         name: resume-smoke\n\
+         prompt: \"Test the resume path.\"\n\
+         initial: design\n\
+         graph:\n\
+         \x20\x20design:\n\
+         \x20\x20\x20\x20role: developer\n\
+         \x20\x20\x20\x20task: \"Write a one-line plan.\"\n\
+         \x20\x20\x20\x20next:\n\
+         \x20\x20\x20\x20\x20\x20- ask: \"wait for human input\"\n\
+         \x20\x20\x20\x20\x20\x20- design: \"keep iterating\"\n\
+         \x20\x20ask:\n\
+         \x20\x20\x20\x20human: true\n\
+         \x20\x20\x20\x20next:\n\
+         \x20\x20\x20\x20\x20\x20- done: \"after human\"\n\
+         \x20\x20done:\n\
+         \x20\x20\x20\x20final: \"resumed terminal\"\n",
+    )
+    .unwrap();
+    flow_path
+}
+
+/// Spawn `kuro resume <run-id>` from inside `project` with the same
+/// sandbox shape `run_kuro` uses. No `--file`, no `--var`: resume
+/// re-resolves the flow through the manifest and reuses the manifest's
+/// vars verbatim.
+fn resume_kuro(
+    project: &Path,
+    run_id: &str,
+    shim: &Path,
+    home_dir: &Path,
+    just_dir: &Path,
+) -> std::process::Output {
+    let bin = env!("CARGO_BIN_EXE_kuro");
+    let host_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{host_path}", just_dir.display());
+    Command::new(bin)
+        .args(["resume", run_id])
+        .current_dir(project)
+        .env("HOME", home_dir)
+        .env("OLLAMA_PATH", shim)
+        .env("PATH", path)
+        .env_remove("RUST_LOG")
+        .output()
+        .expect("spawn kuro resume")
+}
+
+/// Locate the (single) run dir for the given project under the test HOME.
+/// Returns the path so callers can read step files / the manifest.
+fn latest_run_dir(home: &Path, project_name: &str) -> PathBuf {
+    let stacks = home.join(".koto/stacks").join(project_name);
+    std::fs::read_dir(&stacks)
+        .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .max()
+        .unwrap_or_else(|| panic!("no run directories under {}", stacks.display()))
+}
+
+#[test]
+fn resume_continues_paused_run_to_final() {
+    // AC (#338): `kuro resume <run-id>` re-enters the paused run, the
+    // graph driver advances past the human handoff, the manifest is
+    // overwritten so `status: paused` is gone and `final_state:` is set.
+    let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let flow = write_resumable_flow(project.path());
+
+    // Same shim used by both phases. Only `design` is consulted -- the
+    // `ask` state is human (no agent call) and `done` is final (no agent
+    // call). On resume the driver advances `ask -> done` without
+    // re-invoking the shim. If anything else is asked of the shim,
+    // it would `exit 1` here and the test would surface the failure.
+    let shim_body = r#"case "$PROMPT" in
+  *'state `design`'*)
+    printf 'plan: ask the human something.\n{"transition": "ask", "reason": "need user input"}\n'
+    ;;
+  *)
+    printf 'unexpected prompt; resume must not re-invoke any agent\n' >&2
+    exit 1
+    ;;
+esac
+"#;
+    let (_shim_dir, shim, log) = install_shim(shim_body);
+    let (_just_dir, just_shim) = install_just_shim(0);
+    let just_dir = just_shim.parent().unwrap();
+    let home = tempfile::tempdir().expect("home tempdir");
+
+    // Phase 1: original `kuro run` -- pauses at `ask`.
+    let run_out = run_kuro(project.path(), &flow, &shim, home.path(), just_dir);
+    assert!(
+        run_out.status.success(),
+        "phase 1 (kuro run) must exit 0 on pause; status={:?}\nstderr={}\nshim log:\n{}",
+        run_out.status,
+        String::from_utf8_lossy(&run_out.stderr),
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let run_dir = latest_run_dir(home.path(), &project_name);
+    let run_id = run_dir.file_name().unwrap().to_string_lossy().to_string();
+    let pre_resume_manifest = std::fs::read_to_string(run_dir.join("manifest.yaml")).unwrap();
+    assert!(
+        pre_resume_manifest.contains("status: paused"),
+        "phase 1 must produce a paused manifest, got:\n{pre_resume_manifest}"
+    );
+    assert!(
+        pre_resume_manifest.contains("paused_at_state: ask"),
+        "phase 1 must record paused_at_state: ask, got:\n{pre_resume_manifest}"
+    );
+
+    // Phase 2: `kuro resume <run-id>` -- advances ask -> done.
+    let resume_out = resume_kuro(project.path(), &run_id, &shim, home.path(), just_dir);
+    assert!(
+        resume_out.status.success(),
+        "phase 2 (kuro resume) must exit 0; status={:?}\nstdout={}\nstderr={}\nshim log:\n{}",
+        resume_out.status,
+        String::from_utf8_lossy(&resume_out.stdout),
+        String::from_utf8_lossy(&resume_out.stderr),
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    // Manifest after resume: status:paused gone, final_state present,
+    // file path unchanged (same run dir).
+    let post_resume_manifest = std::fs::read_to_string(run_dir.join("manifest.yaml")).unwrap();
+    assert!(
+        !post_resume_manifest.contains("status: paused"),
+        "resumed manifest must NOT carry `status: paused`, got:\n{post_resume_manifest}"
+    );
+    assert!(
+        post_resume_manifest.contains("final_state: done"),
+        "resumed manifest must record `final_state: done`, got:\n{post_resume_manifest}"
+    );
+    // The pre-pause `design` step record is preserved across the
+    // overwrite -- a resumed run that drops the pre-pause history would
+    // lie about what happened.
+    assert!(
+        post_resume_manifest.contains("step_id: design"),
+        "resumed manifest must keep the pre-pause step record, got:\n{post_resume_manifest}"
+    );
+
+    // Step files on disk: exactly the pre-pause `design` artifact.
+    // `ask` (human) and `done` (final) write nothing on either phase.
+    let steps_dir = run_dir.join("steps");
+    let names: Vec<String> = std::fs::read_dir(&steps_dir)
+        .unwrap_or_else(|e| panic!("read steps dir {}: {e}", steps_dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("design")),
+        "expected a step file for design, got: {names:?}"
+    );
+    assert!(
+        names
+            .iter()
+            .all(|n| !n.contains("-ask.") && !n.contains("-done.")),
+        "no step file may exist for human or final states, got: {names:?}"
+    );
+}
+
+#[test]
+fn resume_errors_when_run_id_missing() {
+    // AC (#338): an unknown run-id surfaces a clear error and a non-zero
+    // exit. The message names the run-id and the stack path so an
+    // operator can `ls` the directory and see what is actually there.
+    let project = make_project();
+    // We do not need a flow at all -- the resume command should fail
+    // before trying to load any flow file.
+    let (_shim_dir, shim, _log) = install_shim("printf 'unused\n'\n");
+    let (_just_dir, just_shim) = install_just_shim(0);
+    let just_dir = just_shim.parent().unwrap();
+    let home = tempfile::tempdir().expect("home tempdir");
+
+    let out = resume_kuro(
+        project.path(),
+        "ghost-20990101-000000",
+        &shim,
+        home.path(),
+        just_dir,
+    );
+    assert!(
+        !out.status.success(),
+        "resume of an unknown run-id must exit non-zero; status={:?}\nstderr={}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ghost-20990101-000000"),
+        "error must name the run-id, got stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("not found"),
+        "error must include 'not found', got stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn resume_errors_when_run_already_done() {
+    // AC (#338): a run that already reached a terminal state cannot be
+    // resumed. The error must name the actual status so an operator can
+    // tell apart a finished run from a still-mid-flight one.
+    let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let flow = write_resumable_flow(project.path());
+
+    // Walk the full happy path on the first invocation: design -> ask
+    // -> design (loop back to keep iterating) is NOT what we want;
+    // instead the shim picks `ask` once, and on resume the driver
+    // advances ask -> done. To reach `done` in a single `kuro run`
+    // (no human handoff), we need to pick a different transition --
+    // but the seed flow's only non-pause exit from `design` is `ask`.
+    // So we run a flow that reaches `done` directly: replace the seed
+    // flow with one whose `design` state transitions to `done`.
+    let direct_flow_path = project.path().join(".kuro/flows/done-direct.yaml");
+    // The validator (validate_graph_flow) requires non-terminal states
+    // to declare at least 2 outgoing edges. Add a second branch that the
+    // shim never picks so the file passes schema validation but the run
+    // still walks design -> done in one transition.
+    std::fs::write(
+        &direct_flow_path,
+        "version: \"1\"\n\
+         name: done-direct\n\
+         prompt: \"Reach done directly.\"\n\
+         initial: design\n\
+         graph:\n\
+         \x20\x20design:\n\
+         \x20\x20\x20\x20role: developer\n\
+         \x20\x20\x20\x20task: \"Pick done.\"\n\
+         \x20\x20\x20\x20next:\n\
+         \x20\x20\x20\x20\x20\x20- done: \"directly\"\n\
+         \x20\x20\x20\x20\x20\x20- design: \"keep iterating\"\n\
+         \x20\x20done:\n\
+         \x20\x20\x20\x20final: \"finished\"\n",
+    )
+    .unwrap();
+
+    let shim_body = r#"case "$PROMPT" in
+  *'state `design`'*)
+    printf 'plan: done.\n{"transition": "done", "reason": "directly"}\n'
+    ;;
+  *)
+    printf 'unexpected prompt\n' >&2
+    exit 1
+    ;;
+esac
+"#;
+    let (_shim_dir, shim, _log) = install_shim(shim_body);
+    let (_just_dir, just_shim) = install_just_shim(0);
+    let just_dir = just_shim.parent().unwrap();
+    let home = tempfile::tempdir().expect("home tempdir");
+
+    // Phase 1: run to completion. `flow` (the resumable fixture) is
+    // unused for this test path; the actual flow is the direct one
+    // we just wrote. Pass the direct flow path to `run_kuro`.
+    let _ = flow;
+    let run_out = run_kuro(
+        project.path(),
+        &direct_flow_path,
+        &shim,
+        home.path(),
+        just_dir,
+    );
+    assert!(
+        run_out.status.success(),
+        "phase 1 (kuro run) must exit 0; status={:?}\nstderr={}",
+        run_out.status,
+        String::from_utf8_lossy(&run_out.stderr),
+    );
+
+    let run_dir = latest_run_dir(home.path(), &project_name);
+    let run_id = run_dir.file_name().unwrap().to_string_lossy().to_string();
+
+    // Phase 2: resume must refuse -- the run is `done`, not `paused`.
+    let resume_out = resume_kuro(project.path(), &run_id, &shim, home.path(), just_dir);
+    assert!(
+        !resume_out.status.success(),
+        "resume of a completed run must exit non-zero; status={:?}\nstderr={}",
+        resume_out.status,
+        String::from_utf8_lossy(&resume_out.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&resume_out.stderr);
+    assert!(
+        stderr.contains("not 'paused'") || stderr.contains("not paused"),
+        "error must explain the status mismatch, got stderr:\n{stderr}"
+    );
+}
