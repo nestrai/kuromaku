@@ -12,6 +12,9 @@ tiers:
 defaults:
   backend: cli
 
+vars:
+  ready_label: ready-for-implementation
+
 roles:
   developer:
     agent: Noah

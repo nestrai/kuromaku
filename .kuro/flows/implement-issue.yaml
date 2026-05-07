@@ -1,22 +1,49 @@
 # Project-local override of the canonical implement-issue graph.
 #
 # Topology:
-#   design (architect) --> implement (developer)
-#   implement --> review (reviewer)
-#   review   --> verify (shell: just lint && just test)
-#   verify   --> pr (pass) or implement (fail, with captured output)
-#   pr       --> done
+#   precheck (gate)   --> design (architect)
+#   design            --> implement (developer)
+#   implement         --> review (reviewer)
+#   review            --> verify (shell: just lint && just test)
+#   verify            --> pr (pass) or implement (fail, with captured output)
+#   pr                --> done
 #
 # Usage: kuro run implement-issue --var id=42
+#        kuro run implement-issue --var id=42 --var ready_label=ready-for-implementation
+#
+# Default ready label is `ready-for-implementation`. Override with
+# `--var ready_label=<name>` if your project uses a different convention.
+
 version: "1"
 name: implement-issue
 prompt: |
   Implement issue #{{vars.id}} in this repository. Follow the team's rules
   and produce a draft PR at the end.
 
-initial: design
+  Issues must carry the `{{vars.ready_label}}` label before agents may
+  pick them up. The precheck state aborts the run if the label is missing.
+
+initial: precheck
 
 graph:
+  precheck:
+    role: developer
+    task: |
+      Verify that issue #{{vars.id}} carries the `{{vars.ready_label}}`
+      label. Without it, agents must not start implementation.
+
+      ```bash
+      gh issue view {{vars.id}} --json labels --jq '.labels[].name'
+      ```
+
+      If `{{vars.ready_label}}` is in the output, transition to `design`.
+      If not, transition to `aborted` and explain that the issue is not
+      ready for implementation -- the maintainer must clarify scope, add
+      a Summary, define acceptance criteria, then label the issue.
+    next:
+      - design: "ready label is set, issue is implementation-ready"
+      - aborted: "ready label missing -- issue needs spec work first"
+
   design:
     role: architect
     task: |
