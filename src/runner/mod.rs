@@ -4068,6 +4068,231 @@ look around
         );
     }
 
+    // ---- pause-arm coverage for `build_manifest` (issue #339) ----------
+    //
+    // The production change for #339 (manifest write at pause) shipped
+    // alongside #337 in PR #350. The `match pause` block at the bottom of
+    // `build_manifest` is therefore the wire that carries paused-run
+    // metadata from the graph driver onto the manifest. End-to-end coverage
+    // exists in `tests/graph_smoke.rs::human_state_pauses_run_with_status_paused_in_manifest`,
+    // but that test pays for an Ollama shim subprocess and only fails after
+    // the full setup runs. The two unit tests below pin the wiring directly:
+    // a regression that drops one of the four paused-run fields trips a
+    // millisecond-scale unit test instead of the e2e shim.
+    //
+    // The fixture mirrors `manifest_structure_identical_for_yaml_and_md_sources`
+    // -- minimum viable RunContext, a single canned step, no real executor.
+    // We extract it into a helper because the two tests need byte-identical
+    // inputs and only diverge on the `final_state` / `pause` arguments.
+
+    /// Build the canned arguments shared by the two pause-arm tests. Returns
+    /// owned values rather than references so the tests can hold the result
+    /// in a single binding without lifetime juggling -- the function inputs
+    /// (`flow_contents`, `flow_path`, etc.) all live for the duration of the
+    /// test.
+    #[allow(clippy::type_complexity)]
+    fn pause_arm_fixture() -> (
+        RunContext,
+        PathBuf,
+        Seeds,
+        Vec<crate::config::Agent>,
+        HashMap<String, usize>,
+        HashMap<String, String>,
+        Vec<crate::resolver::ResolvedRole>,
+        HashMap<String, String>,
+        Vec<StepRunResult>,
+    ) {
+        use crate::resolver::ResolvedRole;
+        use crate::stack::StepRecord;
+
+        let dir = tempfile::tempdir().unwrap();
+        let flow_path = dir.path().join("flow.yaml");
+        let ctx = RunContext::new(
+            "pause-arm".to_string(),
+            "fixture for pause-arm unit tests".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let seeds = Seeds::default_local();
+        let roles = vec![ResolvedRole {
+            name: "dev".to_string(),
+            agent: "Sage".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+            model_source: "agent".to_string(),
+            backend_source: "agent".to_string(),
+            seed_origin: Some(".kuro/".to_string()),
+            extra_args: Vec::new(),
+        }];
+        let started = ctx.started_at.to_rfc3339();
+        let results = vec![StepRunResult {
+            step_id: "design".to_string(),
+            agent_name: "Sage".to_string(),
+            backend: "api".to_string(),
+            duration: std::time::Duration::from_millis(500),
+            tokens_in: Some(10),
+            tokens_out: Some(5),
+            output_file: format!("{}/01-design.md", ctx.run_id),
+            print_output: false,
+            record: StepRecord {
+                step_id: "design".to_string(),
+                kind: "llm".to_string(),
+                agent: Some("Sage".to_string()),
+                model_requested: Some("claude-sonnet-4-5".to_string()),
+                model_actual: Some("claude-sonnet-4-5".to_string()),
+                backend: "api".to_string(),
+                tokens_in: Some(10),
+                tokens_out: Some(5),
+                duration_ms: 500,
+                started_at: started,
+                exit_code: 0,
+                input_steps: vec![],
+                output_file: "01-design.md".to_string(),
+                participants: Vec::new(),
+                turns: None,
+                messages: None,
+                terminated_by: None,
+                graph_decision: None,
+            },
+        }];
+
+        (
+            ctx,
+            flow_path,
+            seeds,
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            roles,
+            HashMap::new(),
+            results,
+        )
+    }
+
+    /// Pause arm: when `build_manifest` receives `Some(PauseRecord)`, it
+    /// must transcribe all four lifecycle fields (`status`, `paused_at_state`,
+    /// `paused_at`, `paused_issue_body_sha256`) onto the manifest, leave
+    /// `final_state` empty, and preserve the step history that accumulated
+    /// before the pause. The wire spelling `"paused"` is locked: `kuro resume`
+    /// (#338) reads the manifest back as a string and matches on this value.
+    #[test]
+    fn build_manifest_records_pause_fields_when_pause_provided() {
+        let (ctx, flow_path, seeds, agents, agent_origins, agent_hashes, roles, vars, results) =
+            pause_arm_fixture();
+
+        let pause = super::flow_api::PauseRecord {
+            paused_at_state: "ask_user".to_string(),
+            paused_at: "2026-05-07T09:00:01Z".to_string(),
+            issue_body_sha256: Some(
+                "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".to_string(),
+            ),
+        };
+
+        let manifest = build_manifest(
+            &ctx,
+            "pause-arm",
+            &flow_path,
+            "version: \"1\"\n",
+            &seeds,
+            &agents,
+            &agent_origins,
+            &agent_hashes,
+            &roles,
+            &vars,
+            &results,
+            std::time::Duration::from_secs(1),
+            None,
+            Some(pause),
+        );
+
+        assert_eq!(
+            manifest.status.as_deref(),
+            Some("paused"),
+            "status must serialise to the locked wire string `paused` so #338 can match on it"
+        );
+        assert_eq!(
+            manifest.paused_at_state.as_deref(),
+            Some("ask_user"),
+            "paused_at_state must transcribe the graph state ID where the pause happened"
+        );
+        assert_eq!(
+            manifest.paused_at.as_deref(),
+            Some("2026-05-07T09:00:01Z"),
+            "paused_at must transcribe the RFC3339 timestamp the driver captured"
+        );
+        assert_eq!(
+            manifest.paused_issue_body_sha256.as_deref(),
+            Some("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"),
+            "paused_issue_body_sha256 must transcribe the issue-body hash from the PauseRecord"
+        );
+        assert!(
+            manifest.final_state.is_none(),
+            "final_state and the pause fields are mutually exclusive: a paused run did not reach a terminal state"
+        );
+        assert_eq!(
+            manifest.steps.len(),
+            results.len(),
+            "step history accumulated before the pause must be preserved on the manifest"
+        );
+        assert_eq!(
+            manifest.steps[0].step_id, results[0].record.step_id,
+            "the preserved step records must be the ones the runner accumulated"
+        );
+    }
+
+    /// Companion of the test above: the runner-side regression guard for the
+    /// `skip_serializing_if = Option::is_none` contract on the four
+    /// pause fields. A non-paused run must leave all four absent so the
+    /// terminal-state manifest bytes do not gain new keys; this complements
+    /// the stack-layer roundtrip lock in `stack::tests::manifest_roundtrip`.
+    #[test]
+    fn build_manifest_omits_pause_fields_when_pause_is_none() {
+        let (ctx, flow_path, seeds, agents, agent_origins, agent_hashes, roles, vars, results) =
+            pause_arm_fixture();
+
+        let manifest = build_manifest(
+            &ctx,
+            "pause-arm",
+            &flow_path,
+            "version: \"1\"\n",
+            &seeds,
+            &agents,
+            &agent_origins,
+            &agent_hashes,
+            &roles,
+            &vars,
+            &results,
+            std::time::Duration::from_secs(1),
+            Some("done"),
+            None,
+        );
+
+        assert!(
+            manifest.status.is_none(),
+            "status must stay absent on terminal runs so the manifest's existence keeps encoding `ran to completion`"
+        );
+        assert!(
+            manifest.paused_at_state.is_none(),
+            "paused_at_state must stay absent on terminal runs"
+        );
+        assert!(
+            manifest.paused_at.is_none(),
+            "paused_at must stay absent on terminal runs"
+        );
+        assert!(
+            manifest.paused_issue_body_sha256.is_none(),
+            "paused_issue_body_sha256 must stay absent on terminal runs"
+        );
+        assert_eq!(
+            manifest.final_state.as_deref(),
+            Some("done"),
+            "final_state must transcribe the terminal-state ID the graph driver reported"
+        );
+    }
+
     /// Build a minimal RunContext for shell-step tests that don't need a real
     /// LLM stack. The temp dir's path is the stack path so `write_step` can
     /// land artifacts somewhere predictable.
