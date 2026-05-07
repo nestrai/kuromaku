@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::config::Version;
+use crate::core::Version;
 
 /// Canonical project directory inside the repository. Houses agents, flows,
 /// rules, skills, and the project config. Exported so non-CLI callers (the

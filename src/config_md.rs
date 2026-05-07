@@ -11,9 +11,8 @@
 
 use indexmap::IndexMap;
 
-use crate::config::{
-    ConfigError, GraphFlow, GraphState, SelectEntry, SelectReason, Version, validate_graph_flow,
-};
+use crate::config::ConfigError;
+use crate::core::{GraphFlow, GraphState, SelectEntry, SelectReason, Version, validate_graph_flow};
 
 /// Main entry point: parse a Markdown flow file into a [`GraphFlow`].
 ///
@@ -435,7 +434,7 @@ fn trim_block(lines: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::validate_graph_reachability;
+    use crate::core::validate_graph_reachability;
 
     #[test]
     fn parse_minimal_md_flow() {

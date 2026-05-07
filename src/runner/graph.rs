@@ -28,7 +28,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::time::Instant;
 
-use crate::config::{Agent, Backend, GraphFlow, SelectEntry};
+use crate::config::{Agent, Backend};
+use crate::core::{GraphFlow, SelectEntry};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorError, OutputFormat};
 use crate::stack::{self, GraphDecision, StepRecord};
 use crate::ui::{self, StepInfo, StepState};
@@ -882,7 +883,7 @@ fn render_shell_artifact(command: &str, exit_code: i32, stdout: &str, stderr: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::SelectReason;
+    use crate::core::SelectReason;
 
     fn select_entries(pairs: &[(&str, &str)]) -> Vec<SelectEntry> {
         pairs
