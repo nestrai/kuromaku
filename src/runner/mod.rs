@@ -94,6 +94,48 @@ impl RunContext {
             poster: github::gh_poster(),
         }
     }
+
+    /// Construct a [`RunContext`] for a resumed run (issue #338).
+    ///
+    /// Differs from [`RunContext::new`] in three ways:
+    /// 1. The caller supplies the existing `run_id` / `run_path` /
+    ///    `started_at` instead of generating fresh values. The pause /
+    ///    resume contract says the run keeps its original identity --
+    ///    same directory under `~/.koto/stacks/<project>/`, same
+    ///    timestamp on the manifest -- so that operators see one run,
+    ///    not two related ones.
+    /// 2. No call to [`unique_run_path`]: the directory already exists
+    ///    on disk from the original run.
+    /// 3. No directory creation: layout was set up at the original
+    ///    `kuro run`. Resume reuses it verbatim so step files from
+    ///    before the pause survive next to the ones written after.
+    #[allow(clippy::too_many_arguments)]
+    pub fn resume(
+        flow_name: String,
+        task: String,
+        stack_path: PathBuf,
+        run_id: String,
+        run_path: PathBuf,
+        started_at: chrono::DateTime<chrono::Utc>,
+        guide: Option<String>,
+        rules_cache: HashMap<String, String>,
+        skills_cache: HashMap<String, String>,
+        template_vars: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            run_id,
+            flow_name,
+            task,
+            stack_path,
+            run_path,
+            started_at,
+            guide,
+            rules_cache,
+            skills_cache,
+            template_vars,
+            poster: github::gh_poster(),
+        }
+    }
 }
 
 /// Pick a run directory that does not already exist, appending `-2`, `-3`, ...
@@ -3176,8 +3218,13 @@ mod flow_api {
             if task_state.is_cancelled() {
                 return Err(eyre!("run cancelled before graph driver started"));
             }
+            // `None` -> fresh run, drives from `graph.initial`. Resume
+            // is wired through `execute_graph_flow_resume_setup` (#338),
+            // which builds its own `ResumeFrom` from the persisted
+            // manifest before calling the driver.
             let outcome =
-                super::graph::run_graph_flow(&graph, &agents_by_id, &state_to_agent, &ctx).await?;
+                super::graph::run_graph_flow(&graph, &agents_by_id, &state_to_agent, &ctx, None)
+                    .await?;
             let total_elapsed = flow_start.elapsed();
             // Lifecycle outcome decomposition. The graph driver returns
             // either a `Final` (run reached a `kind: final` state) or a
@@ -3294,6 +3341,497 @@ mod flow_api {
         })
     }
 
+    /// Library entry point for `kuro resume <run-id>` (issue #338).
+    ///
+    /// Re-enters a previously paused graph run: reads the manifest, walks
+    /// the same project / seed / agent / role resolution path that the
+    /// fresh `kuro run` used, then spawns the graph driver from the
+    /// recorded `paused_at_state`.
+    ///
+    /// Setup-side errors (run-id missing, manifest unreadable, status not
+    /// paused, flow file no longer resolvable, agent file gone) surface
+    /// synchronously with operator-shaped messages so a `RunHandle` is
+    /// never produced for an unresumable run.
+    ///
+    /// Out of scope for v1 (see #338's IN/OUT block):
+    /// * body-hash drift detection (#342)
+    /// * human-input plumbing into prior_context (#340)
+    /// * timeout enforcement (#343)
+    /// * automatic resume triggers (#341 `kuro watch`)
+    pub async fn resume_run(run_id: &str) -> Result<RunHandle> {
+        let flow_start = Instant::now();
+
+        // ---- 1. Resolve project + run path -----------------------------
+        // CWD-derived project name -- mirrors `kuro run`. Cross-project
+        // resume (`--project <name>`) is intentionally out of scope for
+        // v1 (#338); the v1 invocation is `kuro resume <run-id>` from
+        // the same project the original run was started in.
+        let stack_path = resolve_stack_path("");
+        let run_path = stack_path.join(run_id);
+        if !run_path.is_dir() {
+            return Err(eyre!(
+                "run-id '{run_id}' not found under {}\n\nhint: run `ls {}` to see available runs",
+                stack_path.display(),
+                stack_path.display(),
+            ));
+        }
+
+        // ---- 2. Read manifest ------------------------------------------
+        // No manifest = run is mid-flight (the runner writes the manifest
+        // post-loop). Treat it as "in flight, not resumable" rather than
+        // "missing": resume can only continue from a clean Paused state,
+        // and a still-running run does not have one persisted yet.
+        let manifest = match stack::read_manifest(&run_path) {
+            Ok(m) => m,
+            Err(stack::StackError::Read(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(eyre!(
+                    "run '{run_id}' has no manifest yet (still in flight or aborted before pause); cannot resume"
+                ));
+            }
+            Err(e) => return Err(eyre!("failed to read manifest for run '{run_id}': {e}")),
+        };
+
+        // ---- 3. Validate manifest is in `Status::Paused` ---------------
+        // The wire string `paused` is locked by `manifest_roundtrips_pause_fields_for_human_handoff`
+        // in stack.rs -- if it ever drifts, that test fires before this code
+        // ships, and the comparison here keeps reading the literal.
+        let status = manifest.status.as_deref();
+        if status != Some("paused") {
+            let actual = status.unwrap_or("done");
+            return Err(eyre!(
+                "run '{run_id}' has status '{actual}', not 'paused'; cannot resume\n\nhint: `kuro resume` only re-enters paused runs -- a completed run is final"
+            ));
+        }
+        let paused_at_state = manifest.paused_at_state.clone().ok_or_else(|| {
+            eyre!(
+                "run '{run_id}' is paused but has no `paused_at_state` recorded -- the manifest is incomplete"
+            )
+        })?;
+
+        // Decode the original `started_at` so the resumed run keeps the
+        // same wall-clock identity. RFC3339 by construction (the writer
+        // uses `to_rfc3339`); a parse failure here means the manifest is
+        // corrupt, which is fail-fast territory.
+        let started_at = chrono::DateTime::parse_from_rfc3339(&manifest.started_at)
+            .map(|dt| dt.with_timezone(&chrono::Utc))
+            .map_err(|e| {
+                eyre!("manifest started_at is not RFC3339: {e}; cannot resume run '{run_id}'")
+            })?;
+
+        // ---- 4. Re-resolve the flow ------------------------------------
+        // Walk the seed cascade for the manifest's `flow_name`. We do
+        // NOT verify `manifest.flow_sha256` against the on-disk file
+        // contents -- drift detection is #342's job. A flow that was
+        // moved or renamed between pause and resume produces an "unknown
+        // flow" error here, which is the right surface for v1.
+        let koto_config = KotoConfig::load_optional(Path::new("."))?;
+        let seeds = koto_config
+            .as_ref()
+            .map(|c| c.seeds.clone())
+            .unwrap_or_else(Seeds::default_local);
+        let flow_path = resolve_flow_path(&FlowSource::Name(manifest.flow_name.clone()), &seeds)?;
+        let contents = std::fs::read_to_string(&flow_path)?;
+
+        // Linear flows cannot pause (they have no human handoff state),
+        // so a paused manifest pointing at a Linear flow means the flow
+        // was switched between runs. Reject explicitly rather than
+        // panic later when the linear runner sees a paused manifest.
+        let flow_loaded = config::load_flow_any_from_path(&flow_path)?;
+        let graph = match flow_loaded {
+            config::Flow::Graph(g) => g,
+            config::Flow::Linear(_) => {
+                return Err(eyre!(
+                    "run '{run_id}' was paused on graph flow '{}', but the flow at {} is now a linear flow; cannot resume",
+                    manifest.flow_name,
+                    flow_path.display(),
+                ));
+            }
+        };
+
+        // ---- 5. Hand off to resume setup -------------------------------
+        // The setup function builds vars + state_to_agent + agents from
+        // the manifest's recorded vars and the project config (re-resolved
+        // each resume -- role overrides given on the original run are NOT
+        // stored in the manifest as overrides, only the resolved bindings
+        // are; this is consistent with how the rest of the system treats
+        // project config). It then constructs a `RunContext::resume` that
+        // adopts the existing run dir and spawns the driver with
+        // `Some(ResumeFrom { state: paused_at_state, ... })`.
+        let resume_ctx = ResumeContext {
+            run_id: run_id.to_string(),
+            run_path,
+            started_at,
+            paused_at_state,
+            prior_steps: manifest.steps.clone(),
+            vars: manifest
+                .vars
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        };
+
+        execute_graph_flow_resume_setup(
+            graph,
+            koto_config.as_ref(),
+            &seeds,
+            flow_path,
+            contents,
+            flow_start,
+            resume_ctx,
+        )
+        .await
+    }
+
+    /// Carries the manifest-derived inputs the resume setup needs but the
+    /// fresh-run setup does not. Fields are owned -- the setup function
+    /// moves them into the spawned task and onto the `RunContext::resume`
+    /// constructor.
+    pub(crate) struct ResumeContext {
+        pub run_id: String,
+        pub run_path: PathBuf,
+        pub started_at: chrono::DateTime<chrono::Utc>,
+        pub paused_at_state: String,
+        /// Pre-pause step records, hydrated verbatim into the resumed
+        /// run's manifest so the `steps:` history spans the full lifecycle
+        /// rather than only the post-resume tail.
+        pub prior_steps: Vec<stack::StepRecord>,
+        /// Effective vars from the manifest (project-config + CLI vars
+        /// merged at original-run time). Used to substitute placeholders
+        /// in the re-loaded flow and to populate the resumed manifest's
+        /// `vars:` field unchanged.
+        pub vars: HashMap<String, String>,
+    }
+
+    /// Resume sibling of [`execute_graph_flow_setup`].
+    ///
+    /// Mirrors the fresh-run setup: vars + role substitution, agent load,
+    /// guide / rules cache, `RunContext` build, driver spawn. Diverges in
+    /// three places only:
+    /// 1. Constructs [`RunContext::resume`] (existing dir, original
+    ///    `run_id` and `started_at`) instead of [`RunContext::new`].
+    /// 2. Passes `Some(ResumeFrom { ... })` to [`super::graph::run_graph_flow`]
+    ///    so the driver enters at `paused_at_state` and seeds its step
+    ///    counter past the pre-pause artefacts on disk.
+    /// 3. Pre-seeds the spawned task's results vector with the manifest's
+    ///    pre-pause step records so the resumed manifest's `steps:` list
+    ///    is contiguous across the pause boundary.
+    ///
+    /// Code paths shared with the fresh setup (substitute_vars,
+    /// substitute_roles, agent loading via `load_agent_file_with_seeds`,
+    /// guide / rules caching) keep their fresh-run home -- duplicated only
+    /// where the divergent ResumeContext shape forces it. The two functions
+    /// stay readable independently rather than threading a `ResumeMode`
+    /// enum through every line; #338's design notes flag the trade-off.
+    async fn execute_graph_flow_resume_setup(
+        graph: config::GraphFlow,
+        koto_config: Option<&crate::koto_config::KotoConfig>,
+        seeds: &Seeds,
+        flow_path: PathBuf,
+        flow_contents: String,
+        flow_start: Instant,
+        resume: ResumeContext,
+    ) -> Result<RunHandle> {
+        use crate::config::{Defaults, load_agent_file_with_seeds};
+        use std::sync::Arc;
+
+        // Resume invariant: external-prompt resolution must already have
+        // run. `load_flow_any_from_path` (the only caller that produces
+        // the `graph: GraphFlow` we receive here) folds `prompt_file:` /
+        // `task_file:` into the in-memory strings before returning.
+        debug_assert!(
+            graph.prompt_file.is_none(),
+            "graph.prompt_file should be resolved before execute_graph_flow_resume_setup"
+        );
+        debug_assert!(
+            graph.graph.values().all(|s| s.task_file.is_none()),
+            "every state's task_file should be resolved before execute_graph_flow_resume_setup"
+        );
+
+        // ---- Effective vars: from the manifest (no CLI overrides) ------
+        // The resume command does not accept `--var`; the run's vars are
+        // pinned to what the original `kuro run` recorded. This is
+        // intentional: changing vars mid-pause would silently re-route
+        // the run.
+        let effective_vars = resume.vars.clone();
+
+        // ---- Resolve role -> agent_id for every non-terminal state -----
+        // Same shape as fresh setup. Final / human / shell states are
+        // skipped (no agent runs there).
+        let project_roles = koto_config.map(|c| &c.roles);
+        let mut state_to_agent: HashMap<String, String> = HashMap::new();
+        for (state_id, state) in &graph.graph {
+            if state.is_final() || state.is_human() || state.is_shell() {
+                continue;
+            }
+            let role_name = state.role.as_deref().ok_or_else(|| {
+                eyre!(
+                    "graph state '{state_id}' is non-terminal but has no `role:` -- declare a role or mark the state as `kind: final`"
+                )
+            })?;
+            let project_role = project_roles.and_then(|m| m.get(role_name));
+            // No CLI overrides on resume: the cascade reduces to
+            // project-config + flow defaults. If the project config has
+            // changed between pause and resume, the resumed run uses
+            // the new bindings -- consistent with how the rest of the
+            // system treats project config.
+            let agent_id = resolver::resolve_role_agent(role_name, None, project_role, &[])
+                .ok_or_else(|| {
+                    eyre!(
+                        "graph state '{state_id}' uses role '{role_name}' but no agent is bound -- set a project-config role binding"
+                    )
+                })?;
+            state_to_agent.insert(state_id.clone(), agent_id);
+        }
+
+        // ---- Build role -> agent_id map for {{roles.X}} substitution ---
+        let mut roles_map: HashMap<String, String> = HashMap::new();
+        if let Some(pr) = project_roles {
+            for (role_name, kr) in pr {
+                roles_map.insert(role_name.clone(), kr.agent.clone());
+            }
+        }
+        for (state_id, agent_id) in &state_to_agent {
+            if let Some(state) = graph.graph.get(state_id)
+                && let Some(role_name) = state.role.as_deref()
+            {
+                roles_map.insert(role_name.to_string(), agent_id.clone());
+            }
+        }
+
+        // ---- Var + role substitution in graph prompt + per-state tasks -
+        let mut graph = graph;
+        if let Some(prompt) = graph.prompt.as_mut() {
+            *prompt = substitute_vars(prompt, &effective_vars)?;
+            *prompt = substitute_roles(prompt, &roles_map, "graph prompt")?;
+        }
+        for (state_id, state) in graph.graph.iter_mut() {
+            if let Some(task) = state.task.as_mut() {
+                *task = substitute_vars(task, &effective_vars)?;
+                let ctx = format!("state '{state_id}'");
+                *task = substitute_roles(task, &roles_map, &ctx)?;
+            }
+            if let Some(run_cmd) = state.run.as_mut() {
+                *run_cmd = substitute_vars(run_cmd, &effective_vars)?;
+            }
+        }
+
+        // ---- Top-level task (no `-t` on resume; falls back to prompt) --
+        let resolved_task = graph.prompt.clone().unwrap_or_default();
+
+        // ---- Load each unique agent ------------------------------------
+        let defaults = Defaults {
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+        };
+        let mut agents_by_id: HashMap<String, config::Agent> = HashMap::new();
+        let mut agent_origins: HashMap<String, usize> = HashMap::new();
+        let mut agent_hashes: HashMap<String, String> = HashMap::new();
+        for agent_id in state_to_agent.values() {
+            if agents_by_id.contains_key(agent_id) {
+                continue;
+            }
+            let (agent, origin, sha) =
+                load_agent_file_with_seeds(seeds, agent_id, &defaults, koto_config)?;
+            agent_origins.insert(agent_id.clone(), origin);
+            agent_hashes.insert(agent_id.clone(), sha);
+            agents_by_id.insert(agent_id.clone(), agent);
+        }
+
+        // ---- Guide / rules cache ---------------------------------------
+        let agents_vec: Vec<config::Agent> = agents_by_id.values().cloned().collect();
+        let guide = super::load_guide_from_seeds(seeds).map_err(|e| eyre!("{e}"))?;
+        let rules_cache = super::load_rules_for_agents_with_seeds(&agents_vec, seeds)
+            .map_err(|e| eyre!("{e}"))?;
+
+        // ---- RunContext: ADOPT the existing run dir --------------------
+        // No `unique_run_path`, no `init_run_layout`. The directory was
+        // created on the original run; reuse it so step files written
+        // before and after the pause share one location.
+        let stack_path = resolve_stack_path("");
+        let ctx = RunContext::resume(
+            graph.name.clone(),
+            resolved_task,
+            stack_path,
+            resume.run_id.clone(),
+            resume.run_path.clone(),
+            resume.started_at,
+            guide,
+            rules_cache,
+            HashMap::new(),
+            effective_vars.clone(),
+        );
+
+        // Resume banner so the operator sees we adopted an existing run
+        // rather than starting a new one. Mirrors `print_command` shape
+        // used by the fresh-run path.
+        let display_path_str = flow_path.display().to_string();
+        ui::print_command(&format!("kuro resume {}", resume.run_id));
+        ui::print_run_resume(&resume.run_id, &resume.paused_at_state);
+        ui::print_flow_start(
+            &graph.name,
+            &display_path_str,
+            graph.graph.len(),
+            agents_by_id.len(),
+        );
+
+        // ---- Spawn driver task -----------------------------------------
+        let state = Arc::new(RunState::default());
+        let task_state = Arc::clone(&state);
+        let run_id = ctx.run_id.clone();
+        let run_id_for_task = run_id.clone();
+        let run_path = ctx.run_path.clone();
+        let stack_path_for_handle = ctx.stack_path.clone();
+        let flow_name_for_handle = graph.name.clone();
+        let flow_name = graph.name.clone();
+        let seeds_owned = seeds.clone();
+        let paused_state_for_resume = resume.paused_at_state.clone();
+        let prior_steps_count = resume.prior_steps.len();
+        let prior_steps = resume.prior_steps;
+
+        let join: JoinHandle<Result<FlowResult>> = tokio::spawn(async move {
+            if task_state.is_cancelled() {
+                return Err(eyre!("run cancelled before graph driver resumed"));
+            }
+            let resume_from = super::graph::ResumeFrom {
+                state: paused_state_for_resume,
+                step_num_offset: prior_steps_count,
+            };
+            let outcome = super::graph::run_graph_flow(
+                &graph,
+                &agents_by_id,
+                &state_to_agent,
+                &ctx,
+                Some(resume_from),
+            )
+            .await?;
+            let total_elapsed = flow_start.elapsed();
+
+            // Hydrate the manifest's `steps:` history across the pause
+            // boundary: prior records + new records. Synthesised
+            // StepRunResults so build_manifest can reuse the same
+            // results-driven path it already takes for fresh runs.
+            // Fields not on `StepRecord` (e.g. `print_output`) are
+            // irrelevant downstream of build_manifest -- the manifest
+            // reads `.record.clone()` and totals from `tokens_in/out`.
+            let mut all_results: Vec<StepRunResult> = prior_steps
+                .into_iter()
+                .map(|rec| StepRunResult {
+                    step_id: rec.step_id.clone(),
+                    agent_name: rec.agent.clone().unwrap_or_default(),
+                    backend: rec.backend.clone(),
+                    duration: std::time::Duration::from_millis(rec.duration_ms as u64),
+                    tokens_in: rec.tokens_in,
+                    tokens_out: rec.tokens_out,
+                    // Keep a stack-relative path shape consistent with
+                    // fresh runs (`<run_id>/<steps>/<filename>`); the
+                    // manifest builder does not consume `output_file`
+                    // but the sibling fields on `StepRunResult` are
+                    // public, so honour the convention.
+                    output_file: format!(
+                        "{}/{}/{}",
+                        run_id_for_task,
+                        stack::STEPS_SUBDIR,
+                        rec.output_file,
+                    ),
+                    print_output: false,
+                    record: rec,
+                })
+                .collect();
+
+            let (post_resume_results, final_state, pause) = match outcome {
+                super::graph::GraphRunOutcome::Final { steps, final_state } => {
+                    (steps, Some(final_state), None)
+                }
+                super::graph::GraphRunOutcome::Paused {
+                    steps,
+                    paused_at_state,
+                    paused_at,
+                } => {
+                    // Re-pause: a resumed run can pause again at a
+                    // later human state. Re-snapshot the issue body so
+                    // a future #342 drift check still has fresh data.
+                    let issue_body_sha256 = effective_vars
+                        .get("id")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .and_then(crate::notify::github::fetch_issue_body)
+                        .map(|body| stack::sha256_hex(body.as_bytes()));
+                    let pause = PauseRecord {
+                        paused_at_state,
+                        paused_at: paused_at.to_rfc3339(),
+                        issue_body_sha256,
+                    };
+                    (steps, None, Some(pause))
+                }
+            };
+            all_results.extend(post_resume_results);
+
+            let pause_state_marker = pause.as_ref().map(|p| p.paused_at_state.clone());
+            let manifest = build_manifest(
+                &ctx,
+                &flow_name,
+                &flow_path,
+                &flow_contents,
+                &seeds_owned,
+                &agents_vec,
+                &agent_origins,
+                &agent_hashes,
+                &[],
+                &effective_vars,
+                &all_results,
+                total_elapsed,
+                final_state.as_deref(),
+                pause,
+            );
+            // Overwrites the previous Paused manifest at the same path
+            // (issue #338's tech note: "overwrite the previous Paused
+            // manifest with the new run state").
+            stack::write_manifest(&ctx.run_path, &manifest)
+                .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
+
+            let summary = super::build_summary(&all_results);
+            match &pause_state_marker {
+                Some(state_id) => {
+                    ui::print_flow_paused(
+                        &summary,
+                        state_id,
+                        &ctx.stack_path.display().to_string(),
+                    );
+                }
+                None => {
+                    let total_in: u32 = all_results.iter().filter_map(|r| r.tokens_in).sum();
+                    let total_out: u32 = all_results.iter().filter_map(|r| r.tokens_out).sum();
+                    ui::print_flow_complete(
+                        &summary,
+                        &format_elapsed(total_elapsed),
+                        &total_in.to_string(),
+                        &total_out.to_string(),
+                        "—",
+                        &ctx.stack_path.display().to_string(),
+                    );
+                }
+            }
+
+            Ok(FlowResult {
+                run_id: ctx.run_id.clone(),
+                run_path: ctx.run_path.clone(),
+                stack_path: ctx.stack_path.clone(),
+                flow_name,
+                manifest,
+                step_results: all_results,
+                total_elapsed,
+            })
+        });
+
+        Ok(RunHandle {
+            run_id,
+            run_path,
+            stack_path: stack_path_for_handle,
+            flow_name: flow_name_for_handle,
+            state,
+            join,
+        })
+    }
+
     /// Test-only constructors for the in-tree MCP session module. We do not
     /// want a public ctor for `ActiveRouter` -- production code reaches it
     /// only through [`RunHandle::active_router`] -- but the session tests
@@ -3339,7 +3877,7 @@ mod flow_api {
 #[allow(unused_imports)]
 pub use flow_api::{
     ActiveRouter, ExecuteFlowSpec, FlowResult, FlowSource, RouterAccessor, RouterAccessorError,
-    RunHandle, execute_flow,
+    RunHandle, execute_flow, resume_run,
 };
 
 // Crate-internal re-exports so the CLI tests (and any other in-tree caller)

@@ -153,17 +153,45 @@ pub enum GraphRunOutcome {
     },
 }
 
-/// Drive a graph flow from `initial:` to a `kind: final` state.
+/// Re-entry point for `kuro resume` (#338).
+///
+/// Threaded into [`run_graph_flow`] as `Some(...)` to start the driver
+/// from a previously-paused state instead of `graph.initial`. The
+/// `step_num_offset` is the number of step records already on disk for
+/// this run -- the driver uses it to start its local `step_num` at
+/// `offset + 1` so the next persisted artifact does not collide with
+/// the pre-pause `NN-<id>.md` files.
+pub struct ResumeFrom {
+    pub state: String,
+    pub step_num_offset: usize,
+}
+
+/// Drive a graph flow from `initial:` (or, when `resume` is set, from a
+/// previously-paused state) to a `kind: final` state.
 ///
 /// `state_to_agent` maps every non-terminal, non-human state ID to the
 /// agent ID that handles it. The mapping is built up-front so a missing
 /// role binding fails before any state runs (mirrors the linear runner's
 /// "unknown agent" semantics).
+///
+/// `resume` is `None` for fresh runs (existing semantics: start at
+/// `graph.initial`, step counter at 0). When `Some(ResumeFrom { state,
+/// step_num_offset })`, the driver starts at `state` and seeds its local
+/// step counter at `step_num_offset` so resumed runs continue the
+/// `NN-<id>.md` numbering of the pre-pause phase. On the FIRST iteration
+/// only, a human-handoff state is treated as a transit point rather than
+/// a pause: the driver advances to `next[0].target` instead of returning
+/// `Paused`. This keeps the resume contract self-contained -- the CLI
+/// does not have to special-case "resume into a paused state" because
+/// the driver already knows it has just been re-entered. The policy
+/// (first `next:` entry wins) is intentionally minimal for v1 (#338);
+/// human-input routing replaces it in #340.
 pub async fn run_graph_flow(
     graph: &GraphFlow,
     agents_by_id: &HashMap<String, Agent>,
     state_to_agent: &HashMap<String, String>,
     ctx: &RunContext,
+    resume: Option<ResumeFrom>,
 ) -> Result<GraphRunOutcome, RunError> {
     // Announce dispatch into the graph runtime on stderr so callers and
     // tests can confirm we did not silently fall through to the linear
@@ -178,12 +206,27 @@ pub async fn run_graph_flow(
 
     let executor = executor::create_executor();
     let mut results: Vec<StepRunResult> = Vec::new();
-    let mut current = graph.initial.clone();
-    let mut step_num: usize = 0;
+    let (mut current, mut step_num, mut skip_pause_once) = match &resume {
+        // Fresh: start at the graph's declared initial state, counter at
+        // 0, and never skip the pause check.
+        None => (graph.initial.clone(), 0usize, false),
+        // Resume: start at the named state, seed the counter so the next
+        // increment lands at `offset + 1`, and arm the one-shot "advance
+        // through a human state" flag for the first iteration only.
+        Some(r) => (r.state.clone(), r.step_num_offset, true),
+    };
     // Track the state the runtime just transitioned out of so the next
     // agent's prompt can include that step's artifact. Without this the
     // graph runs as a sequence of isolated agents, each blind to what its
     // predecessors produced. `None` for the first iteration.
+    //
+    // Resume note: on re-entry the prior step's artifact lives on disk
+    // under the pre-pause run dir, but #338 does not thread it back into
+    // the prompt -- the human state wrote nothing, so there is no
+    // single "prior" body to splice. Richer context handoff lands with
+    // #340 (resume input plumbing). Keeping `prior_state = None` here
+    // means the first agent after resume sees no prior-context block,
+    // which is honest about what is available.
     let mut prior_state: Option<String> = None;
     // Per-state visit counter. A loop between two states (the canonical
     // failure mode is `design <-> steer_design` where the steerer keeps
@@ -218,7 +261,38 @@ pub async fn run_graph_flow(
         // driver returns before `step_num` increments, mirroring the
         // final-state contract. `kuro resume` (#338) will read the
         // manifest back to pick up where we stopped.
+        //
+        // Resume exception: on the FIRST iteration after re-entry, a
+        // human state is the entry point itself -- pausing again would
+        // deadlock the run. Take the first declared `next:` entry and
+        // continue the loop instead. Subsequent visits to a human state
+        // (after the resume's first iteration) pause normally. The
+        // "first declared `next:`" policy is the v1 minimum from #338;
+        // #340 replaces it with input-routing once human comments feed
+        // back into the run.
         if state.is_human() {
+            if skip_pause_once {
+                skip_pause_once = false;
+                let advance = state.select.as_ref().and_then(|s| s.first());
+                let next = advance.ok_or_else(|| RunError::GraphRuntime {
+                    state: current.clone(),
+                    reason: format!(
+                        "paused state '{current}' has no `next:` entries; cannot resume -- declare at least one outgoing edge in the flow before retrying"
+                    ),
+                })?;
+                let next_state = next.target.clone();
+                ui::print_graph_transition(
+                    &next_state,
+                    &next_state,
+                    "resumed -- advancing past human handoff",
+                );
+                // The human state wrote no artifact at pause time, so
+                // `prior_state` stays None for the next iteration --
+                // see the comment block at the top of `run_graph_flow`.
+                prior_state = None;
+                current = next_state;
+                continue;
+            }
             let paused_at = chrono::Utc::now();
             ui::print_graph_paused(&current);
             return Ok(GraphRunOutcome::Paused {
@@ -1241,7 +1315,7 @@ mod tests {
         let state_to_agent: HashMap<String, String> = HashMap::new();
 
         let before = chrono::Utc::now();
-        let outcome = run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx)
+        let outcome = run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx, None)
             .await
             .expect("pause must be Ok, not Err");
         let after = chrono::Utc::now();
@@ -1292,7 +1366,7 @@ mod tests {
         let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
         let state_to_agent: HashMap<String, String> = HashMap::new();
 
-        run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx)
+        run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx, None)
             .await
             .expect("pause must succeed");
 
@@ -1313,5 +1387,219 @@ mod tests {
             entries.is_empty(),
             "no step files must land on disk for a pause-on-initial run, got: {entries:?}"
         );
+    }
+
+    // --- Resume driver tests (issue #338) -------------------------------
+    //
+    // Pin the contract that `resume = Some(...)` inverts the entry-state
+    // selection (start at `from_state`, not `graph.initial`) and that the
+    // first iteration of a resumed human state advances through the first
+    // declared `next:` entry instead of pausing again. The third test
+    // locks in the explicit error path for an unresumable human state
+    // (no `next:` entries) so a future refactor cannot silently fall
+    // through to the normal pause arm and re-suspend the run.
+
+    fn graph_flow_human_with_final_next() -> GraphFlow {
+        // Two states: `ask` (human, advances to `done` on resume) and
+        // `done` (final). Resuming from `ask` must walk to `done`.
+        let mut graph: IndexMap<String, GraphState> = IndexMap::new();
+        graph.insert(
+            "ask".to_string(),
+            GraphState {
+                human: Some(true),
+                select: Some(vec![SelectEntry {
+                    target: "done".to_string(),
+                    reason: Some(SelectReason::Single("after human input".to_string())),
+                }]),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "done".to_string(),
+            GraphState {
+                final_desc: Some("run complete".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut flow = GraphFlow::default();
+        flow.name = "resume-test".to_string();
+        flow.initial = "ask".to_string();
+        flow.graph = graph;
+        flow
+    }
+
+    #[tokio::test]
+    async fn run_graph_flow_resume_from_human_state_takes_first_next() {
+        // Acceptance (#338): resuming into a `human: true` state must
+        // advance through the first declared `next:` entry instead of
+        // pausing again. The first iteration of a resumed run never
+        // pauses on a human state -- otherwise the run would deadlock
+        // (resume re-enters the same state that paused).
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "resume-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = graph_flow_human_with_final_next();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            Some(ResumeFrom {
+                state: "ask".to_string(),
+                step_num_offset: 0,
+            }),
+        )
+        .await
+        .expect("resume from human state must succeed");
+
+        match outcome {
+            GraphRunOutcome::Final { steps, final_state } => {
+                assert_eq!(
+                    final_state, "done",
+                    "resume from `ask` must walk to `done` via next[0]"
+                );
+                assert!(
+                    steps.is_empty(),
+                    "no agent ran (`ask` is human, `done` is final), so no step records"
+                );
+            }
+            GraphRunOutcome::Paused {
+                paused_at_state, ..
+            } => panic!(
+                "resume into a human state must NOT pause again; got Paused({paused_at_state})"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_graph_flow_resume_from_human_state_no_next_errors() {
+        // Acceptance (#338): a human state with no `next:` entries is
+        // unresumable -- there is nowhere to go. The driver must fail
+        // fast with a clear error rather than fall through to the normal
+        // pause arm (which would silently re-suspend the run forever).
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "resume-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = graph_flow_with_human_initial();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        // `GraphRunOutcome` does not implement Debug, so `expect_err`
+        // is unavailable; pattern-match the Result directly.
+        let result = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            Some(ResumeFrom {
+                state: "ask".to_string(),
+                step_num_offset: 0,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(RunError::GraphRuntime { state, reason }) => {
+                assert_eq!(state, "ask");
+                assert!(
+                    reason.contains("no `next:` entries"),
+                    "error must mention missing next: entries, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected RunError::GraphRuntime, got: {other:?}"),
+            Ok(_) => panic!("resume into an unresumable human state must Err, not Ok"),
+        }
+    }
+
+    fn graph_flow_two_finals() -> GraphFlow {
+        // `start` -> `done` (final). Used to verify that `resume_from`
+        // overrides the declared `initial:` -- the driver enters at the
+        // named state, not at `graph.initial`.
+        let mut graph: IndexMap<String, GraphState> = IndexMap::new();
+        graph.insert(
+            "start".to_string(),
+            GraphState {
+                final_desc: Some("never reached when resuming from `done`".to_string()),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "done".to_string(),
+            GraphState {
+                final_desc: Some("resumed terminal".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut flow = GraphFlow::default();
+        flow.name = "resume-bypass-initial".to_string();
+        flow.initial = "start".to_string();
+        flow.graph = graph;
+        flow
+    }
+
+    #[tokio::test]
+    async fn run_graph_flow_resume_from_overrides_initial_state() {
+        // Acceptance (#338): `resume = Some(...)` replaces `graph.initial`
+        // as the entry point. The flow declares `initial: start` (which is
+        // a final state in this fixture) but resuming from `done`
+        // bypasses `start` entirely -- if the driver still consulted
+        // `graph.initial`, the outcome's `final_state` would be `start`.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "resume-bypass-initial".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = graph_flow_two_finals();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            Some(ResumeFrom {
+                state: "done".to_string(),
+                step_num_offset: 0,
+            }),
+        )
+        .await
+        .expect("resume into a final state must terminate cleanly");
+
+        match outcome {
+            GraphRunOutcome::Final { final_state, .. } => {
+                assert_eq!(
+                    final_state, "done",
+                    "resume must enter at `done`, not at `graph.initial` (`start`)"
+                );
+            }
+            GraphRunOutcome::Paused {
+                paused_at_state, ..
+            } => {
+                panic!("resume into a final state must NOT pause; got Paused({paused_at_state})")
+            }
+        }
     }
 }

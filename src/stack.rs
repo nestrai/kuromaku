@@ -570,6 +570,24 @@ pub fn write_manifest(run_path: &Path, manifest: &Manifest) -> Result<(), StackE
     std::fs::write(path, yaml).map_err(StackError::Write)
 }
 
+/// Read the run manifest from `<run_path>/manifest.yaml`.
+///
+/// Symmetric counterpart to [`write_manifest`]. Today only `kuro resume`
+/// (#338) consumes the parsed value -- `read_run` looks at file existence
+/// only -- but the helper lives here so any future audit reader stays on
+/// the same single source of truth for manifest I/O.
+///
+/// Returns [`StackError::Read`] when the file is missing or unreadable
+/// and [`StackError::SerializeYaml`] when the contents are not valid
+/// manifest YAML. The path itself never leaks into errors -- the resume
+/// caller adds it back when surfacing the failure to the operator.
+pub fn read_manifest(run_path: &Path) -> Result<Manifest, StackError> {
+    let path = run_path.join("manifest.yaml");
+    let yaml = std::fs::read_to_string(&path).map_err(StackError::Read)?;
+    let manifest: Manifest = serde_yaml::from_str(&yaml)?;
+    Ok(manifest)
+}
+
 /// Write the resolution audit text at `<run_path>/resolution-audit.txt`.
 pub fn write_resolution_audit(run_path: &Path, text: &str) -> Result<(), StackError> {
     ensure_dir(run_path)?;
@@ -1398,6 +1416,62 @@ mod tests {
 
         // The outside directory must remain intact.
         assert!(outside.path().join("file").is_file());
+    }
+
+    #[test]
+    fn read_manifest_roundtrips_paused_fields() {
+        // Symmetric with `manifest_roundtrips_pause_fields_for_human_handoff`
+        // but exercises the new reader (#338): write a paused manifest,
+        // read it back through `read_manifest`, and assert the pause-
+        // shaped fields survive. `kuro resume` is the first consumer of
+        // the parsed value, so a regression that drops a field here
+        // would silently break resume even if the YAML still serialises.
+        let dir = tempfile::tempdir().unwrap();
+        let run_path = dir.path().join("run");
+        let manifest = Manifest {
+            version: 1,
+            run_id: "graph-20260507-090000".to_string(),
+            flow_name: "implement-issue".to_string(),
+            flow_path: ".kuro/flows/implement-issue.yaml".to_string(),
+            flow_sha256: sha256_hex(b"contents"),
+            started_at: "2026-05-07T09:00:00Z".to_string(),
+            finished_at: "2026-05-07T09:00:01Z".to_string(),
+            duration_ms: 1000,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+            cost: None,
+            vars: indexmap::IndexMap::new(),
+            seeds: vec![],
+            resources: vec![],
+            roles: vec![],
+            steps: vec![],
+            final_state: None,
+            status: Some("paused".to_string()),
+            paused_at_state: Some("ask_user".to_string()),
+            paused_at: Some("2026-05-07T09:00:01Z".to_string()),
+            paused_issue_body_sha256: None,
+        };
+        write_manifest(&run_path, &manifest).unwrap();
+
+        let parsed = read_manifest(&run_path).unwrap();
+        assert_eq!(parsed.run_id, "graph-20260507-090000");
+        assert_eq!(parsed.flow_name, "implement-issue");
+        assert_eq!(parsed.status.as_deref(), Some("paused"));
+        assert_eq!(parsed.paused_at_state.as_deref(), Some("ask_user"));
+        assert_eq!(parsed.paused_at.as_deref(), Some("2026-05-07T09:00:01Z"));
+    }
+
+    #[test]
+    fn read_manifest_errors_when_file_missing() {
+        // The resume path turns this into "run-id not found" with the
+        // run path the user passed. The library error itself just needs
+        // to surface "missing file" cleanly so the caller can wrap it.
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_manifest(dir.path()).unwrap_err();
+        assert!(
+            matches!(err, StackError::Read(_)),
+            "missing manifest must surface as StackError::Read, got: {err:?}"
+        );
     }
 
     #[test]

@@ -79,6 +79,18 @@ struct RunArgs {
 enum Command {
     /// Run a flow
     Run(RunArgs),
+    /// Resume a paused graph run (issue #338).
+    ///
+    /// Re-enters a previously paused run at the state recorded in its
+    /// manifest. The `<run-id>` is the directory name under
+    /// `~/.koto/stacks/<project>/<run-id>/`; `kuro stack` and the
+    /// terminal output of the original `kuro run` both name it. The
+    /// project is derived from the cwd, identical to `kuro run` --
+    /// cross-project resume is not in v1's scope.
+    Resume {
+        /// Run identifier as it appears under `~/.koto/stacks/<project>/`.
+        run_id: String,
+    },
     /// Deprecated alias for `run` -- emits a warning and dispatches to the same handler.
     /// Will be removed in a future release.
     #[command(hide = true)]
@@ -190,6 +202,7 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Run(args) => run_flow(&args).await?,
+        Command::Resume { run_id } => resume_flow(&run_id).await?,
         Command::Up(args) => {
             eprintln!(
                 "warning: `kuro up` is deprecated and will be removed in a future release; use `kuro run` instead"
@@ -507,6 +520,34 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
     // to the terminal via termimad. The library API leaves this to callers
     // because MCP and other quiet harnesses do not want markdown rendered to
     // their stdout.
+    for step in &result.step_results {
+        if step.print_output {
+            let output_path = result.stack_path.join(&step.output_file);
+            if let Ok(content) = std::fs::read_to_string(&output_path) {
+                println!();
+                termimad::print_text(&content);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Implementation of `kuro resume <run-id>` (issue #338).
+///
+/// Thin CLI wrapper around the library's [`runner::resume_run`]: hands
+/// off the run-id, awaits the spawned driver task, and renders any
+/// `print_output: true` step bodies the same way [`run_flow`] does.
+/// Setup-side errors (run-id not found, status not paused, flow
+/// missing) surface synchronously from `resume_run` with their
+/// hint-tagged messages -- this layer adds no extra translation.
+async fn resume_flow(run_id: &str) -> Result<()> {
+    let handle = runner::resume_run(run_id).await?;
+    let result = handle.await_completion().await?;
+
+    // Mirrors `run_flow`'s post-completion render: a resumed run that
+    // continues to a final state may still hit a `print_output: true`
+    // step, and the operator wants the same on-screen artifact view.
     for step in &result.step_results {
         if step.print_output {
             let output_path = result.stack_path.join(&step.output_file);
