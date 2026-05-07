@@ -1,0 +1,125 @@
+version: "1"
+name: validate-issues
+prompt: |
+  Scan all open issues in this repository and evaluate whether each
+  issue is ready to be picked up by an AI agent team. Label issues
+  that need more specification, then create a triage tracking issue
+  with the full report.
+
+initial: scan
+
+graph:
+  scan:
+    role: reviewer
+    task: |
+      Fetch all open issues:
+      `gh issue list --state open --limit 200 --json number,title,body,labels`
+
+      For each issue, evaluate against these criteria:
+
+      1. **Summary section** -- is there a `## Summary` or `## TL;DR` (max 3 sentences) at the top?
+      2. **Clear problem statement** -- is it obvious what needs to change and why?
+      3. **Defined scope** -- is it clear what is in scope and what is not?
+      4. **Acceptance criteria** -- are there testable checkbox conditions for "done"?
+      5. **No ambiguity** -- can an agent implement this without guessing?
+      6. **Right size** -- is it one unit of work, not an epic disguised as an issue?
+
+      Classify each issue:
+
+      ### Ready (agent can pick this up as-is)
+      #N | title
+
+      ### Needs specification (label as needs-spec)
+      #N | title | what is missing (one line)
+
+      ### Too large (should be split into sub-issues)
+      #N | title | suggested split
+
+      ### Already labelled (skip)
+      #N | title | existing label: obsolete/parked/needs-decision
+
+      Rules:
+      - Epics are NOT issues -- skip anything with "epic" in the title
+      - An issue with `## Summary` AND acceptance criteria checkboxes is likely ready
+      - An issue that says "design X" or "discuss Y" without concrete output is needs-spec
+      - Be strict. Agents waste time on vague issues. Better to flag too many than too few.
+    next:
+      - label: "found issues that need specification"
+      - done: "all issues are agent-ready"
+
+  label:
+    role: developer
+    task: |
+      Read the scan results. For each issue under "Needs specification",
+      apply the label (no individual comments -- the triage issue carries
+      the full reasoning):
+
+      ```
+      gh issue edit <number> --add-label needs-spec
+      ```
+
+      For "Too large" issues:
+
+      ```
+      gh issue edit <number> --add-label needs-split
+      ```
+
+      Do NOT touch "Ready" or "Already labelled" issues.
+
+      List what you did:
+      - #N: labelled needs-spec
+      - #M: labelled needs-split
+    next:
+      - triage-issue: "labels applied, ready to publish triage report"
+
+  triage-issue:
+    role: developer
+    task: |
+      Create a single tracking issue with the full triage report. Title
+      format: "Backlog triage YYYY-MM-DD" (use today's date).
+
+      Body structure:
+
+      ```markdown
+      ## Summary
+
+      Backlog triage scan flagged N issues that need attention before
+      they can be picked up by an AI agent team.
+
+      ## Needs specification (X)
+
+      - [ ] #N -- title -- what is missing
+      - [ ] #M -- title -- what is missing
+      ...
+
+      ## Needs split (Y)
+
+      - [ ] #N -- title -- suggested split
+      ...
+
+      ## Ready (Z)
+
+      Issues that passed validation (no action needed):
+      #A, #B, #C ...
+
+      ## How to clear this triage
+
+      For each `needs-spec` issue: add a `## Summary` section, define
+      scope, write testable acceptance criteria, then remove the label.
+
+      For each `needs-split` issue: open sub-issues, link them, then
+      close the original or convert it to an epic.
+
+      Re-run `kuro run validate-issues` to verify.
+      ```
+
+      Apply the `triage` label to the new issue. Output the URL.
+
+      ```
+      gh issue create --title "Backlog triage <YYYY-MM-DD>" --label triage --body "<report>"
+      ```
+    next:
+      - done: "triage issue published"
+
+  done:
+    final: "validation complete -- see triage issue for full report"
