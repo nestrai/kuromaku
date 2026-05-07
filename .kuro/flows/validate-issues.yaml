@@ -6,9 +6,37 @@ prompt: |
   that need more specification, then create a triage tracking issue
   with the full report.
 
-initial: scan
+  Labels used by this flow (created by the prepare state if missing):
+  - needs-spec: issue lacks Summary, scope, or testable acceptance criteria
+  - needs-split: issue is too large -- should become an epic with sub-issues
+  - triage: tracking issue with the full report (one per run)
+
+initial: prepare
 
 graph:
+  prepare:
+    role: developer
+    task: |
+      Ensure the labels this flow uses exist on the repository. Idempotent:
+      safe to run multiple times. Use `gh label list` first to check, then
+      `gh label create` only for missing ones.
+
+      Required labels (with descriptions):
+
+      - `needs-spec` (yellow #fbca04): Issue lacks Summary, scope, or testable acceptance criteria. Cannot be picked up by agents until clarified.
+      - `needs-split` (orange #d93f0b): Issue is too large for one implementation pass. Should be split into sub-issues or promoted to an epic.
+      - `triage` (blue #1d76db): Tracking issue produced by validate-issues flow. One per run, dated.
+
+      ```bash
+      gh label list --json name --jq '.[].name' > /tmp/existing.txt
+      # for each missing label:
+      gh label create needs-spec --color fbca04 --description "..."
+      ```
+
+      Output: list of labels confirmed/created.
+    next:
+      - scan: "labels ready"
+
   scan:
     role: reviewer
     task: |
