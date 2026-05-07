@@ -509,6 +509,27 @@ pub fn print_graph_final(state_id: &str) {
     );
 }
 
+/// Print the line announcing a graph paused at a `human: true` state.
+///
+/// Mirror of [`print_graph_final`] for the pause arm (issue #337).
+/// Stderr-only for the same reason: the pause marker is run-level
+/// metadata, not part of any structured stdout artifact a caller may
+/// pipe downstream. The yellow tone signals "neither failure nor
+/// completion" so a human watching the run sees that the flow is
+/// suspended rather than done.
+pub fn print_graph_paused(state_id: &str) {
+    let t = &DARK;
+    eprintln!();
+    eprintln!(
+        "      {} {} {}",
+        style::style("⏸").with(t.yellow).attribute(Attribute::Bold),
+        style::style("paused at human state").with(t.dim),
+        style::style(state_id)
+            .with(t.yellow)
+            .attribute(Attribute::Bold),
+    );
+}
+
 /// Print context injection line (handoff between steps).
 pub fn print_context_injection(from_step: &str, from_file: &str, tokens: &str) {
     let t = &DARK;
@@ -635,6 +656,79 @@ pub fn print_flow_complete(
     println!(
         "      {} {}",
         style::style("Artifacts written to").with(t.dim),
+        style::style(stack_path).with(t.fg),
+    );
+}
+
+/// Print the flow paused summary (issue #337).
+///
+/// Mirror of [`print_flow_complete`] for graph runs that suspended at a
+/// `human: true` state instead of reaching a terminal. The headline
+/// differs ("paused at state X" vs "flow complete"), the totals row is
+/// dropped (token usage on a paused run is partial by definition -- the
+/// run will continue when resumed and the totals only make sense at
+/// completion), and the artifact path footer is replaced with a hint
+/// pointing at the pause record. The per-step table is kept identical
+/// so an operator inspecting a paused run sees the same shape they see
+/// for a completed one.
+pub fn print_flow_paused(steps: &[StepResult], paused_at_state: &str, stack_path: &str) {
+    let t = &DARK;
+    println!();
+    println!(
+        "      {}{}",
+        style::style("⏸").with(t.yellow).attribute(Attribute::Bold),
+        style::style(" flow paused")
+            .with(t.yellow)
+            .attribute(Attribute::Bold),
+    );
+    println!(
+        "      {}",
+        style::style(format!(
+            "{} steps before pause at `{paused_at_state}`",
+            steps.len()
+        ))
+        .with(t.dim),
+    );
+    println!();
+
+    // Same column header as `print_flow_complete` so an operator viewing
+    // a paused run reads the table the same way they read a completed run.
+    println!(
+        "      {}",
+        style::style(
+            "Step             Agent         Backend       Duration      Tokens (in/out)     Output"
+        )
+        .with(t.dim),
+    );
+    println!(
+        "      {}",
+        style::style("─────────────────────────────────────────────────────────────────────────────────────────").with(t.muted),
+    );
+
+    #[allow(clippy::format_in_format_args)]
+    for s in steps {
+        let state_marker = match s.state {
+            StepState::Done => style::style("✓").with(t.green).to_string(),
+            StepState::Failed => style::style("✗").with(t.red).to_string(),
+            _ => style::style("○").with(t.muted).to_string(),
+        };
+        let tokens = format!("{} / {}", s.tokens_in, s.tokens_out);
+        println!(
+            "      {} {} {} {} {} {} {}",
+            state_marker,
+            style::style(format!("{:<16}", s.id)).with(t.fg),
+            style::style(format!("{:<14}", s.agent)).with(t.magenta),
+            style::style(format!("{:<14}", s.backend)).with(t.blue),
+            format!("{:<14}", s.duration),
+            format!("{:<20}", tokens),
+            style::style(&s.output).with(t.cyan),
+        );
+    }
+
+    println!();
+    println!(
+        "      {} {}",
+        style::style("Pause recorded under").with(t.dim),
         style::style(stack_path).with(t.fg),
     );
 }

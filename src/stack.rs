@@ -286,6 +286,32 @@ pub struct Manifest {
     /// from runs that aborted via the retry budget or max-steps cap.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_state: Option<String>,
+    /// Lifecycle outcome the runtime declared for this run. Absent on
+    /// linear flows and on graph flows that ran to a `kind: final` state
+    /// -- the manifest's existence already encodes "ran to completion".
+    /// Present (`"paused"`) only when the graph driver paused at a
+    /// `human: true` state (issue #337). Future variants (`"failed"`,
+    /// `"timeout"`) reuse this slot.
+    ///
+    /// Wire string is locked: `kuro resume` (#338) reads it back. Tests
+    /// pin the spelling so a rename here is a wire break.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    /// State ID where the graph paused. `None` for non-paused runs.
+    /// Together with `paused_at` and the persisted `steps:`, this is
+    /// what `kuro resume` (#338) needs to rebuild graph position.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at_state: Option<String>,
+    /// RFC3339 timestamp of the pause. Mirrors the discipline of
+    /// `started_at` / `finished_at` so audit tooling can sort.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_at: Option<String>,
+    /// SHA-256 of the referenced GitHub issue body at the moment of the
+    /// pause, hex-encoded. Recorded only when `vars["id"]` is set and
+    /// `gh issue view` returns a body. Read by `kuro resume` (#338) to
+    /// detect mid-pause issue edits; no consumer reads it today.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paused_issue_body_sha256: Option<String>,
 }
 
 /// Compute the SHA-256 of arbitrary bytes, returned as a lowercase hex string.
@@ -951,6 +977,10 @@ mod tests {
             }],
             steps: vec![record(1, "design", "md")],
             final_state: None,
+            status: None,
+            paused_at_state: None,
+            paused_at: None,
+            paused_issue_body_sha256: None,
         };
         write_manifest(&run_path, &manifest).unwrap();
 
@@ -968,6 +998,23 @@ mod tests {
             !yaml.contains("final_state"),
             "final_state must skip-serialise when None, got:\n{yaml}"
         );
+        // Lifecycle fields (issue #337) must also skip-serialise on a
+        // non-paused run so existing manifests stay byte-equivalent.
+        assert!(parsed.status.is_none());
+        assert!(parsed.paused_at_state.is_none());
+        assert!(parsed.paused_at.is_none());
+        assert!(parsed.paused_issue_body_sha256.is_none());
+        for key in [
+            "status:",
+            "paused_at_state:",
+            "paused_at:",
+            "paused_issue_body_sha256:",
+        ] {
+            assert!(
+                !yaml.contains(key),
+                "{key} must skip-serialise when None, got:\n{yaml}"
+            );
+        }
     }
 
     #[test]
@@ -997,6 +1044,10 @@ mod tests {
             roles: vec![],
             steps: vec![],
             final_state: Some("done".to_string()),
+            status: None,
+            paused_at_state: None,
+            paused_at: None,
+            paused_issue_body_sha256: None,
         };
         write_manifest(&run_path, &manifest).unwrap();
 
@@ -1007,6 +1058,79 @@ mod tests {
         );
         let parsed: Manifest = serde_yaml::from_str(&yaml).unwrap();
         assert_eq!(parsed.final_state.as_deref(), Some("done"));
+    }
+
+    #[test]
+    fn manifest_roundtrips_pause_fields_for_human_handoff() {
+        // Issue #337: a graph run that paused at a `human: true` state
+        // records `status: paused`, the state ID, the timestamp, and an
+        // optional issue-body hash. All four roundtrip through YAML so
+        // `kuro resume` (#338) can pick the run back up. The wire string
+        // `paused` is locked here -- a rename is a wire break and must
+        // show up in this test before shipping.
+        let dir = tempfile::tempdir().unwrap();
+        let run_path = dir.path().join("run");
+        let manifest = Manifest {
+            version: 1,
+            run_id: "graph-20260507-090000".to_string(),
+            flow_name: "implement-issue".to_string(),
+            flow_path: ".kuro/flows/implement-issue.yaml".to_string(),
+            flow_sha256: sha256_hex(b"contents"),
+            started_at: "2026-05-07T09:00:00Z".to_string(),
+            finished_at: "2026-05-07T09:00:01Z".to_string(),
+            duration_ms: 1000,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+            cost: None,
+            vars: indexmap::IndexMap::new(),
+            seeds: vec![],
+            resources: vec![],
+            roles: vec![],
+            steps: vec![],
+            // A paused run never reaches a `kind: final` state, so
+            // `final_state` stays absent. Mutual-exclusion is enforced
+            // by the runtime; the manifest can still hold both fields
+            // without a serde-level guard, but downstream readers
+            // should treat the pair as exclusive.
+            final_state: None,
+            status: Some("paused".to_string()),
+            paused_at_state: Some("ask_user".to_string()),
+            paused_at: Some("2026-05-07T09:00:01Z".to_string()),
+            paused_issue_body_sha256: Some(
+                "2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae".to_string(),
+            ),
+        };
+        write_manifest(&run_path, &manifest).unwrap();
+
+        let yaml = std::fs::read_to_string(run_path.join("manifest.yaml")).unwrap();
+        // Wire string locked: `kuro resume` (#338) reads this back.
+        assert!(
+            yaml.contains("status: paused"),
+            "status must serialise as the literal string 'paused', got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("paused_at_state: ask_user"),
+            "paused_at_state must serialise, got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("paused_at: '2026-05-07T09:00:01Z'")
+                || yaml.contains("paused_at: \"2026-05-07T09:00:01Z\"")
+                || yaml.contains("paused_at: 2026-05-07T09:00:01Z"),
+            "paused_at must serialise, got:\n{yaml}"
+        );
+        assert!(
+            yaml.contains("paused_issue_body_sha256:"),
+            "paused_issue_body_sha256 must serialise, got:\n{yaml}"
+        );
+
+        let parsed: Manifest = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.status.as_deref(), Some("paused"));
+        assert_eq!(parsed.paused_at_state.as_deref(), Some("ask_user"));
+        assert_eq!(parsed.paused_at.as_deref(), Some("2026-05-07T09:00:01Z"));
+        assert_eq!(
+            parsed.paused_issue_body_sha256.as_deref(),
+            Some("2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae"),
+        );
     }
 
     // --- read_run ---

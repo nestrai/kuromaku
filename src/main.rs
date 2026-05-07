@@ -1155,6 +1155,7 @@ mod tests {
             &results,
             std::time::Duration::from_secs(2),
             None,
+            None,
         );
 
         // Run identification matches the context.

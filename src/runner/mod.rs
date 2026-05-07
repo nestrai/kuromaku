@@ -2285,6 +2285,26 @@ mod flow_api {
         }
     }
 
+    /// Pause metadata threaded from the graph driver into [`build_manifest`]
+    /// (issue #337).
+    ///
+    /// Constructed only on the [`super::graph::GraphRunOutcome::Paused`] arm
+    /// of `execute_graph_flow_setup`; absent for linear runs and for graph
+    /// runs that reached a `kind: final` state. Field semantics mirror the
+    /// manifest fields they populate so the wiring stays one-to-one.
+    pub(crate) struct PauseRecord {
+        pub paused_at_state: String,
+        /// RFC3339 string -- the manifest stores a string for symmetry with
+        /// `started_at` / `finished_at`, so the conversion happens here
+        /// once at the boundary.
+        pub paused_at: String,
+        /// SHA-256 hex of the referenced GitHub issue body. Best-effort:
+        /// `None` when no `id` var is set, when `gh` is unavailable, or
+        /// when the issue lookup fails. The pause itself does not depend
+        /// on it.
+        pub issue_body_sha256: Option<String>,
+    }
+
     /// Build the run manifest. Pure -- no I/O happens here; the caller is
     /// expected to write the result to `<run_path>/manifest.yaml`.
     ///
@@ -2312,6 +2332,7 @@ mod flow_api {
         results: &[StepRunResult],
         total_elapsed: Duration,
         final_state: Option<&str>,
+        pause: Option<PauseRecord>,
     ) -> Manifest {
         let finished_at = chrono::Utc::now();
 
@@ -2416,6 +2437,21 @@ mod flow_api {
         let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
         let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
 
+        // Lifecycle fields: a paused run records the pause shape on the
+        // manifest so `kuro resume` (#338) can read it back. A non-paused
+        // run leaves all four absent so existing manifests keep their
+        // bytes -- the `skip_serializing_if` on each field locks the
+        // back-compat contract on disk; tests pin the wire string.
+        let (status, paused_at_state, paused_at, paused_issue_body_sha256) = match pause {
+            Some(p) => (
+                Some("paused".to_string()),
+                Some(p.paused_at_state),
+                Some(p.paused_at),
+                p.issue_body_sha256,
+            ),
+            None => (None, None, None, None),
+        };
+
         Manifest {
             version: 1,
             run_id: ctx.run_id.clone(),
@@ -2434,6 +2470,10 @@ mod flow_api {
             roles: role_records,
             steps: results.iter().map(|r| r.record.clone()).collect(),
             final_state: final_state.map(str::to_string),
+            status,
+            paused_at_state,
+            paused_at,
+            paused_issue_body_sha256,
         }
     }
 
@@ -2863,6 +2903,10 @@ mod flow_api {
             // field stays absent so audit consumers can distinguish linear
             // and graph runs structurally.
             None,
+            // Linear flows have no `human: true` states; pause is graph-
+            // only (issue #337). The field stays absent on disk so old
+            // manifests are byte-equivalent to new ones.
+            None,
         );
         stack::write_manifest(&ctx.run_path, &manifest)
             .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
@@ -3135,18 +3179,52 @@ mod flow_api {
             let outcome =
                 super::graph::run_graph_flow(&graph, &agents_by_id, &state_to_agent, &ctx).await?;
             let total_elapsed = flow_start.elapsed();
-            let super::graph::GraphRunOutcome {
-                steps: results,
-                final_state,
-            } = outcome;
+            // Lifecycle outcome decomposition. The graph driver returns
+            // either a `Final` (run reached a `kind: final` state) or a
+            // `Paused` (run reached a `human: true` state, issue #337).
+            // We carry both shapes through the same downstream wiring
+            // -- manifest, summary table, FlowResult -- but populate the
+            // pause-shaped fields only on the `Paused` arm.
+            let (results, final_state, pause) = match outcome {
+                super::graph::GraphRunOutcome::Final { steps, final_state } => {
+                    (steps, Some(final_state), None)
+                }
+                super::graph::GraphRunOutcome::Paused {
+                    steps,
+                    paused_at_state,
+                    paused_at,
+                } => {
+                    // Best-effort issue-body snapshot. Hashed at pause time
+                    // so `kuro resume` (#338) can detect mid-pause edits to
+                    // the referenced issue. Skipped silently when no `id`
+                    // var is set, when `gh` is unavailable, or when the
+                    // lookup fails: the pause itself is the contract,
+                    // drift detection is a future-facing convenience.
+                    let issue_body_sha256 = effective_vars
+                        .get("id")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .and_then(crate::notify::github::fetch_issue_body)
+                        .map(|body| stack::sha256_hex(body.as_bytes()));
+                    let pause = PauseRecord {
+                        paused_at_state,
+                        paused_at: paused_at.to_rfc3339(),
+                        issue_body_sha256,
+                    };
+                    (steps, None, Some(pause))
+                }
+            };
 
             // Manifest: reuse the linear builder so `kuro show-output`
             // and `read_run` see the same shape regardless of flow
             // type. Resolved roles are empty for graph flows in this
             // prototype -- a richer audit lands with the role/state
-            // resolution pass. `final_state` is populated for graph
-            // runs so audit consumers can tell terminal states (`done`
-            // vs `aborted`) apart without parsing stderr (issue #257).
+            // resolution pass. `final_state` is populated for runs that
+            // reached a terminal state (#257); `pause` is populated for
+            // runs that suspended at a human handoff (#337). The two
+            // are mutually exclusive at the source -- the driver
+            // returns one outcome variant -- so the manifest cannot
+            // record both.
+            let pause_state_marker = pause.as_ref().map(|p| p.paused_at_state.clone());
             let manifest = build_manifest(
                 &ctx,
                 &flow_name,
@@ -3160,28 +3238,40 @@ mod flow_api {
                 &effective_vars,
                 &results,
                 total_elapsed,
-                Some(final_state.as_str()),
+                final_state.as_deref(),
+                pause,
             );
             stack::write_manifest(&ctx.run_path, &manifest)
                 .map_err(|e| eyre!("failed to write manifest.yaml: {e}"))?;
 
-            // Reuse the linear summary table so a graph run ends with the
-            // same per-step recap a linear run does (#266). Token totals
-            // are 0 today because the graph driver does not collect usage
-            // metadata yet -- mirrors the linear path's "—" treatment when
-            // a backend declines to report tokens. #269 will design a
-            // graph-native summary that also visualises the path taken.
+            // Summary: paused runs use a distinct headline so an operator
+            // tailing the run sees that it suspended rather than completed.
+            // The per-step table itself is identical -- a paused run still
+            // walked some agent states and the operator wants the same
+            // shape recap. Token totals are dropped on pause because they
+            // are partial by definition (the run continues on resume).
             let summary = super::build_summary(&results);
-            let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
-            let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
-            ui::print_flow_complete(
-                &summary,
-                &format_elapsed(total_elapsed),
-                &total_in.to_string(),
-                &total_out.to_string(),
-                "—",
-                &ctx.stack_path.display().to_string(),
-            );
+            match &pause_state_marker {
+                Some(state_id) => {
+                    ui::print_flow_paused(
+                        &summary,
+                        state_id,
+                        &ctx.stack_path.display().to_string(),
+                    );
+                }
+                None => {
+                    let total_in: u32 = results.iter().filter_map(|r| r.tokens_in).sum();
+                    let total_out: u32 = results.iter().filter_map(|r| r.tokens_out).sum();
+                    ui::print_flow_complete(
+                        &summary,
+                        &format_elapsed(total_elapsed),
+                        &total_in.to_string(),
+                        &total_out.to_string(),
+                        "—",
+                        &ctx.stack_path.display().to_string(),
+                    );
+                }
+            }
 
             Ok(FlowResult {
                 run_id: ctx.run_id.clone(),
@@ -3922,6 +4012,7 @@ look around
             &results,
             total_elapsed,
             Some("done"),
+            None,
         );
         let mut md_manifest = build_manifest(
             &ctx,
@@ -3937,6 +4028,7 @@ look around
             &results,
             total_elapsed,
             Some("done"),
+            None,
         );
 
         // Source-keyed values diverge by construction: the path lives in

@@ -228,6 +228,45 @@ pub fn fetch_issue_summary(id: u64) -> Option<IssueSummary> {
     })
 }
 
+/// Fetch the full body of a GitHub issue via `gh issue view <id> --json body`.
+///
+/// Returns `None` on any failure -- `gh` not on PATH, non-zero exit (no
+/// repo context, network issue, unknown issue), JSON parse error, or
+/// missing body field. Distinct from [`fetch_issue_summary`] in that it
+/// returns the full body untouched: the body-hash snapshot recorded into
+/// a paused run's manifest (issue #337) needs to hash the exact bytes
+/// `kuro resume` (#338) will compare against, not a 3-line preview.
+///
+/// Stays best-effort: a paused run with no `vars["id"]`, no `gh`
+/// installed, or a network blip simply skips the body-hash field rather
+/// than failing the pause -- the manifest's `status: paused` and
+/// `paused_at_state` are the contract; the hash is a future drift-
+/// detection convenience.
+pub fn fetch_issue_body(id: u64) -> Option<String> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("gh")
+        .arg("issue")
+        .arg("view")
+        .arg(id.to_string())
+        .arg("--json")
+        .arg("body")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+    json.get("body")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
 /// Take the first `max_lines` non-empty lines and join them with `\n`.
 ///
 /// Issue bodies tend to start with a blank line or a heading; skipping empty
