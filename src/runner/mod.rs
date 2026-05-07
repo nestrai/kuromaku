@@ -3359,6 +3359,22 @@ mod flow_api {
     /// * timeout enforcement (#343)
     /// * automatic resume triggers (#341 `kuro watch`)
     pub async fn resume_run(run_id: &str) -> Result<RunHandle> {
+        // Production fetcher: shells out to `gh issue view --json comments`.
+        // The `_with` variant is the test seam (issue #340).
+        resume_run_with(run_id, crate::notify::github::gh_comments_fetcher()).await
+    }
+
+    /// Test-seam variant of [`resume_run`] (issue #340).
+    ///
+    /// Same contract as `resume_run` but lets the caller swap the
+    /// GH-comments fetcher. Production wires `gh_comments_fetcher()`;
+    /// integration tests inject a closure that returns canned
+    /// `IssueComment`s (or a simulated network failure) so the
+    /// human-input synthesis path is testable without spawning `gh`.
+    pub async fn resume_run_with(
+        run_id: &str,
+        fetcher: crate::notify::github::CommentsFetcher,
+    ) -> Result<RunHandle> {
         let flow_start = Instant::now();
 
         // ---- 1. Resolve project + run path -----------------------------
@@ -3405,6 +3421,16 @@ mod flow_api {
         let paused_at_state = manifest.paused_at_state.clone().ok_or_else(|| {
             eyre!(
                 "run '{run_id}' is paused but has no `paused_at_state` recorded -- the manifest is incomplete"
+            )
+        })?;
+        // `paused_at` is the cutoff for the human-input fetch (#340).
+        // A paused manifest without it is incomplete: the timestamp
+        // filter has nothing to compare against, and degrading silently
+        // would let stale comments leak in as "human input". Fail loud
+        // so the operator surfaces the missing field instead.
+        let paused_at = manifest.paused_at.clone().ok_or_else(|| {
+            eyre!(
+                "run '{run_id}' is paused but has no `paused_at` recorded -- the manifest is incomplete"
             )
         })?;
 
@@ -3462,6 +3488,7 @@ mod flow_api {
             run_path,
             started_at,
             paused_at_state,
+            paused_at,
             prior_steps: manifest.steps.clone(),
             vars: manifest
                 .vars
@@ -3478,8 +3505,73 @@ mod flow_api {
             contents,
             flow_start,
             resume_ctx,
+            fetcher,
         )
         .await
+    }
+
+    /// Build the synthetic `kind: human` step record + body for a resumed
+    /// run (issue #340).
+    ///
+    /// Returns `Some((record, body))` only when there is human input to
+    /// inject:
+    /// * `vars["id"]` resolves to a `u64` issue number, AND
+    /// * `fetch_new_comments_since` returns at least one comment.
+    ///
+    /// All other paths -- missing/non-numeric `id`, fetcher error, no new
+    /// comments -- collapse to `None` so the caller skips writing a
+    /// synthetic step. This keeps the "empty prior_context is not an
+    /// error" acceptance criterion local to one place rather than
+    /// scattering soft-fail logic across the resume setup.
+    ///
+    /// The returned record's `output_file` is `step_content_filename(step_num,
+    /// paused_at_state, "md")` so the `prior_context` reader (which infers
+    /// the extension from the meta yaml) finds the body on disk. `step_id`
+    /// is the paused state ID, so the driver's `skip_pause_once` arm can
+    /// reuse the same name as the `human_input_step_id` it threads back
+    /// into `prior_state`.
+    pub(crate) fn synthesize_human_step(
+        step_num: usize,
+        paused_at_state: &str,
+        paused_at: &str,
+        vars: &HashMap<String, String>,
+        fetcher: &crate::notify::github::CommentsFetcher,
+    ) -> Option<(stack::StepRecord, String)> {
+        let id = vars.get("id").and_then(|s| s.parse::<u64>().ok())?;
+        let comments = crate::notify::github::fetch_new_comments_since(id, paused_at, fetcher);
+        if comments.is_empty() {
+            return None;
+        }
+        let body = crate::notify::github::format_human_input(&comments, paused_at);
+        let output_file = stack::step_content_filename(step_num, paused_at_state, "md");
+        let record = stack::StepRecord {
+            step_id: paused_at_state.to_string(),
+            kind: "human".to_string(),
+            agent: None,
+            model_requested: None,
+            model_actual: None,
+            // `backend: "human"` keeps the audit shape self-describing
+            // (consumers grep `kind == "human"` AND `backend == "human"`
+            // when partitioning step types). No agent ran, so leaving
+            // it empty would lie about the row.
+            backend: "human".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 0,
+            // Mirror the pause moment so audit consumers can correlate
+            // the synthetic record with the manifest's `paused_at`
+            // without re-deriving it from the run timeline.
+            started_at: paused_at.to_string(),
+            exit_code: 0,
+            input_steps: Vec::new(),
+            output_file,
+            participants: Vec::new(),
+            turns: None,
+            messages: None,
+            terminated_by: None,
+            graph_decision: None,
+        };
+        Some((record, body))
     }
 
     /// Carries the manifest-derived inputs the resume setup needs but the
@@ -3491,6 +3583,11 @@ mod flow_api {
         pub run_path: PathBuf,
         pub started_at: chrono::DateTime<chrono::Utc>,
         pub paused_at_state: String,
+        /// RFC3339 timestamp of the original pause, transcribed verbatim
+        /// from the manifest. Used as the `>=` cutoff for the human-input
+        /// fetch (#340) so only comments added at or after the pause
+        /// land in the synthetic `kind: human` step record.
+        pub paused_at: String,
         /// Pre-pause step records, hydrated verbatim into the resumed
         /// run's manifest so the `steps:` history spans the full lifecycle
         /// rather than only the post-resume tail.
@@ -3522,6 +3619,7 @@ mod flow_api {
     /// where the divergent ResumeContext shape forces it. The two functions
     /// stay readable independently rather than threading a `ResumeMode`
     /// enum through every line; #338's design notes flag the trade-off.
+    #[allow(clippy::too_many_arguments)]
     async fn execute_graph_flow_resume_setup(
         graph: config::GraphFlow,
         koto_config: Option<&crate::koto_config::KotoConfig>,
@@ -3529,7 +3627,8 @@ mod flow_api {
         flow_path: PathBuf,
         flow_contents: String,
         flow_start: Instant,
-        resume: ResumeContext,
+        mut resume: ResumeContext,
+        fetcher: crate::notify::github::CommentsFetcher,
     ) -> Result<RunHandle> {
         use crate::config::{Defaults, load_agent_file_with_seeds};
         use std::sync::Arc;
@@ -3661,6 +3760,41 @@ mod flow_api {
             effective_vars.clone(),
         );
 
+        // ---- Synthesise human-input step (issue #340) ------------------
+        // If the human typed something into the issue between pause and
+        // resume, fold those comments into a synthetic `kind: human` step
+        // record on disk. The driver's `skip_pause_once` arm will route
+        // `prior_state` to this step on the first iteration so the next
+        // agent reads the human input through the same `prior_context`
+        // path every other state uses.
+        //
+        // Soft-fail throughout: missing `id` var, no new comments, or a
+        // fetch error all collapse to "no synthetic step written, no
+        // prior_context for the next agent" -- which honours the
+        // acceptance criterion that empty input is not an error. Network
+        // errors land on stderr as `[warn]` lines via
+        // `fetch_new_comments_since` rather than aborting the resume.
+        let human_input_step_id: Option<String> = match synthesize_human_step(
+            resume.prior_steps.len() + 1,
+            &resume.paused_at_state,
+            &resume.paused_at,
+            &effective_vars,
+            &fetcher,
+        ) {
+            Some((record, body)) => {
+                let step_num = resume.prior_steps.len() + 1;
+                stack::write_run_step(&resume.run_path, step_num, &record, &body)
+                    .map_err(|e| eyre!("failed to persist human-input step: {e}"))?;
+                // Keep the manifest's `steps:` history contiguous: the
+                // synthetic step appears between pre-pause and
+                // post-resume records, exactly as it lives on disk.
+                let step_id = record.step_id.clone();
+                resume.prior_steps.push(record);
+                Some(step_id)
+            }
+            None => None,
+        };
+
         // Resume banner so the operator sees we adopted an existing run
         // rather than starting a new one. Mirrors `print_command` shape
         // used by the fresh-run path.
@@ -3695,6 +3829,7 @@ mod flow_api {
             let resume_from = super::graph::ResumeFrom {
                 state: paused_state_for_resume,
                 step_num_offset: prior_steps_count,
+                human_input_step_id,
             };
             let outcome = super::graph::run_graph_flow(
                 &graph,
@@ -3830,6 +3965,154 @@ mod flow_api {
             state,
             join,
         })
+    }
+
+    #[cfg(test)]
+    mod synth_tests {
+        //! Unit tests for `synthesize_human_step` (issue #340).
+        //!
+        //! Cover the four soft-fail paths called out in the design plan:
+        //! missing `id`, fetch error, no new comments, and the happy path
+        //! (record + body shape). Lives inside `flow_api` so it can call
+        //! the private helper directly without widening visibility.
+        use super::synthesize_human_step;
+        use crate::notify::github::{CommentsFetcher, IssueComment};
+        use std::collections::HashMap;
+
+        fn comment(author: &str, created_at: &str, body: &str) -> IssueComment {
+            IssueComment {
+                author: author.to_string(),
+                created_at: created_at.to_string(),
+                body: body.to_string(),
+            }
+        }
+
+        fn fetcher_returning(comments: Vec<IssueComment>) -> CommentsFetcher {
+            Box::new(move |_id: u64| Ok(comments.clone()))
+        }
+
+        fn vars_with_id(id: &str) -> HashMap<String, String> {
+            let mut v = HashMap::new();
+            v.insert("id".to_string(), id.to_string());
+            v
+        }
+
+        #[test]
+        fn returns_none_when_no_id_var() {
+            // Acceptance (#340): "no id template var" must collapse to
+            // None so the resume continues without a synthetic step.
+            let fetcher: CommentsFetcher = Box::new(|_| {
+                panic!("fetcher must not be called when there is no id");
+            });
+            let out =
+                synthesize_human_step(2, "ask", "2026-05-07T10:00:00Z", &HashMap::new(), &fetcher);
+            assert!(out.is_none());
+        }
+
+        #[test]
+        fn returns_none_when_id_is_not_numeric() {
+            // `--var id=PR-123` is invalid as an issue number; degrade
+            // rather than crash.
+            let fetcher: CommentsFetcher = Box::new(|_| {
+                panic!("fetcher must not be called for non-numeric id");
+            });
+            let out = synthesize_human_step(
+                2,
+                "ask",
+                "2026-05-07T10:00:00Z",
+                &vars_with_id("PR-123"),
+                &fetcher,
+            );
+            assert!(out.is_none());
+        }
+
+        #[test]
+        fn returns_none_when_no_new_comments() {
+            // Acceptance (#340): "If no new comments exist, prior_context
+            // is empty (not an error)." The helper must return None so
+            // no synthetic step lands on disk and the next agent runs
+            // without prior_context.
+            let fetcher =
+                fetcher_returning(vec![comment("alice", "2026-05-06T09:00:00Z", "stale")]);
+            let out = synthesize_human_step(
+                2,
+                "ask",
+                "2026-05-07T10:00:00Z",
+                &vars_with_id("139"),
+                &fetcher,
+            );
+            assert!(out.is_none());
+        }
+
+        #[test]
+        fn returns_none_when_fetcher_errors() {
+            // Acceptance (#340): "Network errors fall back to empty
+            // prior_context with a warning." The fetch error degrades
+            // through `fetch_new_comments_since` to an empty Vec, which
+            // here surfaces as None.
+            let fetcher: CommentsFetcher = Box::new(|_| Err("simulated outage".to_string()));
+            let out = synthesize_human_step(
+                2,
+                "ask",
+                "2026-05-07T10:00:00Z",
+                &vars_with_id("139"),
+                &fetcher,
+            );
+            assert!(out.is_none());
+        }
+
+        #[test]
+        fn returns_record_with_human_kind_and_body_for_one_comment() {
+            // Happy path: one comment after the pause produces a record
+            // with `kind: "human"`, `agent: None`, `step_id` set to the
+            // paused state, and an output_file matching the on-disk
+            // naming convention. The body is the formatted human-input
+            // block, which the next agent reads via `prior_context`.
+            let fetcher = fetcher_returning(vec![comment(
+                "alice",
+                "2026-05-07T10:30:00Z",
+                "looks good, ship it",
+            )]);
+            let out = synthesize_human_step(
+                3,
+                "ask",
+                "2026-05-07T10:00:00Z",
+                &vars_with_id("139"),
+                &fetcher,
+            )
+            .expect("happy path returns Some");
+            let (record, body) = out;
+            assert_eq!(record.kind, "human");
+            assert_eq!(record.step_id, "ask");
+            assert_eq!(record.backend, "human");
+            assert!(record.agent.is_none());
+            assert_eq!(record.output_file, "03-ask.md");
+            assert_eq!(record.exit_code, 0);
+            assert_eq!(record.duration_ms, 0);
+            assert_eq!(record.started_at, "2026-05-07T10:00:00Z");
+            assert!(body.contains("Human input received since pause"));
+            assert!(body.contains("looks good, ship it"));
+            assert!(body.contains("@alice"));
+        }
+
+        #[test]
+        fn record_output_file_uses_provided_step_num() {
+            // The on-disk filename embeds `step_num` so the synthetic
+            // record sorts correctly between pre-pause and post-resume
+            // step files. `read_run_step_content` keys off the step_id,
+            // not the step_num, but downstream tools (`kuro show-output`,
+            // listing helpers) walk the directory in name order.
+            let fetcher = fetcher_returning(vec![comment("alice", "2026-05-07T10:30:00Z", "ok")]);
+            let out = synthesize_human_step(
+                12,
+                "human-handoff",
+                "2026-05-07T10:00:00Z",
+                &vars_with_id("139"),
+                &fetcher,
+            )
+            .expect("happy path returns Some");
+            assert_eq!(out.0.output_file, "12-human-handoff.md");
+        }
     }
 
     /// Test-only constructors for the in-tree MCP session module. We do not

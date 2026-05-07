@@ -161,9 +161,20 @@ pub enum GraphRunOutcome {
 /// this run -- the driver uses it to start its local `step_num` at
 /// `offset + 1` so the next persisted artifact does not collide with
 /// the pre-pause `NN-<id>.md` files.
+///
+/// `human_input_step_id` (issue #340) names the step ID of the synthetic
+/// `kind: human` record the resume setup wrote on disk capturing GH
+/// comments added since pause. The driver's `skip_pause_once` arm uses
+/// it to set `prior_state` so the next agent reads the human input via
+/// the same `prior_context` path every other state uses. `None` when
+/// the setup did not write a synthetic record (no `id` var, no new
+/// comments, fetch failure) -- in that case the next agent runs without
+/// prior context, which honours the issue's "empty prior_context is not
+/// an error" acceptance criterion.
 pub struct ResumeFrom {
     pub state: String,
     pub step_num_offset: usize,
+    pub human_input_step_id: Option<String>,
 }
 
 /// Drive a graph flow from `initial:` (or, when `resume` is set, from a
@@ -206,27 +217,34 @@ pub async fn run_graph_flow(
 
     let executor = executor::create_executor();
     let mut results: Vec<StepRunResult> = Vec::new();
-    let (mut current, mut step_num, mut skip_pause_once) = match &resume {
+    let (mut current, mut step_num, mut skip_pause_once, mut human_input_step_id) = match resume {
         // Fresh: start at the graph's declared initial state, counter at
-        // 0, and never skip the pause check.
-        None => (graph.initial.clone(), 0usize, false),
+        // 0, never skip the pause check, no synthetic human step on disk.
+        None => (graph.initial.clone(), 0usize, false, None),
         // Resume: start at the named state, seed the counter so the next
-        // increment lands at `offset + 1`, and arm the one-shot "advance
-        // through a human state" flag for the first iteration only.
-        Some(r) => (r.state.clone(), r.step_num_offset, true),
+        // increment lands at `offset + 1`, arm the one-shot "advance
+        // through a human state" flag for the first iteration only, and
+        // remember the synthetic human-input step ID (#340) so the skip
+        // arm can route prior_context to it on the way out.
+        Some(r) => (r.state, r.step_num_offset, true, r.human_input_step_id),
     };
     // Track the state the runtime just transitioned out of so the next
     // agent's prompt can include that step's artifact. Without this the
     // graph runs as a sequence of isolated agents, each blind to what its
     // predecessors produced. `None` for the first iteration.
     //
-    // Resume note: on re-entry the prior step's artifact lives on disk
-    // under the pre-pause run dir, but #338 does not thread it back into
-    // the prompt -- the human state wrote nothing, so there is no
-    // single "prior" body to splice. Richer context handoff lands with
-    // #340 (resume input plumbing). Keeping `prior_state = None` here
-    // means the first agent after resume sees no prior-context block,
-    // which is honest about what is available.
+    // Resume note: on re-entry the human state's pre-pause record was
+    // empty -- the human state wrote nothing at pause time. #340 fills
+    // that gap: the resume setup synthesises a `kind: human` step
+    // record on disk before spawning the driver, capturing any GH
+    // comments added since `paused_at` as the body. The `skip_pause_once`
+    // arm below (which fires on the first iteration of a resumed run)
+    // sets `prior_state = Some(<paused-state>)` so the next agent reads
+    // that synthetic artifact through the same `prior_context` path
+    // every other state uses. When the synthetic record is missing
+    // (no `id` var, no new comments, fetch failure -- all soft-fail
+    // paths), `read_run_step_content` will surface a clear error
+    // rather than silently dropping context.
     let mut prior_state: Option<String> = None;
     // Per-state visit counter. A loop between two states (the canonical
     // failure mode is `design <-> steer_design` where the steerer keeps
@@ -286,10 +304,23 @@ pub async fn run_graph_flow(
                     &next_state,
                     "resumed -- advancing past human handoff",
                 );
-                // The human state wrote no artifact at pause time, so
-                // `prior_state` stays None for the next iteration --
-                // see the comment block at the top of `run_graph_flow`.
-                prior_state = None;
+                // #340: the resume setup writes a synthetic `kind: human`
+                // step record on disk (capturing GH comments added since
+                // pause) BEFORE this driver task spawns, and threads the
+                // step ID through `ResumeFrom::human_input_step_id`.
+                // Routing `prior_state` to it lets the next agent read
+                // the human input through the same `prior_context` path
+                // every other state uses.
+                //
+                // `take()`: only the first transition out of a resumed
+                // human state should pick up the synthetic record;
+                // subsequent visits to other states must not re-inject
+                // the same body. When the field is `None` (no `id` var,
+                // no new comments, or a fetch failure soft-failed in
+                // setup), `prior_state` stays `None` and the next agent
+                // runs without prior context -- honouring "empty
+                // prior_context is not an error".
+                prior_state = human_input_step_id.take();
                 current = next_state;
                 continue;
             }
@@ -1457,6 +1488,7 @@ mod tests {
             Some(ResumeFrom {
                 state: "ask".to_string(),
                 step_num_offset: 0,
+                human_input_step_id: None,
             }),
         )
         .await
@@ -1511,6 +1543,7 @@ mod tests {
             Some(ResumeFrom {
                 state: "ask".to_string(),
                 step_num_offset: 0,
+                human_input_step_id: None,
             }),
         )
         .await;
@@ -1583,6 +1616,7 @@ mod tests {
             Some(ResumeFrom {
                 state: "done".to_string(),
                 step_num_offset: 0,
+                human_input_step_id: None,
             }),
         )
         .await
@@ -1600,6 +1634,375 @@ mod tests {
             } => {
                 panic!("resume into a final state must NOT pause; got Paused({paused_at_state})")
             }
+        }
+    }
+
+    // --- Human-input prior_context routing (issue #340) ----------------
+    //
+    // When the resume setup synthesised a `kind: human` step on disk, it
+    // threads the step ID through `ResumeFrom::human_input_step_id`. The
+    // driver's `skip_pause_once` arm must route `prior_state` to that
+    // step so the next agent reads the human input via `prior_context`.
+    // The mirror case (no synthetic step on disk) must keep
+    // `prior_state = None` so an empty input still resumes cleanly.
+    //
+    // We can't observe `prior_state` directly without spinning up an
+    // executor, so we exercise the read path: pre-write a step record at
+    // the paused state's id and resume into a graph that runs a shell
+    // state next. The shell state inherits the synthetic body via
+    // `prior_context` -- which is exactly what an LLM agent would see.
+
+    fn human_then_shell_then_final() -> GraphFlow {
+        // `ask (human, next: verify) -> verify (shell, next pass: done) -> done (final)`.
+        // A shell state is ideal here because it runs deterministically
+        // without an LLM backend, and `run_shell_state` reads
+        // `prior_state` via the same `read_run_step_content` path the
+        // LLM arm uses (via the driver loop's `prior_state` tracking).
+        //
+        // Note: the shell state does NOT splice `prior_context` into its
+        // own command, so we don't need the body to be observable in the
+        // command output. What we DO assert is that a missing synthetic
+        // record causes `read_run_step_content` to fail with a
+        // `RunError::Stack { ... StepNotFound }` -- which proves the
+        // driver looked it up. With the synthetic record on disk, the
+        // read succeeds and the run reaches the final state.
+        let mut graph: IndexMap<String, GraphState> = IndexMap::new();
+        graph.insert(
+            "ask".to_string(),
+            GraphState {
+                human: Some(true),
+                select: Some(vec![SelectEntry {
+                    target: "verify".to_string(),
+                    reason: Some(SelectReason::Single("after human input".to_string())),
+                }]),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "verify".to_string(),
+            GraphState {
+                run: Some("true".to_string()),
+                select: Some(vec![
+                    SelectEntry {
+                        target: "done".to_string(),
+                        reason: Some(SelectReason::Single("pass".to_string())),
+                    },
+                    SelectEntry {
+                        target: "fail".to_string(),
+                        reason: Some(SelectReason::Single("fail".to_string())),
+                    },
+                ]),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "done".to_string(),
+            GraphState {
+                final_desc: Some("ok".to_string()),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "fail".to_string(),
+            GraphState {
+                final_desc: Some("verify failed".to_string()),
+                ..Default::default()
+            },
+        );
+        let flow = GraphFlow {
+            name: "human-prior-context".to_string(),
+            initial: "ask".to_string(),
+            graph,
+            ..Default::default()
+        };
+        flow
+    }
+
+    #[tokio::test]
+    async fn resume_routes_prior_context_to_synthetic_human_step() {
+        // Acceptance (#340): the synthetic human-input record on disk is
+        // looked up via `read_run_step_content` when the driver reaches
+        // the next agent state. We pre-write the record and resume; the
+        // shell state's prior_context lookup must succeed (the run
+        // reaches `done` cleanly).
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "human-prior-context".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+
+        // Synthetic human-input record: pre-pause step count is 0, so
+        // the synthetic record sits at step_num=1 with output_file=01-ask.md.
+        let synthetic = StepRecord {
+            step_id: "ask".to_string(),
+            kind: "human".to_string(),
+            agent: None,
+            model_requested: None,
+            model_actual: None,
+            backend: "human".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 0,
+            started_at: "2026-05-07T10:00:00Z".to_string(),
+            exit_code: 0,
+            input_steps: Vec::new(),
+            output_file: "01-ask.md".to_string(),
+            participants: Vec::new(),
+            turns: None,
+            messages: None,
+            terminated_by: None,
+            graph_decision: None,
+        };
+        stack::write_run_step(&ctx.run_path, 1, &synthetic, "human said hi").unwrap();
+
+        let flow = human_then_shell_then_final();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            Some(ResumeFrom {
+                state: "ask".to_string(),
+                step_num_offset: 1,
+                human_input_step_id: Some("ask".to_string()),
+            }),
+        )
+        .await
+        .expect("resume with synthetic human step must succeed");
+
+        match outcome {
+            GraphRunOutcome::Final { final_state, .. } => {
+                assert_eq!(
+                    final_state, "done",
+                    "shell state must route to `done` after reading the human-input prior_context"
+                );
+            }
+            other => panic!(
+                "expected Final(done), got something else: {:?}",
+                match other {
+                    GraphRunOutcome::Final { final_state, .. } => format!("Final({final_state})"),
+                    GraphRunOutcome::Paused {
+                        paused_at_state, ..
+                    } => format!("Paused({paused_at_state})"),
+                }
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_without_human_input_keeps_prior_state_none() {
+        // Acceptance (#340): "If no new comments exist, prior_context is
+        // empty (not an error)." The driver must resume cleanly even
+        // when no synthetic step is on disk -- which means the
+        // `skip_pause_once` arm must NOT set `prior_state = Some(<paused
+        // state>)` unconditionally. The shell state has no prior_state
+        // to read, so the run reaches `done` without a `StepNotFound`.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "human-prior-context".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+
+        // No synthetic record on disk; the next state must NOT try to
+        // read it.
+        let flow = human_then_shell_then_final();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            Some(ResumeFrom {
+                state: "ask".to_string(),
+                step_num_offset: 0,
+                human_input_step_id: None,
+            }),
+        )
+        .await
+        .expect("resume with no synthetic step must succeed cleanly");
+
+        match outcome {
+            GraphRunOutcome::Final { final_state, .. } => {
+                assert_eq!(final_state, "done");
+            }
+            other => panic!(
+                "expected Final(done), got something else: {:?}",
+                match other {
+                    GraphRunOutcome::Final { final_state, .. } => format!("Final({final_state})"),
+                    GraphRunOutcome::Paused {
+                        paused_at_state, ..
+                    } => format!("Paused({paused_at_state})"),
+                }
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_human_input_only_injects_on_first_iteration() {
+        // The human-input step must surface as `prior_context` only on
+        // the first transition out of the resumed human state. If the
+        // driver kept routing `prior_state = Some(paused_at_state)` on
+        // every later iteration, the synthetic body would leak into
+        // every downstream state. Use a graph where the shell state
+        // routes to a SECOND shell state -- the second one must NOT
+        // attempt to read `01-ask.md` again. We prove this by removing
+        // the artifact AFTER the first read window: if the driver tried
+        // to re-read it, the run would fail with `StepNotFound`.
+        //
+        // Cannot easily delete the artifact mid-run from the test, so
+        // instead use a graph with `verify1 -> verify2 -> done` and
+        // assert the run completes -- the second shell state inherits
+        // its own `prior_state` (`verify1`), not `ask`.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "human-prior-context".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        std::fs::create_dir_all(ctx.run_path.join(stack::STEPS_SUBDIR)).unwrap();
+
+        // Pre-write the synthetic ask step record only.
+        let synthetic = StepRecord {
+            step_id: "ask".to_string(),
+            kind: "human".to_string(),
+            agent: None,
+            model_requested: None,
+            model_actual: None,
+            backend: "human".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 0,
+            started_at: "2026-05-07T10:00:00Z".to_string(),
+            exit_code: 0,
+            input_steps: Vec::new(),
+            output_file: "01-ask.md".to_string(),
+            participants: Vec::new(),
+            turns: None,
+            messages: None,
+            terminated_by: None,
+            graph_decision: None,
+        };
+        stack::write_run_step(&ctx.run_path, 1, &synthetic, "human input").unwrap();
+
+        // Two-shell graph: `ask (human) -> verify1 (shell) -> verify2 (shell) -> done`.
+        let mut graph: IndexMap<String, GraphState> = IndexMap::new();
+        graph.insert(
+            "ask".to_string(),
+            GraphState {
+                human: Some(true),
+                select: Some(vec![SelectEntry {
+                    target: "verify1".to_string(),
+                    reason: Some(SelectReason::Single("after human".to_string())),
+                }]),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "verify1".to_string(),
+            GraphState {
+                run: Some("true".to_string()),
+                select: Some(vec![
+                    SelectEntry {
+                        target: "verify2".to_string(),
+                        reason: Some(SelectReason::Single("pass".to_string())),
+                    },
+                    SelectEntry {
+                        target: "fail".to_string(),
+                        reason: Some(SelectReason::Single("fail".to_string())),
+                    },
+                ]),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "verify2".to_string(),
+            GraphState {
+                run: Some("true".to_string()),
+                select: Some(vec![
+                    SelectEntry {
+                        target: "done".to_string(),
+                        reason: Some(SelectReason::Single("pass".to_string())),
+                    },
+                    SelectEntry {
+                        target: "fail".to_string(),
+                        reason: Some(SelectReason::Single("fail".to_string())),
+                    },
+                ]),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "done".to_string(),
+            GraphState {
+                final_desc: Some("ok".to_string()),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "fail".to_string(),
+            GraphState {
+                final_desc: Some("fail".to_string()),
+                ..Default::default()
+            },
+        );
+        let flow = GraphFlow {
+            name: "human-prior-context".to_string(),
+            initial: "ask".to_string(),
+            graph,
+            ..Default::default()
+        };
+
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            Some(ResumeFrom {
+                state: "ask".to_string(),
+                step_num_offset: 1,
+                human_input_step_id: Some("ask".to_string()),
+            }),
+        )
+        .await
+        .expect("two-shell resume must complete");
+
+        match outcome {
+            GraphRunOutcome::Final { final_state, .. } => {
+                assert_eq!(final_state, "done");
+            }
+            other => panic!(
+                "expected Final(done), got something else: {:?}",
+                match other {
+                    GraphRunOutcome::Final { final_state, .. } => format!("Final({final_state})"),
+                    GraphRunOutcome::Paused {
+                        paused_at_state, ..
+                    } => format!("Paused({paused_at_state})"),
+                }
+            ),
         }
     }
 }

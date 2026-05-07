@@ -267,6 +267,206 @@ pub fn fetch_issue_body(id: u64) -> Option<String> {
         .map(str::to_string)
 }
 
+/// One comment fetched from a GitHub issue, normalised so callers do not
+/// have to know the `gh issue view --json comments` JSON shape.
+///
+/// `created_at` is kept as the verbatim RFC3339 string `gh` emits (UTC, `Z`
+/// suffix). The filter in [`fetch_new_comments_since`] parses it via
+/// [`chrono::DateTime::parse_from_rfc3339`] rather than string-comparing so
+/// a future shape drift -- offsets like `+02:00` instead of `Z` -- does not
+/// silently re-route which comments count as "new".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IssueComment {
+    pub author: String,
+    pub created_at: String,
+    pub body: String,
+}
+
+/// Function-shaped fetcher: takes the issue number and returns the full list
+/// of comments on that issue (or a stringly-typed error). Boxed so the
+/// runner can swap in the default `gh`-CLI implementation in production
+/// (issue #340) and a closure (canned comments, simulated failure) in
+/// tests, mirroring the [`Poster`] seam.
+pub type CommentsFetcher =
+    Box<dyn Fn(u64) -> std::result::Result<Vec<IssueComment>, String> + Send + Sync>;
+
+/// The production fetcher: shells out to `gh` via [`fetch_issue_comments`].
+pub fn gh_comments_fetcher() -> CommentsFetcher {
+    Box::new(fetch_issue_comments)
+}
+
+/// Fetch all comments on a GitHub issue via `gh issue view <id> --json comments`.
+///
+/// Uses the `--json` shape rather than the human `--comments` view because the
+/// human renderer drops the machine-readable `createdAt` timestamps that
+/// [`fetch_new_comments_since`] needs to filter on. Returns a stringly-typed
+/// error so callers can soft-fail without unwrapping a typed error tree --
+/// the resume contract for #340 is "any failure on the comment-fetch path
+/// degrades to empty input + a warning, never aborts the resume".
+///
+/// Tolerant JSON parser: missing `author`/`author.login` collapses to an
+/// empty author rather than dropping the comment. The only required fields
+/// are `body` (silently treated as empty when missing) and `createdAt`
+/// (comments without a timestamp are dropped, since the timestamp filter
+/// would have nothing to compare).
+pub fn fetch_issue_comments(id: u64) -> std::result::Result<Vec<IssueComment>, String> {
+    use std::process::{Command, Stdio};
+
+    let output = Command::new("gh")
+        .arg("issue")
+        .arg("view")
+        .arg(id.to_string())
+        .arg("--json")
+        .arg("comments")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("failed to spawn gh: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(format!(
+            "gh exited with status {}: {stderr}",
+            output
+                .status
+                .code()
+                .map_or("?".to_string(), |c| c.to_string()),
+        ));
+    }
+
+    parse_issue_comments_json(&output.stdout)
+}
+
+/// Parse the `gh issue view <id> --json comments` JSON shape into a
+/// normalised vector. Split out so the JSON-shape tolerance is unit-testable
+/// without spawning `gh` -- the network path stays in [`fetch_issue_comments`].
+fn parse_issue_comments_json(bytes: &[u8]) -> std::result::Result<Vec<IssueComment>, String> {
+    let json: serde_json::Value =
+        serde_json::from_slice(bytes).map_err(|e| format!("failed to parse gh JSON: {e}"))?;
+    let arr = json
+        .get("comments")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "gh JSON has no `comments` array".to_string())?;
+
+    let mut out = Vec::with_capacity(arr.len());
+    for c in arr {
+        // `createdAt` is the only hard requirement: dropping a comment with
+        // no timestamp is safer than picking an arbitrary fallback that
+        // would silently route it past or before the pause.
+        let Some(created_at) = c.get("createdAt").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let body = c
+            .get("body")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let author = c
+            .get("author")
+            .and_then(|v| v.get("login"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        out.push(IssueComment {
+            author,
+            created_at: created_at.to_string(),
+            body,
+        });
+    }
+    Ok(out)
+}
+
+/// Fetch comments on `id` via `fetcher` and keep only those with
+/// `created_at >= paused_at`.
+///
+/// Soft-fail: any error from `fetcher`, an unparsable `paused_at`, or a
+/// comment whose `created_at` is unparsable collapses to an empty Vec plus
+/// a `[warn]` line on stderr. The resume contract (#340 acceptance) is
+/// explicit that `gh` outages must degrade to "empty prior_context", not
+/// abort the resume.
+///
+/// Comparison is done on parsed [`chrono::DateTime<Utc>`] values rather than
+/// string compare. RFC3339 with a `Z` suffix is lexicographically sortable,
+/// so for today's `gh` output the two compare modes agree -- but a future
+/// `gh` change emitting offsets like `+02:00` would break naive string
+/// compare while leaving parsed compare correct. Belt and braces: cheap.
+///
+/// The `>=` boundary is intentional. The pause timestamp is captured
+/// _before_ the human is told to comment; a comment whose `created_at`
+/// equals `paused_at` to the second is far more likely to be the human's
+/// reply than an older comment that happens to share the timestamp.
+pub fn fetch_new_comments_since(
+    id: u64,
+    paused_at: &str,
+    fetcher: &CommentsFetcher,
+) -> Vec<IssueComment> {
+    let cutoff = match chrono::DateTime::parse_from_rfc3339(paused_at) {
+        Ok(dt) => dt.with_timezone(&chrono::Utc),
+        Err(e) => {
+            eprintln!(
+                "[warn] resume: paused_at '{paused_at}' is not RFC3339 ({e}); skipping human-input fetch"
+            );
+            return Vec::new();
+        }
+    };
+
+    let comments = match fetcher(id) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "[warn] resume: failed to fetch comments for issue #{id} ({e}); continuing without human input"
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut filtered: Vec<IssueComment> = comments
+        .into_iter()
+        .filter(
+            |c| match chrono::DateTime::parse_from_rfc3339(&c.created_at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc) >= cutoff,
+                Err(_) => false,
+            },
+        )
+        .collect();
+
+    // Sort chronologically so the rendered body always reads top-to-bottom
+    // in the order the human typed. `gh` returns comments in chronological
+    // order today, but pinning the order here means a future `gh` change
+    // does not silently flip the layout the next agent sees.
+    filtered.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+    filtered
+}
+
+/// Render comments as the body that lands on disk and feeds the next
+/// agent's `prior_context` (issue #340).
+///
+/// Empty input collapses to an empty string -- the caller decides whether
+/// to skip writing a synthetic step at all rather than persisting a
+/// content file with only a header. Format mirrors the framing block
+/// [`crate::runner::graph::render_shell_artifact`] uses for shell states
+/// (header line + `---` separators + verbatim body) so the on-disk
+/// artifact reads the same shape in `kuro show-output` regardless of
+/// whether the prior step was a shell command or a human handoff.
+pub fn format_human_input(comments: &[IssueComment], paused_at: &str) -> String {
+    if comments.is_empty() {
+        return String::new();
+    }
+    let n = comments.len();
+    let plural = if n == 1 { "comment" } else { "comments" };
+    let mut out = format!("Human input received since pause at {paused_at} ({n} new {plural}):\n");
+    for c in comments {
+        out.push_str("\n---\n");
+        out.push_str(&format!("@{} at {}:\n\n", c.author, c.created_at));
+        out.push_str(&c.body);
+        if !c.body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Take the first `max_lines` non-empty lines and join them with `\n`.
 ///
 /// Issue bodies tend to start with a blank line or a heading; skipping empty
@@ -457,5 +657,202 @@ mod tests {
         let body = "first\r\nsecond\r\n";
         let preview = truncate_body_preview(body, 3);
         assert_eq!(preview, "first\nsecond");
+    }
+
+    // --- Comment fetcher + formatter (issue #340) ---------------------------
+
+    fn comment(author: &str, created_at: &str, body: &str) -> IssueComment {
+        IssueComment {
+            author: author.to_string(),
+            created_at: created_at.to_string(),
+            body: body.to_string(),
+        }
+    }
+
+    fn canned_fetcher(comments: Vec<IssueComment>) -> CommentsFetcher {
+        Box::new(move |_id: u64| Ok(comments.clone()))
+    }
+
+    #[test]
+    fn fetch_new_comments_since_filters_by_paused_at_inclusive() {
+        // Acceptance (#340): the boundary is `>= paused_at`. A comment
+        // whose timestamp equals the pause moment is far more likely to be
+        // the human's reply than a coincidence -- include it. Comments
+        // strictly before pause are dropped.
+        let fetcher = canned_fetcher(vec![
+            comment("alice", "2026-05-07T09:00:00Z", "way before"),
+            comment("alice", "2026-05-07T09:59:59Z", "just before"),
+            comment("bob", "2026-05-07T10:00:00Z", "right at pause"),
+            comment("carol", "2026-05-07T10:00:01Z", "after pause"),
+        ]);
+        let kept = fetch_new_comments_since(42, "2026-05-07T10:00:00Z", &fetcher);
+        let bodies: Vec<&str> = kept.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["right at pause", "after pause"]);
+    }
+
+    #[test]
+    fn fetch_new_comments_since_returns_empty_when_none_new() {
+        // Pause came after every recorded comment -> no human input. Empty
+        // is the contract, not an error: the caller decides whether to
+        // skip the synthetic step.
+        let fetcher = canned_fetcher(vec![
+            comment("alice", "2026-05-06T09:00:00Z", "stale"),
+            comment("bob", "2026-05-06T10:00:00Z", "also stale"),
+        ]);
+        let kept = fetch_new_comments_since(42, "2026-05-07T00:00:00Z", &fetcher);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn fetch_new_comments_since_soft_fails_on_fetcher_error() {
+        // Acceptance (#340): network errors fall back to empty
+        // prior_context with a warning. We assert "empty Vec, no panic" --
+        // the warning lands on stderr, which is the standard side channel.
+        let fetcher: CommentsFetcher = Box::new(|_| Err("simulated gh outage".to_string()));
+        let kept = fetch_new_comments_since(42, "2026-05-07T10:00:00Z", &fetcher);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn fetch_new_comments_since_soft_fails_on_unparsable_paused_at() {
+        // A corrupt manifest must not abort resume. The fetch path is the
+        // single seam where we can quietly degrade -- the rest of the
+        // resume pipeline already enforces RFC3339 on `paused_at`, so this
+        // belt-and-braces check fires only if a future writer regresses.
+        let fetcher = canned_fetcher(vec![comment("alice", "2026-05-07T10:00:00Z", "any")]);
+        let kept = fetch_new_comments_since(42, "not-a-date", &fetcher);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn fetch_new_comments_since_drops_comments_with_unparsable_timestamp() {
+        // A `gh` shape drift that emits a non-RFC3339 timestamp must not
+        // crash the filter. Drop those comments rather than treating them
+        // as "since pause" or "before pause" -- both are guesses.
+        let fetcher = canned_fetcher(vec![
+            comment("alice", "2026-05-07T11:00:00Z", "valid"),
+            comment("bob", "garbage", "will be dropped"),
+        ]);
+        let kept = fetch_new_comments_since(42, "2026-05-07T10:00:00Z", &fetcher);
+        let bodies: Vec<&str> = kept.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["valid"]);
+    }
+
+    #[test]
+    fn fetch_new_comments_since_returns_chronological_order() {
+        // The next agent reads the body top-to-bottom; pinning the order
+        // here keeps the layout stable even if `gh` ever returns comments
+        // out of order. Input is intentionally shuffled.
+        let fetcher = canned_fetcher(vec![
+            comment("carol", "2026-05-07T11:00:00Z", "third"),
+            comment("alice", "2026-05-07T10:00:00Z", "first"),
+            comment("bob", "2026-05-07T10:30:00Z", "second"),
+        ]);
+        let kept = fetch_new_comments_since(42, "2026-05-07T10:00:00Z", &fetcher);
+        let bodies: Vec<&str> = kept.iter().map(|c| c.body.as_str()).collect();
+        assert_eq!(bodies, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn format_human_input_empty_collapses_to_empty_string() {
+        // Caller skips writing a synthetic step on empty -- the format
+        // function must reflect that contract by emitting nothing rather
+        // than a lonely header.
+        let s = format_human_input(&[], "2026-05-07T10:00:00Z");
+        assert_eq!(s, "");
+    }
+
+    #[test]
+    fn format_human_input_renders_singular_header_for_one_comment() {
+        let s = format_human_input(
+            &[comment("alice", "2026-05-07T10:30:00Z", "looks good")],
+            "2026-05-07T10:00:00Z",
+        );
+        assert!(s.contains("Human input received since pause at 2026-05-07T10:00:00Z"));
+        assert!(s.contains("(1 new comment)"));
+        assert!(s.contains("@alice at 2026-05-07T10:30:00Z:"));
+        assert!(s.contains("looks good"));
+    }
+
+    #[test]
+    fn format_human_input_renders_plural_header_for_multiple_comments() {
+        let s = format_human_input(
+            &[
+                comment("alice", "2026-05-07T10:30:00Z", "first"),
+                comment("bob", "2026-05-07T11:00:00Z", "second"),
+            ],
+            "2026-05-07T10:00:00Z",
+        );
+        assert!(s.contains("(2 new comments)"));
+        // Order in the rendered body must match the input order so the
+        // chronological sort applied by `fetch_new_comments_since` is
+        // what the agent sees.
+        let first_idx = s.find("first").expect("first present");
+        let second_idx = s.find("second").expect("second present");
+        assert!(first_idx < second_idx);
+    }
+
+    #[test]
+    fn format_human_input_preserves_markdown_verbatim() {
+        // Comment bodies frequently contain code fences, headings, lists.
+        // The synthesised step is read by the next agent as plain
+        // markdown, so the body must round-trip untouched.
+        let raw = "### Heading\n\n```rust\nfn ok() {}\n```\n- bullet";
+        let s = format_human_input(
+            &[comment("alice", "2026-05-07T10:30:00Z", raw)],
+            "2026-05-07T10:00:00Z",
+        );
+        assert!(s.contains(raw), "raw markdown not present in body: {s}");
+    }
+
+    #[test]
+    fn parse_issue_comments_json_handles_canonical_gh_shape() {
+        // Pin the `gh issue view <id> --json comments` shape so a future
+        // gh change either keeps working or fails loud here, not silently
+        // at run time.
+        let bytes = br#"{
+          "comments": [
+            {"author": {"login": "alice"}, "createdAt": "2026-05-07T10:30:00Z", "body": "first"},
+            {"author": {"login": "bob"}, "createdAt": "2026-05-07T11:00:00Z", "body": "second"}
+          ]
+        }"#;
+        let parsed = parse_issue_comments_json(bytes).expect("canonical shape parses");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].author, "alice");
+        assert_eq!(parsed[0].body, "first");
+        assert_eq!(parsed[1].created_at, "2026-05-07T11:00:00Z");
+    }
+
+    #[test]
+    fn parse_issue_comments_json_tolerates_missing_author_login() {
+        // A comment from a deleted account or a bot without a login should
+        // still surface (with empty author) rather than poisoning the
+        // entire fetch. Body is what the agent ultimately needs to read.
+        let bytes = br#"{"comments":[
+          {"createdAt":"2026-05-07T10:30:00Z","body":"orphan"}
+        ]}"#;
+        let parsed = parse_issue_comments_json(bytes).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].author, "");
+        assert_eq!(parsed[0].body, "orphan");
+    }
+
+    #[test]
+    fn parse_issue_comments_json_skips_comments_without_created_at() {
+        // `createdAt` is the only field the timestamp filter cannot work
+        // around: drop the comment rather than guess.
+        let bytes = br#"{"comments":[
+          {"author":{"login":"alice"},"body":"timeless"},
+          {"author":{"login":"bob"},"createdAt":"2026-05-07T11:00:00Z","body":"keeps"}
+        ]}"#;
+        let parsed = parse_issue_comments_json(bytes).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].body, "keeps");
+    }
+
+    #[test]
+    fn parse_issue_comments_json_rejects_missing_array() {
+        let err = parse_issue_comments_json(br#"{"foo": "bar"}"#).expect_err("missing array");
+        assert!(err.contains("comments"));
     }
 }
