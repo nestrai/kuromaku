@@ -3349,18 +3349,21 @@ name: empty-shape
 
     #[test]
     fn graph_state_without_select_or_final_is_dead_end() {
-        let yaml = r#"
-version: "1"
-name: dangling-state
-initial: lonely
-graph:
-  lonely:
-    role: developer
-"#;
-        let flow = match load_flow_any_from_str(yaml).expect("schema must accept dead-end YAML") {
-            Flow::Graph(g) => g,
-            Flow::Linear(_) => panic!("expected graph flow"),
-        };
+        // Validator-only test: build the graph directly so a parser change
+        // (deny_unknown_fields tightening, schema-level reject of edgeless
+        // agent states) cannot break this assertion. The validator must
+        // flag a state with no `next:` and no `final:` regardless of how
+        // it was authored.
+        let flow = graph(
+            "lonely",
+            vec![(
+                "lonely",
+                GraphState {
+                    role: Some("developer".to_string()),
+                    ..Default::default()
+                },
+            )],
+        );
         let report = validate_graph_reachability(&flow);
         assert!(!report.is_ok(), "expected dead-end error, got ok");
         let msg = &report.errors[0];
@@ -3468,17 +3471,27 @@ graph:
 
     #[test]
     fn graph_conflicting_discriminators_errors() {
-        // A state cannot be both final and a shell state.
-        let yaml = r#"
-version: "1"
-name: bad
-initial: start
-graph:
-  start:
-    run: "true"
-    final: "end"
-"#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
+        // A state cannot be both final and a shell state. Drive the
+        // validator directly so the assertion is about validator
+        // semantics, not loader plumbing -- a parser-side change must
+        // not be able to mask or displace this error.
+        let mut graph_states: IndexMap<String, GraphState> = IndexMap::new();
+        graph_states.insert(
+            "start".to_string(),
+            GraphState {
+                run: Some("true".to_string()),
+                final_desc: Some("end".to_string()),
+                ..Default::default()
+            },
+        );
+        let g = GraphFlow {
+            version: Version("1".to_string()),
+            name: "bad".to_string(),
+            initial: "start".to_string(),
+            graph: graph_states,
+            ..Default::default()
+        };
+        let err = validate_graph_flow(&g).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("conflicting"),
@@ -3562,6 +3575,35 @@ graph:
     fn state_final_no_description() -> GraphState {
         GraphState {
             final_desc: Some("".to_string()),
+            ..Default::default()
+        }
+    }
+
+    /// Agent state with role, task, and outgoing edges. Used by the
+    /// canonical-fixture migration where states need a task body, not
+    /// just a role. Reasons attached as `SelectReason::Single`.
+    fn state_agent(role: &str, task: &str, targets: Vec<(&str, &str)>) -> GraphState {
+        let entries: Vec<SelectEntry> = targets
+            .iter()
+            .map(|(target, reason)| SelectEntry {
+                target: (*target).to_string(),
+                reason: Some(SelectReason::Single((*reason).to_string())),
+            })
+            .collect();
+        GraphState {
+            role: Some(role.to_string()),
+            task: Some(task.to_string()),
+            select: Some(entries),
+            ..Default::default()
+        }
+    }
+
+    /// Final state with an explicit description. The plain `state_final()`
+    /// helper hard-codes one description; the canonical fixture needs two
+    /// distinct ones.
+    fn state_final_with(desc: &str) -> GraphState {
+        GraphState {
+            final_desc: Some(desc.to_string()),
             ..Default::default()
         }
     }
@@ -3778,13 +3820,61 @@ graph:
         assert!(report.errors[1].contains("'second'"));
     }
 
-    /// Acceptance: the canonical GRAPH_CONFIG fixture (every shape:
+    /// Acceptance: the canonical graph fixture (every shape: agent
     /// non-terminal, re-entrant, human, two finals) validates clean.
-    /// Anchors that the existing schema fixture is also valid at the
-    /// graph-validation layer, not just the schema layer.
+    /// Anchors that this shape is valid at the graph-validation layer
+    /// independent of any parser behaviour.
+    ///
+    /// The shape mirrors the YAML `GRAPH_CONFIG` constant field-for-field,
+    /// but the two are intentionally decoupled now: parser/serializer
+    /// drift is covered by `graph_round_trip_serde`, validator behaviour
+    /// is covered here. If you edit `GRAPH_CONFIG`, audit this fixture
+    /// too -- they no longer auto-track.
     #[test]
     fn validate_canonical_graph_fixture_clean() {
-        let g = load_graph_flow_from_str(GRAPH_CONFIG).unwrap();
+        let mut graph_states: IndexMap<String, GraphState> = IndexMap::new();
+        graph_states.insert(
+            "start".to_string(),
+            state_agent(
+                "developer",
+                "Do the first thing.\n",
+                vec![
+                    ("middle", "Things went well."),
+                    ("aborted", "Cannot proceed."),
+                ],
+            ),
+        );
+        graph_states.insert(
+            "middle".to_string(),
+            state_agent(
+                "reviewer",
+                "Check the result.\n",
+                vec![("done", "Looks good."), ("start", "Needs another round.")],
+            ),
+        );
+        graph_states.insert(
+            "human_review".to_string(),
+            state_human(vec![
+                ("middle", "Operator unblocks the review."),
+                ("aborted", "Operator aborts the run."),
+            ]),
+        );
+        graph_states.insert(
+            "done".to_string(),
+            state_final_with("Happy-path exit -- review approved."),
+        );
+        graph_states.insert(
+            "aborted".to_string(),
+            state_final_with("Early exit -- aborted from start or human_review."),
+        );
+        let g = GraphFlow {
+            version: Version("1".to_string()),
+            name: "example-graph".to_string(),
+            prompt: Some("Top-level instruction shared by all states.\n".to_string()),
+            initial: "start".to_string(),
+            graph: graph_states,
+            ..Default::default()
+        };
         let report = validate_graph_reachability(&g);
         assert!(
             report.is_ok(),
