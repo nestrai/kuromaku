@@ -2487,6 +2487,17 @@ mod flow_api {
         // to the path-aware loader below.
         match config::load_flow_any_from_path(&path) {
             Ok(config::Flow::Graph(g)) => {
+                // Engine-layer schema validation (issue #326). The
+                // YAML/MD parsers no longer call `validate_graph_flow`
+                // internally; the engine entry point does it once,
+                // before reachability runs, so dead-end and
+                // schema-rule errors both fail before agent spawn.
+                config::validate_graph_flow(&g).map_err(|e| {
+                    eyre!(
+                        "graph flow '{}' failed schema validation: {e}; refusing to start",
+                        path.display()
+                    )
+                })?;
                 let report = config::validate_graph_reachability(&g);
                 for warning in &report.warnings {
                     eprintln!("warning: {warning}");

@@ -528,8 +528,11 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
 ///
 /// * Linear flows pass through schema validation only -- there is no
 ///   graph layer to walk. A successful parse is reported as ok.
-/// * Graph flows additionally run [`config::validate_graph_reachability`],
-///   which surfaces dead-ends (errors) and unreachable states (warnings).
+/// * Graph flows additionally run [`config::validate_graph_flow`] for
+///   schema-level workflow rules and [`config::validate_graph_reachability`]
+///   for dead-ends (errors) and unreachable states (warnings). The
+///   validator is invoked here -- not inside the YAML parser -- so the
+///   parser layer stays free of engine semantics (issue #326).
 ///
 /// Output discipline (issue #238):
 /// * stdout receives only the success summary, so callers can grep or
@@ -566,6 +569,13 @@ fn run_validate(flow: &str) -> Result<()> {
             Ok(())
         }
         config::Flow::Graph(g) => {
+            // Engine-layer schema validation (issue #326). The YAML
+            // parser only deserialises now, so we have to invoke the
+            // validator explicitly before reachability runs. Errors
+            // surface through eyre with the same wording the parser
+            // used to produce, preserving the user-facing contract.
+            config::validate_graph_flow(&g)
+                .map_err(|e| eyre!("validation failed in '{}': {e}", path.display()))?;
             let report = config::validate_graph_reachability(&g);
             // Warnings first, errors second -- reading order matches
             // severity (lighter to heavier) so the worst news is the

@@ -692,14 +692,27 @@ pub fn load_flow_any_from_str(contents: &str) -> Result<Flow, ConfigError> {
 
 /// Load a graph-shaped flow YAML.
 ///
-/// Schema-only validation (issue #237): version match, `initial:`
-/// references a known state, every `edge.to:` references a known state,
-/// and each state has at least one of `edges:` or `kind:`. Reachability
-/// and dead-end checks are deferred to the validator issue.
+/// Structural YAML deserialisation only -- engine validation
+/// (`validate_graph_flow`, `validate_graph_reachability`) is the
+/// caller's responsibility. This split is the parser/validator
+/// boundary spelled out in `docs/architecture/graphflow.md` and
+/// audited by issue #326: parsers turn one input format into a
+/// `GraphFlow` and only enforce format-specific syntax (well-formed
+/// YAML, `serde(deny_unknown_fields)`, type shape). Workflow-level
+/// rules (initial-state existence, select-target existence, shell
+/// `pass`/`fail`, version match, etc.) live in the engine layer and
+/// are invoked by callers right after the parse.
+///
+/// The validator functions still live in this file for now; they
+/// move to a dedicated module under #324, which is why callers go
+/// through the public re-exports rather than reaching across modules.
 #[allow(dead_code)]
 pub fn load_graph_flow_from_str(contents: &str) -> Result<GraphFlow, ConfigError> {
+    // Structural deserialisation only. Do NOT call `validate_graph_flow`
+    // here -- the parser must accept any YAML that matches the
+    // `GraphFlow` schema, even if it would fail semantic validation.
+    // See issue #326.
     let raw: GraphFlow = serde_yaml::from_str(contents)?;
-    validate_graph_flow(&raw)?;
     Ok(raw)
 }
 
@@ -989,7 +1002,19 @@ pub fn load_flow_any_from_path(path: &Path) -> Result<Flow, ConfigError> {
     }
 }
 
-/// Structural validation for [`GraphFlow`] (issue #317 redesign).
+/// Engine-layer structural validation for [`GraphFlow`] (issue #317
+/// redesign).
+///
+/// This is **not** a parser concern -- it operates on a fully
+/// deserialised `GraphFlow` and enforces workflow semantics that any
+/// input format (YAML, MD, future SDKs) must satisfy. Parsers
+/// (`load_graph_flow_from_str`, the MD loader) deliberately do not
+/// call this; CLI entry points (`run_validate`, the runner pre-flight)
+/// invoke it explicitly after the parse. See issue #326 for the
+/// audit and `docs/architecture/graphflow.md` for the layering.
+///
+/// Moves to a dedicated `validator` module under issue #324; the
+/// physical home is the only thing that changes.
 ///
 /// Checks:
 /// - version must be "1"
@@ -3811,6 +3836,10 @@ graph:
 
     #[test]
     fn graph_unknown_initial_target_errors() {
+        // Issue #326: this is a workflow-semantics error (engine
+        // layer), not a YAML parser error. The parser must accept it;
+        // `validate_graph_flow` must reject it. The error wording stays
+        // identical so user-facing messages do not regress.
         let yaml = r#"
 version: "1"
 name: bad-initial
@@ -3819,7 +3848,12 @@ graph:
   done:
     final: "end"
 "#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let parsed = match load_flow_any_from_str(yaml).expect("parser must accept semantic errors")
+        {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph flow"),
+        };
+        let err = validate_graph_flow(&parsed).expect_err("validator must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("initial") && msg.contains("'nowhere'"),
@@ -3833,6 +3867,7 @@ graph:
 
     #[test]
     fn graph_select_to_unknown_state_errors() {
+        // Issue #326: parser accepts, validator rejects.
         let yaml = r#"
 version: "1"
 name: bad-select
@@ -3846,7 +3881,12 @@ graph:
   done:
     final: "end"
 "#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let parsed = match load_flow_any_from_str(yaml).expect("parser must accept semantic errors")
+        {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph flow"),
+        };
+        let err = validate_graph_flow(&parsed).expect_err("validator must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("start") && msg.contains("'ghost'"),
@@ -4015,6 +4055,8 @@ graph:
     #[test]
     fn graph_conflicting_discriminators_errors() {
         // A state cannot be both final and a shell state.
+        // Issue #326: this is engine-layer state-shape validation, not
+        // a parser concern. Parse succeeds, validate rejects.
         let yaml = r#"
 version: "1"
 name: bad
@@ -4024,7 +4066,12 @@ graph:
     run: "true"
     final: "end"
 "#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let parsed = match load_flow_any_from_str(yaml).expect("parser must accept semantic errors")
+        {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph flow"),
+        };
+        let err = validate_graph_flow(&parsed).expect_err("validator must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("conflicting"),
@@ -4034,6 +4081,7 @@ graph:
 
     #[test]
     fn graph_unsupported_version_errors() {
+        // Issue #326: version match is engine territory.
         let yaml = r#"
 version: "2"
 name: future
@@ -4042,12 +4090,104 @@ graph:
   done:
     final: "end"
 "#;
-        let err = load_flow_any_from_str(yaml).unwrap_err();
+        let parsed = match load_flow_any_from_str(yaml).expect("parser must accept semantic errors")
+        {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph flow"),
+        };
+        let err = validate_graph_flow(&parsed).expect_err("validator must reject");
         let msg = err.to_string();
         assert!(
             msg.contains("unsupported version '2'"),
             "error must name the unsupported version: {msg}"
         );
+    }
+
+    // --- Issue #326: parser/validator boundary contract -----------------
+    //
+    // These tests pin the audit decision: the YAML parser only does
+    // structural deserialisation. Workflow-semantics violations parse
+    // cleanly and surface only when the engine validator runs.
+    // Counterpart tests (parse OK, validate fails) for individual
+    // rules are interleaved with the rules they cover above.
+
+    #[test]
+    fn parse_graph_with_duplicate_select_target_succeeds_validate_fails() {
+        // The "duplicate target in select list" rule lives in
+        // `validate_graph_flow`. After #326 the parser must accept
+        // this YAML; validation rejects it.
+        let yaml = r#"
+version: "1"
+name: dup
+initial: start
+graph:
+  start:
+    role: developer
+    next:
+      - done: "first"
+      - done: "duplicate"
+  done:
+    final: "end"
+"#;
+        let parsed =
+            match load_flow_any_from_str(yaml).expect("parser must accept duplicate target") {
+                Flow::Graph(g) => g,
+                Flow::Linear(_) => panic!("expected graph flow"),
+            };
+        let err = validate_graph_flow(&parsed).expect_err("validator must reject duplicate");
+        assert!(
+            err.to_string().contains("more than once"),
+            "validator must call out the duplicate: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_graph_with_yaml_syntax_error_fails_at_parse() {
+        // The parser still owns YAML well-formedness. An unbalanced
+        // quote is rejected by `serde_yaml`, not by the validator --
+        // the validator should never be reached because the input is
+        // not a valid `GraphFlow`.
+        let yaml = r#"
+version: "1"
+name: "broken
+initial: start
+graph:
+  start:
+    final: "end"
+"#;
+        let err = load_flow_any_from_str(yaml).expect_err("parser must reject malformed YAML");
+        // We only care that the error is a parse error -- not the
+        // exact serde_yaml wording, which is library-controlled.
+        assert!(
+            matches!(err, ConfigError::Parse(_)),
+            "expected ConfigError::Parse for malformed YAML, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_graph_flow_from_str_does_not_call_validator() {
+        // Direct contract test for the audit (#326): a YAML that
+        // would fail every engine rule (unsupported version, unknown
+        // initial state, unknown select target) must still
+        // deserialise cleanly through `load_graph_flow_from_str`. The
+        // function deliberately stops at structural deserialisation.
+        let yaml = r#"
+version: "99"
+name: schema-violations
+initial: nowhere
+graph:
+  start:
+    role: developer
+    next:
+      - ghost: "Goes nowhere real."
+      - other: "Also missing."
+"#;
+        let parsed = load_graph_flow_from_str(yaml)
+            .expect("parser must accept input that fails every engine rule");
+        assert_eq!(parsed.initial, "nowhere");
+        // Sanity: the validator does still reject it, so the rule
+        // moved from the parser to the caller, not into thin air.
+        assert!(validate_graph_flow(&parsed).is_err());
     }
 
     #[test]
@@ -4836,10 +4976,28 @@ graph:
 
     // --- `kind: shell` schema validation (issue #310) -------------------
     //
-    // The shell-state contract is enforced at parse time so a misshapen
-    // verify gate is rejected long before the runner spawns anything.
-    // Each test pins one rule from `validate_shell_state_semantics` and
-    // names the field the user would need to fix.
+    // The shell-state contract is enforced by `validate_graph_flow` --
+    // the engine validator -- so a misshapen verify gate is rejected
+    // before the runner spawns anything. After issue #326 the YAML
+    // parser is structural-only, so each of these tests parses first
+    // and then asserts that the validator rejects with the expected
+    // message. Each test pins one rule from
+    // `validate_state_semantics` and names the field the user would
+    // need to fix.
+
+    /// Helper: parse a shell-state YAML fixture as a graph flow and
+    /// run the engine validator. Returns the validator error so each
+    /// test can assert on its message. Panics if the YAML fails to
+    /// parse (parser failure means the fixture is structurally
+    /// malformed, which is a different test concern).
+    fn shell_yaml_validate_err(yaml: &str) -> ConfigError {
+        let parsed = match load_flow_any_from_str(yaml).expect("parser must accept semantic errors")
+        {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("expected graph flow"),
+        };
+        validate_graph_flow(&parsed).expect_err("validator must reject")
+    }
 
     /// Helper: minimal three-state graph with a `kind: shell` `verify`
     /// state between `a` and the two terminal states. Tests mutate the
@@ -4878,7 +5036,7 @@ graph:
       - back: fail
 "#,
         );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let err = shell_yaml_validate_err(&yaml);
         assert!(err.to_string().contains("empty"));
     }
 
@@ -4893,7 +5051,7 @@ graph:
       - back: fail
 "#,
         );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let err = shell_yaml_validate_err(&yaml);
         let msg = err.to_string();
         assert!(
             msg.contains("verify") && msg.contains("role"),
@@ -4912,7 +5070,7 @@ graph:
       - back: fail
 "#,
         );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let err = shell_yaml_validate_err(&yaml);
         let msg = err.to_string();
         assert!(
             msg.contains("verify") && msg.contains("task"),
@@ -4930,7 +5088,7 @@ graph:
       - done: fail
 "#,
         );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let err = shell_yaml_validate_err(&yaml);
         assert!(err.to_string().contains("pass"));
     }
 
@@ -4944,7 +5102,7 @@ graph:
       - back: pass
 "#,
         );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let err = shell_yaml_validate_err(&yaml);
         assert!(err.to_string().contains("fail"));
     }
 
@@ -4958,7 +5116,7 @@ graph:
       - verify: fail
 "#,
         );
-        let err = load_flow_any_from_str(&yaml).unwrap_err();
+        let err = shell_yaml_validate_err(&yaml);
         let msg = err.to_string();
         assert!(
             msg.contains("self-loop") && msg.contains("verify"),
