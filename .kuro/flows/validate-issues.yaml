@@ -3,13 +3,16 @@ name: validate-issues
 prompt: |
   Scan all open issues in this repository and evaluate whether each
   issue is ready to be picked up by an AI agent team. Label issues
-  that need more specification, then create a triage tracking issue
-  with the full report.
+  that need attention, then maintain ONE standing triage discussion
+  with the report.
 
   Labels used by this flow (created by the prepare state if missing):
   - needs-spec: issue lacks Summary, scope, or testable acceptance criteria
   - needs-split: issue is too large -- should become an epic with sub-issues
-  - triage: tracking issue with the full report (one per run)
+
+  Output channel: a single GitHub Discussion in the "Backlog" category.
+  Updated on every run, not duplicated. The discussion accumulates
+  comments per scan so the history stays visible.
 
 initial: prepare
 
@@ -17,20 +20,14 @@ graph:
   prepare:
     role: developer
     task: |
-      Ensure the labels this flow uses exist on the repository. Idempotent:
-      safe to run multiple times. Use `gh label list` first to check, then
-      `gh label create` only for missing ones.
-
-      Required labels (with descriptions):
-
-      - `needs-spec` (yellow #fbca04): Issue lacks Summary, scope, or testable acceptance criteria. Cannot be picked up by agents until clarified.
-      - `needs-split` (orange #d93f0b): Issue is too large for one implementation pass. Should be split into sub-issues or promoted to an epic.
-      - `triage` (blue #1d76db): Tracking issue produced by validate-issues flow. One per run, dated.
+      Ensure the labels this flow uses exist on the repository.
+      Idempotent: safe to run multiple times.
 
       ```bash
-      gh label list --json name --jq '.[].name' > /tmp/existing.txt
-      # for each missing label:
-      gh label create needs-spec --color fbca04 --description "..."
+      gh label list --json name --jq '.[].name'
+      # only create missing ones:
+      gh label create needs-spec --color fbca04 --description "Issue lacks Summary, scope, or testable acceptance criteria."
+      gh label create needs-split --color d93f0b --description "Issue is too large -- should be split into sub-issues."
       ```
 
       Output: list of labels confirmed/created.
@@ -71,25 +68,19 @@ graph:
       - Epics are NOT issues -- skip anything with "epic" in the title
       - An issue with `## Summary` AND acceptance criteria checkboxes is likely ready
       - An issue that says "design X" or "discuss Y" without concrete output is needs-spec
-      - Be strict. Agents waste time on vague issues. Better to flag too many than too few.
+      - Be strict. Agents waste time on vague issues.
     next:
-      - label: "found issues that need specification"
+      - label: "found issues that need attention"
       - done: "all issues are agent-ready"
 
   label:
     role: developer
     task: |
-      Read the scan results. For each issue under "Needs specification",
-      apply the label (no individual comments -- the triage issue carries
-      the full reasoning):
+      Apply labels (no individual comments -- the triage discussion
+      carries the full reasoning):
 
-      ```
+      ```bash
       gh issue edit <number> --add-label needs-spec
-      ```
-
-      For "Too large" issues:
-
-      ```
       gh issue edit <number> --add-label needs-split
       ```
 
@@ -99,21 +90,52 @@ graph:
       - #N: labelled needs-spec
       - #M: labelled needs-split
     next:
-      - triage-issue: "labels applied, ready to publish triage report"
+      - triage-discussion: "labels applied, ready to update discussion"
       - aborted: "labelling failed"
 
-  triage-issue:
+  triage-discussion:
     role: developer
     task: |
-      Create a single tracking issue with the full triage report. Title
-      format: "Backlog triage YYYY-MM-DD" (use today's date).
+      Maintain ONE standing triage discussion in the "Backlog" category.
+      Update its body if it exists, create it once if not. Comments are
+      added on every run to track history.
 
-      Body structure:
+      Steps:
+
+      1. Get the repository ID and the Backlog category ID:
+
+         ```bash
+         REPO_ID=$(gh api graphql -f query='query { repository(owner: "<owner>", name: "<repo>") { id } }' --jq '.data.repository.id')
+         CATEGORY_ID=$(gh api graphql -f query='query { repository(owner: "<owner>", name: "<repo>") { discussionCategories(first: 25) { nodes { id slug } } } }' --jq '.data.repository.discussionCategories.nodes[] | select(.slug == "backlog") | .id')
+         ```
+
+      2. Look for an existing discussion titled exactly "Backlog triage" in the Backlog category:
+
+         ```bash
+         gh api graphql -f query='query { repository(owner: "<owner>", name: "<repo>") { discussions(first: 50, categoryId: "<CATEGORY_ID>") { nodes { id title number } } } }'
+         ```
+
+      3a. **If exists**: edit its body and add a comment:
+
+         ```bash
+         gh api graphql -f query='mutation($id: ID!, $body: String!) { updateDiscussion(input: { discussionId: $id, body: $body }) { discussion { url } } }' -f id=<discussion-id> -F body=@/tmp/triage-body.md
+
+         gh api graphql -f query='mutation($id: ID!, $body: String!) { addDiscussionComment(input: { discussionId: $id, body: $body }) { comment { url } } }' -f id=<discussion-id> -F body="Re-scanned <YYYY-MM-DD>: <X> needs-spec, <Y> needs-split, <Z> ready"
+         ```
+
+      3b. **If not exists**: create it in the Backlog category:
+
+         ```bash
+         gh api graphql -f query='mutation($repo: ID!, $cat: ID!, $title: String!, $body: String!) { createDiscussion(input: { repositoryId: $repo, categoryId: $cat, title: $title, body: $body }) { discussion { url } } }' -f repo=$REPO_ID -f cat=$CATEGORY_ID -f title="Backlog triage" -F body=@/tmp/triage-body.md
+         ```
+
+      Body structure (same in both cases, written to /tmp/triage-body.md first):
 
       ```markdown
       ## Summary
 
-      Backlog triage scan flagged N issues that need attention before
+      Standing triage tracking discussion. Updated by `kuro run validate-issues`.
+      Last scan: <YYYY-MM-DD>. Lists open issues that need attention before
       they can be picked up by an AI agent team.
 
       ## Needs specification (X)
@@ -127,12 +149,7 @@ graph:
       - [ ] #N -- title -- suggested split
       ...
 
-      ## Ready (Z)
-
-      Issues that passed validation (no action needed):
-      #A, #B, #C ...
-
-      ## How to clear this triage
+      ## How to clear an item
 
       For each `needs-spec` issue: add a `## Summary` section, define
       scope, write testable acceptance criteria, then remove the label.
@@ -140,20 +157,16 @@ graph:
       For each `needs-split` issue: open sub-issues, link them, then
       close the original or convert it to an epic.
 
-      Re-run `kuro run validate-issues` to verify.
+      Re-run `kuro run validate-issues` to update this list.
       ```
 
-      Apply the `triage` label to the new issue. Output the URL.
-
-      ```
-      gh issue create --title "Backlog triage <YYYY-MM-DD>" --label triage --body "<report>"
-      ```
+      Output the discussion URL (whether updated or created).
     next:
-      - done: "triage issue published"
-      - aborted: "could not create triage issue"
+      - done: "triage discussion updated"
+      - aborted: "could not update triage discussion"
 
   done:
-    final: "validation complete -- see triage issue for full report"
+    final: "validation complete -- see the Backlog triage discussion for the report"
 
   aborted:
     final: "validation aborted -- check the previous step output for the failure reason"
