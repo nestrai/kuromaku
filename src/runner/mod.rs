@@ -2287,6 +2287,16 @@ mod flow_api {
 
     /// Build the run manifest. Pure -- no I/O happens here; the caller is
     /// expected to write the result to `<run_path>/manifest.yaml`.
+    ///
+    /// Format-agnostic: the inputs are already parsed (`FlowConfig` /
+    /// `GraphFlow` materialise upstream) and the only path-shaped values
+    /// the builder consumes are `flow_path` plus `flow_contents`, which it
+    /// stores verbatim and hashes. The same workflow expressed as YAML or
+    /// Markdown therefore produces a structurally identical manifest --
+    /// only `flow_path`, `flow_sha256`, and the flow's own
+    /// `ResourceRecord` differ by construction. This contract is locked
+    /// in by `tests::manifest_structure_identical_for_yaml_and_md_sources`
+    /// (issue #329); do not branch on `flow_path.extension()` here.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn build_manifest(
         ctx: &RunContext,
@@ -3718,6 +3728,251 @@ mod tests {
         assert!(
             !path.exists(),
             "unique_run_path must return a path that doesn't exist yet"
+        );
+    }
+
+    // Issue #329: lock in that the manifest builder is format-agnostic.
+    //
+    // The same workflow expressed in YAML and in Markdown must produce a
+    // structurally identical manifest. The only fields that legitimately
+    // differ are the source-keyed ones (`flow_path`, `flow_sha256`, and the
+    // flow's own `ResourceRecord`), plus the wall-clock `finished_at`
+    // captured inside `build_manifest` at call time. Everything else is
+    // shaped from already-parsed structures (`GraphFlow` materialises
+    // upstream of the builder), so a future regression that branches on
+    // `flow_path.extension()` -- or that pipes the source format into a
+    // new field -- will fail this test.
+    const EQUIVALENCE_FLOW_YAML: &str = r#"version: "1"
+name: equivalence
+prompt: drive the test graph
+initial: start
+graph:
+  start:
+    role: dev
+    task: say hi
+    next:
+      - middle: "Move to the middle state."
+      - done: "Skip to done."
+  middle:
+    role: dev
+    task: look around
+    next:
+      - done: "Move to the final state."
+      - start: "Go back."
+  done:
+    final: "Three-state graph reached its terminal state."
+"#;
+
+    const EQUIVALENCE_FLOW_MD: &str = r#"---
+format: kuromaku-flow/v1
+---
+
+# equivalence
+
+drive the test graph
+
+---
+
+## start
+*role: dev*
+
+say hi
+
+-> middle: Move to the middle state.
+-> done: Skip to done.
+
+---
+
+## middle
+*role: dev*
+
+look around
+
+-> done: Move to the final state.
+-> start: Go back.
+
+---
+
+## done
+*final: Three-state graph reached its terminal state.*
+"#;
+
+    #[test]
+    fn manifest_structure_identical_for_yaml_and_md_sources() {
+        use crate::config::{self, Flow};
+        use crate::resolver::ResolvedRole;
+        use crate::stack::StepRecord;
+
+        // Two source files for the same logical workflow. Writing them to a
+        // tempdir lets `load_flow_any_from_path` exercise its real
+        // extension dispatch -- the YAML probe vs the Markdown loader.
+        let dir = tempfile::tempdir().unwrap();
+        let yaml_path = dir.path().join("flow.yaml");
+        let md_path = dir.path().join("flow.md");
+        std::fs::write(&yaml_path, EQUIVALENCE_FLOW_YAML).unwrap();
+        std::fs::write(&md_path, EQUIVALENCE_FLOW_MD).unwrap();
+
+        let yaml_flow = match config::load_flow_any_from_path(&yaml_path).unwrap() {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("YAML fixture must parse as a graph flow"),
+        };
+        let md_flow = match config::load_flow_any_from_path(&md_path).unwrap() {
+            Flow::Graph(g) => g,
+            Flow::Linear(_) => panic!("MD fixture must parse as a graph flow"),
+        };
+
+        // Sanity check: the two sources lower into equal `GraphFlow`s. The
+        // manifest builder never sees `GraphFlow` directly, so this is a
+        // local guard rather than the central assertion -- if the parsers
+        // diverge here, the manifest comparison below would still hold but
+        // the failure attribution would be misleading.
+        assert_eq!(
+            yaml_flow.name, md_flow.name,
+            "fixture name must round-trip identically across YAML and MD parsers"
+        );
+        assert_eq!(
+            yaml_flow.initial, md_flow.initial,
+            "initial state must round-trip identically across YAML and MD parsers"
+        );
+        assert_eq!(
+            yaml_flow.graph.keys().collect::<Vec<_>>(),
+            md_flow.graph.keys().collect::<Vec<_>>(),
+            "state IDs and order must round-trip identically"
+        );
+
+        // Single shared RunContext keeps `run_id`, `started_at`, `stack_path`
+        // and the rules/skills caches identical between the two manifest
+        // builds. Anything that varies between the two builds is therefore
+        // attributable to source-format leakage, not to context drift.
+        let ctx = RunContext::new(
+            "equivalence".to_string(),
+            "format-agnostic manifest audit".to_string(),
+            dir.path().to_path_buf(),
+            Some("guide content".to_string()),
+            HashMap::from([("rust-developer".to_string(), "Use iterators".to_string())]),
+            HashMap::from([("domain-cli".to_string(), "skill content".to_string())]),
+            HashMap::new(),
+        );
+
+        let seeds = Seeds::default_local();
+        let agents: Vec<config::Agent> = Vec::new();
+        let agent_origins: HashMap<String, usize> = HashMap::new();
+        let agent_hashes: HashMap<String, String> = HashMap::new();
+        let roles = vec![ResolvedRole {
+            name: "dev".to_string(),
+            agent: "Sage".to_string(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+            model_source: "agent".to_string(),
+            backend_source: "agent".to_string(),
+            seed_origin: Some(".kuro/".to_string()),
+            extra_args: Vec::new(),
+        }];
+        let mut vars = HashMap::new();
+        vars.insert("owner".to_string(), "nestrai".to_string());
+
+        // Canned step records. The runtime input to `build_manifest` is
+        // already format-agnostic by the time the runner reaches it, so we
+        // bypass the executor entirely and feed the same `StepRunResult`
+        // into both calls.
+        let started = ctx.started_at.to_rfc3339();
+        let results: Vec<StepRunResult> = vec![StepRunResult {
+            step_id: "start".to_string(),
+            agent_name: "Sage".to_string(),
+            backend: "api".to_string(),
+            duration: std::time::Duration::from_millis(1234),
+            tokens_in: Some(100),
+            tokens_out: Some(50),
+            output_file: format!("{}/01-start.md", ctx.run_id),
+            print_output: false,
+            record: StepRecord {
+                step_id: "start".to_string(),
+                kind: "llm".to_string(),
+                agent: Some("Sage".to_string()),
+                model_requested: Some("claude-sonnet-4-5".to_string()),
+                model_actual: Some("claude-sonnet-4-5".to_string()),
+                backend: "api".to_string(),
+                tokens_in: Some(100),
+                tokens_out: Some(50),
+                duration_ms: 1234,
+                started_at: started.clone(),
+                exit_code: 0,
+                input_steps: vec![],
+                output_file: "01-start.md".to_string(),
+                participants: Vec::new(),
+                turns: None,
+                messages: None,
+                terminated_by: None,
+                graph_decision: None,
+            },
+        }];
+
+        let total_elapsed = std::time::Duration::from_secs(2);
+        let mut yaml_manifest = build_manifest(
+            &ctx,
+            "equivalence",
+            &yaml_path,
+            EQUIVALENCE_FLOW_YAML,
+            &seeds,
+            &agents,
+            &agent_origins,
+            &agent_hashes,
+            &roles,
+            &vars,
+            &results,
+            total_elapsed,
+            Some("done"),
+        );
+        let mut md_manifest = build_manifest(
+            &ctx,
+            "equivalence",
+            &md_path,
+            EQUIVALENCE_FLOW_MD,
+            &seeds,
+            &agents,
+            &agent_origins,
+            &agent_hashes,
+            &roles,
+            &vars,
+            &results,
+            total_elapsed,
+            Some("done"),
+        );
+
+        // Source-keyed values diverge by construction: the path lives in
+        // `flow_path`, the bytes hash to `flow_sha256`, and both surface a
+        // second time on the flow's `ResourceRecord`. Mask all four; if
+        // anything else differs, that is the regression we are catching.
+        let mask = |m: &mut crate::stack::Manifest| {
+            m.flow_path = "<masked>".to_string();
+            m.flow_sha256 = "<masked>".to_string();
+            // `finished_at` is `chrono::Utc::now()` captured inside the
+            // builder; the two calls happen microseconds apart and would
+            // otherwise jitter independently of source format.
+            m.finished_at = "<masked>".to_string();
+            for r in m.resources.iter_mut() {
+                if r.kind == "flow" {
+                    r.path = "<masked>".to_string();
+                    r.sha256 = "<masked>".to_string();
+                }
+            }
+        };
+        mask(&mut yaml_manifest);
+        mask(&mut md_manifest);
+
+        // Compare via the YAML serialisation rather than via in-memory
+        // `PartialEq`. The serialised form IS the manifest contract --
+        // audit consumers read `manifest.yaml`, not the in-memory struct
+        // -- and using a string compare gives the developer a readable
+        // diff on failure without dragging `PartialEq` across the entire
+        // manifest schema. A regression that grows a new format-keyed
+        // slot (e.g. a `source_format:` field) or that branches on
+        // `flow_path.extension()` inside the builder trips this assert.
+        let yaml_serialised = serde_yaml::to_string(&yaml_manifest).unwrap();
+        let md_serialised = serde_yaml::to_string(&md_manifest).unwrap();
+        assert_eq!(
+            yaml_serialised, md_serialised,
+            "serialised manifest must be identical for YAML and MD sources"
         );
     }
 
