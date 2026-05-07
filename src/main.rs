@@ -640,8 +640,6 @@ mod tests {
 
     // --- CLI parsing for `run` (canonical) and `up` (deprecated alias) (issue #181) ---
 
-    use clap::Parser as _;
-
     /// Helper: extract the `RunArgs` from whichever of the two variants
     /// `Cli::try_parse_from` produced. Lets the assertions below stay focused
     /// on argument values without re-doing the variant match each time.
