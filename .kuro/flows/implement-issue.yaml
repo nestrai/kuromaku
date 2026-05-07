@@ -9,10 +9,11 @@
 #   pr                --> done
 #
 # Usage: kuro run implement-issue --var id=42
-#        kuro run implement-issue --var id=42 --var ready_label=ready-for-implementation
 #
-# Default ready label is `ready-for-implementation`. Override with
-# `--var ready_label=<name>` if your project uses a different convention.
+# The precheck state reads the project's `issue-quality.md` rule to
+# determine what counts as "ready for implementation" (typically a
+# specific label). Projects override the rule locally to change the
+# convention -- the flow itself stays generic.
 
 version: "1"
 name: implement-issue
@@ -20,8 +21,9 @@ prompt: |
   Implement issue #{{vars.id}} in this repository. Follow the team's rules
   and produce a draft PR at the end.
 
-  Issues must carry the `{{vars.ready_label}}` label before agents may
-  pick them up. The precheck state aborts the run if the label is missing.
+  The precheck state verifies that issue #{{vars.id}} satisfies the
+  project's implementation-readiness criteria from the issue-quality
+  rule before any agent starts work.
 
 initial: precheck
 
@@ -29,20 +31,24 @@ graph:
   precheck:
     role: developer
     task: |
-      Verify that issue #{{vars.id}} carries the `{{vars.ready_label}}`
-      label. Without it, agents must not start implementation.
+      Read the project's `issue-quality.md` rule from the active rule
+      cascade. The rule defines the implementation-readiness criteria
+      (typically a specific label like `ready-for-implementation`).
+
+      Verify that issue #{{vars.id}} satisfies the criteria:
 
       ```bash
-      gh issue view {{vars.id}} --json labels --jq '.labels[].name'
+      gh issue view {{vars.id}} --json labels,body --jq '{labels: [.labels[].name], body: .body}'
       ```
 
-      If `{{vars.ready_label}}` is in the output, transition to `design`.
-      If not, transition to `aborted` and explain that the issue is not
-      ready for implementation -- the maintainer must clarify scope, add
-      a Summary, define acceptance criteria, then label the issue.
+      Compare the issue against the rule's "Implementation gate"
+      section. If the issue is ready, transition to `design`. If not,
+      transition to `aborted` with a clear explanation of what is
+      missing per the rule (e.g. "label X not set", "no Summary
+      section", "acceptance criteria missing").
     next:
-      - design: "ready label is set, issue is implementation-ready"
-      - aborted: "ready label missing -- issue needs spec work first"
+      - design: "issue satisfies implementation-readiness criteria"
+      - aborted: "issue does not meet readiness criteria -- needs spec work"
 
   design:
     role: architect

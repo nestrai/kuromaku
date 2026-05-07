@@ -2,6 +2,20 @@
 
 Every issue you create or update must be implementable by another agent or developer without guessing.
 
+## Implementation gate
+
+An issue is **ready for implementation** when it carries the
+`ready-for-implementation` label. The implement-issue flow refuses
+to start without this label.
+
+The maintainer applies the label after the issue meets every quality
+standard below. The label is the explicit handoff: "this is good
+enough that an agent can pick it up."
+
+Projects with different conventions override this rule locally
+(e.g. `agent-ready` or `triaged`). The implement-issue flow's
+precheck state reads this rule, not a hardcoded constant.
+
 ## Required sections
 
 - **Summary**: a `## Summary` or `## TL;DR` section at the top, 2-3 sentences max. Names the change and the why. The first thing a reader sees -- skip the prose, get to the point.
