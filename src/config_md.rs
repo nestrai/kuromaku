@@ -8,6 +8,33 @@
 //! The parser is a simple line-by-line scanner -- no `pulldown-cmark` or
 //! other Markdown AST library needed. The format is regular enough that a
 //! state machine over lines is cleaner than fighting with a cmark tree.
+//!
+//! # Layering: parser vs validator (issue #325)
+//!
+//! [`parse_md_flow`] produces an **unvalidated** [`GraphFlow`]. It is
+//! responsible for *Markdown syntax* and *data-model structural invariants*
+//! only. Workflow semantics (target existence, shell `pass`/`fail`
+//! routing rules, duplicate select targets, final-state-with-transitions,
+//! reachability, and so on) are the exclusive responsibility of
+//! [`validate_graph_flow`] in `config.rs`. The public entry point
+//! [`load_graph_flow_from_md`] composes the two -- exactly mirroring the
+//! YAML side (`load_graph_flow_from_str`).
+//!
+//! Two checks in this file may look semantic but are not, and stay here:
+//!
+//! - The duplicate-state-id check in [`ParseState::flush_state`] is a
+//!   *structural* invariant of the underlying `IndexMap<String, GraphState>`.
+//!   The validator receives an already-merged map and cannot detect this
+//!   after the fact (the YAML side has the same blind spot via serde_yaml's
+//!   last-wins behaviour). Removing it would be a silent-overwrite
+//!   regression in the MD format.
+//! - The frontmatter `format: kuromaku-flow/v1` check is parse-time schema
+//!   discrimination, equivalent to the YAML `version: 1` check.
+//!
+//! Everything else in this module is line-classification: H1, H2, italic
+//! metadata whitelist, `->` transitions, `---` separators. If you find
+//! yourself adding a check that talks about *what the workflow means*,
+//! it belongs in `validate_graph_flow`, not here.
 
 use indexmap::IndexMap;
 
@@ -123,9 +150,14 @@ impl ParseState {
     }
 }
 
-/// Parse the markdown into a [`GraphFlow`]. Does NOT run validation
-/// (the caller does that after).
-fn parse_md_flow(contents: &str) -> Result<GraphFlow, ConfigError> {
+/// Parse the markdown into a [`GraphFlow`]. Does NOT run workflow-semantic
+/// validation (the caller does that via [`validate_graph_flow`]).
+///
+/// Visibility is `pub(crate)` so unit tests in this module can drive the
+/// parser in isolation from the validator and pin the layering boundary
+/// (see issue #325). Callers outside the crate should use
+/// [`load_graph_flow_from_md`].
+pub(crate) fn parse_md_flow(contents: &str) -> Result<GraphFlow, ConfigError> {
     let mut st = ParseState::new();
 
     for (line_num, line) in contents.lines().enumerate() {
@@ -812,6 +844,151 @@ format: kuromaku-flow/v1
         assert!(
             msg.contains("pass") || msg.contains("fail"),
             "error must mention pass/fail: {msg}"
+        );
+    }
+
+    // --- Boundary-lock tests (issue #325) ---
+    //
+    // These tests pin the layering between `parse_md_flow` (Markdown syntax
+    // only) and `validate_graph_flow` (workflow semantics). For each
+    // semantic rule, the parser must accept the input and the validator
+    // must reject it. If the parser ever starts to reject one of these
+    // syntactically-clean cases, semantic logic has leaked into the parser
+    // and the contract has been broken.
+
+    #[test]
+    fn parser_accepts_unknown_target_validator_rejects() {
+        let md = r#"---
+format: kuromaku-flow/v1
+---
+
+# unknown-target
+
+---
+
+## start
+*role: developer*
+
+Go.
+
+-> nowhere: this target does not exist
+-> start: retry
+
+---
+
+## done
+*final: end*
+"#;
+
+        // Parser: structurally fine, no unknown-state knowledge.
+        let flow = parse_md_flow(md).expect("parser must accept unknown transition target");
+        let entries = flow.graph["start"].select.as_ref().unwrap();
+        assert_eq!(entries[0].target, "nowhere");
+
+        // Validator: rejects with an "unknown state" message naming the target.
+        let err = validate_graph_flow(&flow).expect_err("validator must reject unknown target");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown state") && msg.contains("nowhere"),
+            "validator error must mention 'unknown state' and 'nowhere': {msg}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_duplicate_target_validator_rejects() {
+        let md = r#"---
+format: kuromaku-flow/v1
+---
+
+# duplicate-target
+
+---
+
+## start
+*role: developer*
+
+Go.
+
+-> done: first reason
+-> done: second reason
+-> start: retry
+
+---
+
+## done
+*final: end*
+"#;
+
+        // Parser: keeps both entries verbatim, no dedup.
+        let flow = parse_md_flow(md).expect("parser must accept duplicate transition targets");
+        let entries = flow.graph["start"].select.as_ref().unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].target, "done");
+        assert_eq!(entries[1].target, "done");
+
+        // Validator: rejects with a "more than once" message.
+        let err =
+            validate_graph_flow(&flow).expect_err("validator must reject duplicate select target");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("more than once"),
+            "validator error must mention 'more than once': {msg}"
+        );
+    }
+
+    #[test]
+    fn parser_accepts_shell_wrong_reasons_validator_rejects() {
+        let md = r#"---
+format: kuromaku-flow/v1
+---
+
+# shell-wrong-reasons
+
+---
+
+## check
+*run: make test*
+
+-> done: success
+-> retry: failure
+
+---
+
+## retry
+*role: developer*
+
+Try again.
+
+-> check: ready
+-> retry: try once more
+
+---
+
+## done
+*final: end*
+"#;
+
+        // Parser: shell-state pass/fail rules are not its concern.
+        let flow = parse_md_flow(md).expect("parser must accept arbitrary shell-state reasons");
+        let check = &flow.graph["check"];
+        assert!(check.is_shell());
+        let entries = check.select.as_ref().unwrap();
+        assert_eq!(
+            entries[0].reason,
+            Some(SelectReason::Single("success".to_string()))
+        );
+        assert_eq!(
+            entries[1].reason,
+            Some(SelectReason::Single("failure".to_string()))
+        );
+
+        // Validator: rejects because shell states must use 'pass' / 'fail'.
+        let err = validate_graph_flow(&flow)
+            .expect_err("validator must reject shell state with non-pass/fail reasons");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("pass") || msg.contains("fail"),
+            "validator error must mention pass/fail: {msg}"
         );
     }
 }
