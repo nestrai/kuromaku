@@ -397,3 +397,134 @@ esac
         "blocked path must record `final_state: aborted` in the manifest, got:\n{manifest}"
     );
 }
+
+/// Write a minimal graph flow with a human-handoff state to the project's
+/// `.kuro/flows/` directory. The flow runs one agent step (`design`) then
+/// hands off to a human state (`ask`). Returns the absolute path of the
+/// flow file so the test can pass it via `--file`.
+///
+/// Kept tiny on purpose: issue #337 only locks in the pause contract, and
+/// a five-state flow would dilute the test's signal. The `ask` state has
+/// no `next:` -- the validator accepts that for human states (they may be
+/// resumed later, but resume is #338's problem) and the driver pauses
+/// before evaluating outgoing edges.
+fn write_pause_flow(project: &Path) -> PathBuf {
+    let flow_dir = project.join(".kuro/flows");
+    std::fs::create_dir_all(&flow_dir).unwrap();
+    let flow_path = flow_dir.join("pause.yaml");
+    std::fs::write(
+        &flow_path,
+        "version: \"1\"\n\
+         name: pause-smoke\n\
+         prompt: \"Test the pause path.\"\n\
+         initial: design\n\
+         graph:\n\
+         \x20\x20design:\n\
+         \x20\x20\x20\x20role: developer\n\
+         \x20\x20\x20\x20task: \"Write a one-line plan.\"\n\
+         \x20\x20\x20\x20next:\n\
+         \x20\x20\x20\x20\x20\x20- ask: \"wait for human input\"\n\
+         \x20\x20\x20\x20\x20\x20- design: \"keep iterating\"\n\
+         \x20\x20ask:\n\
+         \x20\x20\x20\x20human: true\n",
+    )
+    .unwrap();
+    flow_path
+}
+
+#[test]
+fn human_state_pauses_run_with_status_paused_in_manifest() {
+    // Acceptance (issue #337):
+    // - exit code 0 (paused is not an error)
+    // - manifest contains `status: paused`
+    // - manifest contains `paused_at_state: ask`
+    // - manifest contains a `paused_at:` RFC3339 timestamp
+    // - no `final_state:` (paused is mutually exclusive with terminal)
+    // - one step file for `design`, none for `ask`
+    let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let flow = write_pause_flow(project.path());
+
+    let (_shim_dir, shim, log) = install_shim(
+        r#"case "$PROMPT" in
+  *'state `design`'*)
+    printf 'plan: ask the human something.\n{"transition": "ask", "reason": "need user input"}\n'
+    ;;
+  *)
+    printf 'unexpected prompt; only design should run before pause\n' >&2
+    exit 1
+    ;;
+esac
+"#,
+    );
+
+    // No verify gate is in the pause flow, but `run_kuro` requires a
+    // just_dir tempdir argument. An empty tempdir is fine.
+    let (_just_dir, just_shim) = install_just_shim(0);
+    let just_dir = just_shim.parent().unwrap();
+
+    let home = tempfile::tempdir().expect("home tempdir");
+    let out = run_kuro(project.path(), &flow, &shim, home.path(), just_dir);
+
+    assert!(
+        out.status.success(),
+        "pause must exit 0 (it is not an error); status={:?}\nstdout={}\nstderr={}\nshim log:\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+        std::fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let manifest = read_manifest(home.path(), &project_name);
+    assert!(
+        manifest.contains("status: paused"),
+        "paused run must record `status: paused`, got:\n{manifest}"
+    );
+    assert!(
+        manifest.contains("paused_at_state: ask"),
+        "paused run must record `paused_at_state: ask`, got:\n{manifest}"
+    );
+    // RFC3339 dates start with a 4-digit year + `-` -- check for the
+    // `paused_at:` field key followed by a year-shaped prefix. This is
+    // looser than parsing the timestamp but tight enough to catch a
+    // missing field or an empty string.
+    assert!(
+        manifest.contains("paused_at: ") && manifest.contains("paused_at: 20"),
+        "paused run must record an RFC3339 `paused_at:` timestamp, got:\n{manifest}"
+    );
+    assert!(
+        !manifest.contains("final_state:"),
+        "paused run must NOT record `final_state:` -- pause and terminal are mutually exclusive, got:\n{manifest}"
+    );
+
+    // Step files: exactly one for `design`, none for `ask`. The pause
+    // contract is that the human state writes nothing -- mirroring the
+    // final-state convention.
+    let stacks = home.path().join(".koto/stacks").join(&project_name);
+    let run_dir = std::fs::read_dir(&stacks)
+        .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .max()
+        .unwrap_or_else(|| panic!("no run directories under {}", stacks.display()));
+    let steps_dir = run_dir.join("steps");
+    let names: Vec<String> = std::fs::read_dir(&steps_dir)
+        .unwrap_or_else(|e| panic!("read steps dir {}: {e}", steps_dir.display()))
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        names.iter().any(|n| n.contains("design")),
+        "expected a step file for design, got: {names:?}"
+    );
+    assert!(
+        names.iter().all(|n| !n.contains("-ask.")),
+        "no step file may exist for the paused human state, got: {names:?}"
+    );
+}

@@ -119,22 +119,38 @@ fn unknown_edge_retry_note(picked: &str, allowed: &[String]) -> String {
     )
 }
 
-/// Outcome of a successful graph-flow run.
+/// Lifecycle outcome of a graph-flow run.
 ///
-/// Carries both the per-step results (for the manifest's `steps:` and the
-/// summary table) and the terminal state ID the run ended in. The terminal
-/// state lives on this struct rather than on a `StepRunResult` because the
-/// final state has no step record -- the driver does not run an agent for
-/// `kind: final` states (see the early return in [`run_graph_flow`]).
+/// Pause is not an error -- a `human: true` state suspends the run so a
+/// human operator can react, then a future `kuro resume` (#338) picks it
+/// back up. Mixing pause into [`RunError`] would force every caller to
+/// pattern-match `Err(_)` to tell pause apart from real failures, so the
+/// outcome enum carries both successful lifecycle endings:
 ///
-/// Audit consumers (`kuro show-output`, the MCP `show_output` tool, log
-/// parsers) want to know which `kind: final` state was reached -- that is
-/// what tells `done` apart from `aborted`. Surfacing it here lets the
-/// caller (`runner::execute_flow`) thread it into the manifest's
-/// `final_state` field per issue #257.
-pub struct GraphRunOutcome {
-    pub steps: Vec<StepRunResult>,
-    pub final_state: String,
+/// * `Final` -- the driver reached a state with `kind: final`. The terminal
+///   state ID lives here rather than on a `StepRunResult` because the
+///   driver does not run an agent for `kind: final` states (see the early
+///   return in [`run_graph_flow`]). Audit consumers (`kuro show-output`,
+///   the MCP `show_output` tool, log parsers) read it to tell `done` apart
+///   from `aborted` -- per issue #257.
+///
+/// * `Paused` -- the driver reached a state with `human: true`. The graph
+///   position is recorded into the manifest's `status: paused` block so
+///   `kuro resume` (#338) can later pick the run back up. Pausing must
+///   NOT write a step record: a human-handoff state has no agent reply
+///   and writing a synthetic record would muddy `kuro show-output`. The
+///   driver therefore returns before incrementing `step_num`, mirroring
+///   the `Final` arm's contract.
+pub enum GraphRunOutcome {
+    Final {
+        steps: Vec<StepRunResult>,
+        final_state: String,
+    },
+    Paused {
+        steps: Vec<StepRunResult>,
+        paused_at_state: String,
+        paused_at: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// Drive a graph flow from `initial:` to a `kind: final` state.
@@ -189,20 +205,26 @@ pub async fn run_graph_flow(
         // Final state: terminate cleanly.
         if state.is_final() {
             ui::print_graph_final(&current);
-            return Ok(GraphRunOutcome {
+            return Ok(GraphRunOutcome::Final {
                 steps: results,
                 final_state: current,
             });
         }
 
-        // Human-handoff is accepted at the schema level but the prototype
-        // runtime does not know how to drive it.
+        // Human-handoff: suspend the run cleanly so a human operator can
+        // react. The graph position lives on the outcome so the caller
+        // can record `status: paused` into the manifest. No step record
+        // is written -- a human state has no agent reply -- and the
+        // driver returns before `step_num` increments, mirroring the
+        // final-state contract. `kuro resume` (#338) will read the
+        // manifest back to pick up where we stopped.
         if state.is_human() {
-            return Err(RunError::GraphRuntime {
-                state: current.clone(),
-                reason:
-                    "human handoff is accepted by the schema but not supported by the prototype runtime"
-                        .to_string(),
+            let paused_at = chrono::Utc::now();
+            ui::print_graph_paused(&current);
+            return Ok(GraphRunOutcome::Paused {
+                steps: results,
+                paused_at_state: current,
+                paused_at,
             });
         }
 
@@ -1162,6 +1184,134 @@ mod tests {
         assert!(
             msg.contains("'fail'"),
             "expected message naming 'fail', got: {msg}"
+        );
+    }
+
+    // --- Human-pause driver tests (issue #337) --------------------------
+    //
+    // These exercise `run_graph_flow` directly so the pause contract --
+    // clean Ok with `GraphRunOutcome::Paused`, no step record written,
+    // pause arm carries the correct state ID and a recent timestamp --
+    // is locked at the driver layer rather than only at the integration
+    // level. The graph driver is the single source of truth for pause
+    // semantics; downstream wiring (manifest, summary) just translates.
+
+    use crate::core::GraphFlow;
+    use crate::core::GraphState;
+    use indexmap::IndexMap;
+
+    fn graph_flow_with_human_initial() -> GraphFlow {
+        // Smallest valid graph: `initial: ask`, `ask: { human: true }`.
+        // The driver only consults `is_human()` on the current state, so
+        // a human state with no `next:` is enough to verify pause.
+        let mut graph: IndexMap<String, GraphState> = IndexMap::new();
+        graph.insert(
+            "ask".to_string(),
+            GraphState {
+                human: Some(true),
+                ..Default::default()
+            },
+        );
+        let mut flow = GraphFlow::default();
+        flow.name = "human-pause-test".to_string();
+        flow.initial = "ask".to_string();
+        flow.graph = graph;
+        flow
+    }
+
+    #[tokio::test]
+    async fn human_state_returns_paused_outcome() {
+        // Acceptance: reaching a `human: true` state must terminate the
+        // driver cleanly with `GraphRunOutcome::Paused` carrying the
+        // state ID and a timestamp. No `RunError` -- pause is not a
+        // failure, mixing it into the error type would force every
+        // caller to disambiguate via pattern-match.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "human-pause-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = graph_flow_with_human_initial();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let before = chrono::Utc::now();
+        let outcome = run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx)
+            .await
+            .expect("pause must be Ok, not Err");
+        let after = chrono::Utc::now();
+
+        match outcome {
+            GraphRunOutcome::Paused {
+                steps,
+                paused_at_state,
+                paused_at,
+            } => {
+                assert_eq!(paused_at_state, "ask");
+                assert!(
+                    steps.is_empty(),
+                    "pause at the initial human state must not record any steps"
+                );
+                // The timestamp was captured between the test's `before`
+                // and `after` -- if the driver returned a stale or future
+                // timestamp the bound check fires.
+                assert!(
+                    paused_at >= before && paused_at <= after,
+                    "paused_at {paused_at:?} must fall in [{before:?}, {after:?}]"
+                );
+            }
+            GraphRunOutcome::Final { final_state, .. } => {
+                panic!("human state must yield Paused, got Final({final_state})")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn human_state_does_not_write_a_step_record() {
+        // Final states do not write a step record (the driver returns
+        // before `step_num` increments). Pause must follow the same
+        // pattern -- writing a synthetic record for a state that ran no
+        // agent would muddy `kuro show-output` and lie about what
+        // happened on disk.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "human-pause-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = graph_flow_with_human_initial();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx)
+            .await
+            .expect("pause must succeed");
+
+        // The driver always initialises `<run>/steps/`. Assert the
+        // directory exists but holds no per-step files for the human
+        // state. `read_dir` may legitimately be empty.
+        let steps_dir = ctx.run_path.join(stack::STEPS_SUBDIR);
+        assert!(
+            steps_dir.is_dir(),
+            "init_run_layout must create steps/ even when no step ran"
+        );
+        let entries: Vec<_> = std::fs::read_dir(&steps_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.is_empty(),
+            "no step files must land on disk for a pause-on-initial run, got: {entries:?}"
         );
     }
 }
