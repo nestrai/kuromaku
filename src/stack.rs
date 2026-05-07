@@ -111,7 +111,15 @@ pub fn init_run_layout(run_path: &Path) -> Result<(), StackError> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepRecord {
     pub step_id: String,
-    /// `"llm"` for agent steps, `"shell"` for `run:` steps.
+    /// Kind of step. Known values:
+    /// * `"llm"` -- agent step in a linear flow.
+    /// * `"shell"` -- `run:` step (linear or graph).
+    /// * `"graph"` -- agent step in a graph flow that emitted a transition.
+    /// * `"conversation"` -- multi-agent conversation step (#170).
+    /// * `"human"` -- synthetic record for a human handoff resumed via
+    ///   `kuro resume`, capturing GH comments added since pause (#340).
+    ///
+    /// Free-form `String` so future kinds slot in without a schema bump.
     #[serde(rename = "type")]
     pub kind: String,
     /// LLM steps: agent name. Shell steps: empty string.
