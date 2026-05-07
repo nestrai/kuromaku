@@ -36,6 +36,7 @@ graph:
       Output: list of labels confirmed/created.
     next:
       - scan: "labels ready"
+      - aborted: "label setup failed"
 
   scan:
     role: reviewer
@@ -99,6 +100,7 @@ graph:
       - #M: labelled needs-split
     next:
       - triage-issue: "labels applied, ready to publish triage report"
+      - aborted: "labelling failed"
 
   triage-issue:
     role: developer
@@ -148,6 +150,10 @@ graph:
       ```
     next:
       - done: "triage issue published"
+      - aborted: "could not create triage issue"
 
   done:
     final: "validation complete -- see triage issue for full report"
+
+  aborted:
+    final: "validation aborted -- check the previous step output for the failure reason"
