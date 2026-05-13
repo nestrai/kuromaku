@@ -669,8 +669,11 @@ fn collect_local_human_input(
     // a TTY so an interactive `kuro resume` does not silently block on
     // a `read`.
     if !stdin_isatty {
-        let raw = stdin_read()
-            .map_err(|e| eyre!("failed to read stdin: {e}\n\nhint: pipe the body via `echo \"...\" | kuro resume`"))?;
+        let raw = stdin_read().map_err(|e| {
+            eyre!(
+                "failed to read stdin: {e}\n\nhint: pipe the body via `echo \"...\" | kuro resume`"
+            )
+        })?;
         let trimmed = raw.trim_end_matches('\n');
         if !trimmed.is_empty() {
             return Ok(Some(runner::LocalHumanInput {
@@ -1041,9 +1044,14 @@ mod tests {
     fn resume_subcommand_accepts_message_file_flag() {
         // The other side of the same contract -- `--message-file`
         // alone must parse cleanly with `message` left None.
-        let cli =
-            Cli::try_parse_from(["kuro", "resume", "run-id", "--message-file", "/tmp/feedback.md"])
-                .expect("CLI parse failed");
+        let cli = Cli::try_parse_from([
+            "kuro",
+            "resume",
+            "run-id",
+            "--message-file",
+            "/tmp/feedback.md",
+        ])
+        .expect("CLI parse failed");
         let Command::Resume {
             run_id,
             message,

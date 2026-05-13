@@ -3661,11 +3661,8 @@ mod flow_api {
         if local.body.is_empty() {
             return None;
         }
-        let body = crate::notify::github::format_local_human_input(
-            &local.body,
-            &local.source,
-            paused_at,
-        );
+        let body =
+            crate::notify::github::format_local_human_input(&local.body, &local.source, paused_at);
         let output_file = stack::step_content_filename(step_num, paused_at_state, "md");
         let record = stack::StepRecord {
             step_id: paused_at_state.to_string(),
@@ -4301,7 +4298,9 @@ mod flow_api {
             assert_eq!(record.duration_ms, 0);
             assert_eq!(record.started_at, "2026-05-13T10:00:00Z");
             assert!(
-                body.contains("Human input received since pause at 2026-05-13T10:00:00Z (via --message)"),
+                body.contains(
+                    "Human input received since pause at 2026-05-13T10:00:00Z (via --message)"
+                ),
                 "body must carry the source-tagged header, got:\n{body}"
             );
             assert!(body.contains("approve"), "body must carry verbatim text");

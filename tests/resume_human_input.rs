@@ -568,12 +568,7 @@ fn read_synthetic_human_body(home: &Path, project_name: &str, state_id: &str) ->
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.ends_with(&suffix))
         })
-        .unwrap_or_else(|| {
-            panic!(
-                "expected a NN-{state_id}.md under {}",
-                steps_dir.display()
-            )
-        });
+        .unwrap_or_else(|| panic!("expected a NN-{state_id}.md under {}", steps_dir.display()));
     std::fs::read_to_string(body_path).unwrap()
 }
 
@@ -598,8 +593,7 @@ fn resume_injects_message_flag_as_prior_context() {
     let (_gh_dir, gh_shim) = install_gh_shim("[]", _ollama_dir.path());
     let gh_dir = gh_shim.parent().unwrap();
 
-    let run_id =
-        pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
+    let run_id = pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
 
     let resume_out = spawn_resume(
         project.path(),
@@ -668,8 +662,7 @@ fn resume_injects_stdin_as_prior_context() {
     let (_gh_dir, gh_shim) = install_gh_shim("[]", _ollama_dir.path());
     let gh_dir = gh_shim.parent().unwrap();
 
-    let run_id =
-        pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
+    let run_id = pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
 
     let resume_out = spawn_resume(
         project.path(),
@@ -722,8 +715,7 @@ fn resume_errors_when_no_input_and_no_gh_source() {
     let (_gh_dir, gh_shim) = install_gh_shim("[]", _ollama_dir.path());
     let gh_dir = gh_shim.parent().unwrap();
 
-    let run_id =
-        pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
+    let run_id = pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
 
     let resume_out = spawn_resume(
         project.path(),
