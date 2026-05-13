@@ -442,6 +442,33 @@ pub async fn spawn_interactive(
     cmd.status().await.map_err(ExecutorError::Io)
 }
 
+/// True if `extra_args` carries any token that overrides codex' sandbox or
+/// approval policy. When this fires, [`build_codex_command`] suppresses the
+/// default `--full-auto` push so the user's override is not shadowed by the
+/// deprecated shorthand (codex' deprecated-flag precedence puts `--full-auto`
+/// in front of any later `--sandbox` / `-c sandbox_mode=...`).
+///
+/// The detection set is closed and mirrors codex' documented flags:
+///   - exact tokens: `--full-auto`, `--sandbox`, `-s`, `--ask-for-approval`, `-a`
+///   - joined long form: `--sandbox=...`, `--ask-for-approval=...`
+///   - `-c` TOML overrides for `sandbox_mode=...` or `approval_policy=...`
+///
+/// Unrelated `-c` overrides (e.g. `-c model_reasoning_effort=high` from #236)
+/// do NOT trigger the drop -- that is the #236 happy path and stays default.
+fn extras_override_full_auto(extra_args: &[String]) -> bool {
+    extra_args.iter().enumerate().any(|(i, token)| {
+        matches!(
+            token.as_str(),
+            "--full-auto" | "--sandbox" | "-s" | "--ask-for-approval" | "-a"
+        ) || token.starts_with("--sandbox=")
+            || token.starts_with("--ask-for-approval=")
+            || (token == "-c"
+                && extra_args.get(i + 1).is_some_and(|next| {
+                    next.starts_with("sandbox_mode=") || next.starts_with("approval_policy=")
+                }))
+    })
+}
+
 /// Build the CLI command string for a codex backend.
 ///
 /// Uses `codex exec` in full-auto mode (no approval prompts, sandboxed).
@@ -453,6 +480,18 @@ pub async fn spawn_interactive(
 /// `-c key=value` overrides on the same argv position the codex CLI
 /// documents for them. Each token is shell-escaped here -- the caller passes
 /// `["-c", "model_reasoning_effort=high"]` as two separate entries.
+///
+/// **#358 override gate.** The default `--full-auto` push is suppressed iff
+/// `extra_args` carries a sandbox or approval override (see
+/// [`extras_override_full_auto`]). This is how an agent opts out of the
+/// codex default without rebuilding kuromaku, e.g.:
+///
+/// ```yaml
+/// extra_args:
+///   codex: ["--sandbox", "workspace-write", "--ask-for-approval", "on-failure"]
+/// ```
+///
+/// With unrelated extras (or none), behaviour is byte-identical to pre-#358.
 pub fn build_codex_command(
     model: &str,
     system_prompt: Option<&str>,
@@ -470,7 +509,11 @@ pub fn build_codex_command(
     };
 
     let mut parts = vec![codex_bin, "exec".to_string()];
-    parts.push("--full-auto".to_string());
+    // #358: only emit the default `--full-auto` when the user has not
+    // supplied their own sandbox/approval override via extra_args.
+    if !extras_override_full_auto(extra_args) {
+        parts.push("--full-auto".to_string());
+    }
     // "default" means use Codex's built-in model, don't pass -m flag.
     // Any other value gets passed literally.
     if model != "default" {
@@ -717,6 +760,138 @@ mod tests {
         assert!(model_pos < c_pos, "extras must follow -m MODEL: {cmd}");
         assert!(c_pos < kv_pos, "got: {cmd}");
         assert!(kv_pos < prompt_pos, "prompt must stay last: {cmd}");
+    }
+
+    // --- #358: codex --full-auto override gate ---
+    //
+    // AC1 (override takes effect): tests 1-6 below. Each asserts that when
+    // extra_args carries a sandbox/approval override in any documented codex
+    // spelling, the default `--full-auto` token is suppressed AND the user's
+    // tokens are present (shell-escaped) and the prompt stays last.
+    //
+    // AC2 (default unchanged): tests 8-9 below. Unrelated extras and empty
+    // extras must leave `--full-auto` in place. These are the regression
+    // pins guarding the #236 happy path and the pre-#358 default.
+    //
+    // AC3 (precedence pinned at unit layer): the combination of 1-6 covers
+    // the unit-test acceptance criterion explicitly named in #358.
+
+    #[test]
+    fn codex_full_auto_dropped_when_sandbox_overridden() {
+        let extra = vec![
+            "--sandbox".to_string(),
+            "workspace-write".to_string(),
+            "--ask-for-approval".to_string(),
+            "on-failure".to_string(),
+        ];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        assert!(
+            !cmd.contains("--full-auto"),
+            "--full-auto must be dropped when --sandbox is in extras: {cmd}"
+        );
+        assert!(cmd.contains("'--sandbox'"), "got: {cmd}");
+        assert!(cmd.contains("'workspace-write'"), "got: {cmd}");
+        assert!(cmd.contains("'--ask-for-approval'"), "got: {cmd}");
+        assert!(cmd.contains("'on-failure'"), "got: {cmd}");
+        assert!(cmd.trim_end().ends_with("'write docs'"), "got: {cmd}");
+    }
+
+    #[test]
+    fn codex_full_auto_dropped_when_sandbox_joined_form() {
+        let extra = vec!["--sandbox=workspace-write".to_string()];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        assert!(
+            !cmd.contains("--full-auto"),
+            "joined --sandbox=... must also suppress --full-auto: {cmd}"
+        );
+        assert!(cmd.contains("'--sandbox=workspace-write'"), "got: {cmd}");
+    }
+
+    #[test]
+    fn codex_full_auto_dropped_when_c_sandbox_mode() {
+        let extra = vec!["-c".to_string(), "sandbox_mode=workspace-write".to_string()];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        assert!(
+            !cmd.contains("--full-auto"),
+            "-c sandbox_mode=... must suppress --full-auto: {cmd}"
+        );
+        assert!(cmd.contains("'-c'"), "got: {cmd}");
+        assert!(cmd.contains("'sandbox_mode=workspace-write'"), "got: {cmd}");
+    }
+
+    #[test]
+    fn codex_full_auto_dropped_when_c_approval_policy() {
+        let extra = vec!["-c".to_string(), "approval_policy=on-failure".to_string()];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        assert!(
+            !cmd.contains("--full-auto"),
+            "-c approval_policy=... must suppress --full-auto: {cmd}"
+        );
+        assert!(cmd.contains("'approval_policy=on-failure'"), "got: {cmd}");
+    }
+
+    #[test]
+    fn codex_full_auto_dropped_when_short_sandbox() {
+        let extra = vec!["-s".to_string(), "workspace-write".to_string()];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        assert!(
+            !cmd.contains("--full-auto"),
+            "-s short form must suppress --full-auto: {cmd}"
+        );
+        assert!(cmd.contains("'-s'"), "got: {cmd}");
+    }
+
+    #[test]
+    fn codex_full_auto_dropped_when_ask_for_approval_long() {
+        let extra = vec!["--ask-for-approval".to_string(), "never".to_string()];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        assert!(
+            !cmd.contains("--full-auto"),
+            "--ask-for-approval must suppress --full-auto: {cmd}"
+        );
+        assert!(cmd.contains("'--ask-for-approval'"), "got: {cmd}");
+    }
+
+    #[test]
+    fn codex_full_auto_passthrough_idempotent() {
+        // User passes their own --full-auto. The gate trips and our default
+        // push is suppressed, so only the user's (shell-escaped) token
+        // survives. Count the substring -- the default push emits the raw
+        // `--full-auto` token unescaped, while the user's token comes through
+        // shell_escape as `'--full-auto'`. Both contain the `--full-auto`
+        // substring, so we need an exact count, not a contains check.
+        let extra = vec!["--full-auto".to_string()];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        let count = cmd.matches("--full-auto").count();
+        assert_eq!(count, 1, "exactly one --full-auto expected, got: {cmd}");
+        assert!(cmd.contains("'--full-auto'"), "got: {cmd}");
+    }
+
+    #[test]
+    fn codex_full_auto_kept_for_unrelated_extras() {
+        // #236 happy path: -c model_reasoning_effort=high is an unrelated TOML
+        // override. The gate must NOT trip -- default sandbox stays in place.
+        let extra = vec!["-c".to_string(), "model_reasoning_effort=high".to_string()];
+        let cmd = build_codex_command("o3", None, "write docs", &extra);
+
+        assert!(
+            cmd.contains("--full-auto"),
+            "unrelated -c override must not drop --full-auto: {cmd}"
+        );
+    }
+
+    #[test]
+    fn codex_full_auto_kept_when_extras_empty() {
+        // AC2 explicit: empty extras leave the default argv byte-identical.
+        let cmd = build_codex_command("o3", None, "write docs", &[]);
+        assert!(cmd.contains("--full-auto"), "got: {cmd}");
     }
 
     #[test]
