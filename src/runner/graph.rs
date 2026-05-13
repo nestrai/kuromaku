@@ -29,7 +29,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::config::{Agent, Backend};
-use crate::core::{GraphFlow, SelectEntry};
+use crate::core::{GraphFlow, GraphState, SelectEntry};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, ExecutorError, OutputFormat};
 use crate::stack::{self, GraphDecision, StepRecord};
 use crate::ui::{self, StepInfo, StepState};
@@ -426,6 +426,27 @@ pub async fn run_graph_flow(
         };
         ui::print_step_banner(step_num, DEFAULT_MAX_STEPS, &step_info);
 
+        // #356: resolve the effective `extra_args` slice once per state
+        // visit (mirrors `resolve_extra_args` in the linear runner) and
+        // surface it next to the model/backend so a user reading the
+        // run output can see what override tokens their YAML produced.
+        // Only printed when non-empty -- the default case stays quiet so
+        // existing run logs are byte-identical.
+        let effective_extra_args: Vec<String> =
+            resolve_state_extra_args(state, agent, agent.backend);
+        if !effective_extra_args.is_empty() {
+            let source = if !state.extra_args.is_empty() {
+                "state"
+            } else {
+                "agent"
+            };
+            eprintln!(
+                "      extra_args ({source}, {}): [{}]",
+                agent.backend.yaml_name(),
+                effective_extra_args.join(" ")
+            );
+        }
+
         // Read the prior state's persisted artifact so the next agent can
         // build on it. Without this the graph runs as a chain of strangers --
         // a steering agent reviewing nothing, an implementer reading no
@@ -511,6 +532,7 @@ pub async fn run_graph_flow(
                     &user_prompt,
                     &agent.model,
                     agent.backend,
+                    &effective_extra_args,
                     &output_path,
                     attempt,
                 )
@@ -676,12 +698,88 @@ fn build_state_user_prompt(
     out
 }
 
+/// Resolve the effective `extra_args` slice for a graph state visit (#356).
+///
+/// Cascade mirrors [`super::resolve_extra_args`] in the linear runner: a
+/// non-empty state map fully replaces the agent map, even when it lacks
+/// an entry for the effective backend (in which case the resolved slice
+/// is empty -- the documented "clear extra_args for this backend"
+/// intent from #236). When the state map is empty the agent map
+/// supplies the override tokens.
+///
+/// Returns an owned `Vec<String>` because the state map is string-keyed
+/// (raw YAML form, see [`GraphState::extra_args`]) and the lookup
+/// happens via [`Backend::yaml_name`], producing a `&[String]` whose
+/// lifetime is tied to a temporary; cloning out keeps the call site
+/// simple and the cost is one `Vec` allocation per state visit (the
+/// tokens are short).
+fn resolve_state_extra_args(state: &GraphState, agent: &Agent, backend: Backend) -> Vec<String> {
+    if !state.extra_args.is_empty() {
+        return state
+            .extra_args
+            .get(backend.yaml_name())
+            .cloned()
+            .unwrap_or_default();
+    }
+    agent.extra_args.get(&backend).cloned().unwrap_or_default()
+}
+
+/// Build the executor command string for a single state visit.
+///
+/// Pure function with no I/O: separated from [`run_state_via_executor`]
+/// so the per-backend argv assembly is unit-testable without spawning a
+/// process. Mirrors the `match backend` block in the linear runner
+/// (`runner::mod::run_step_via_executor`), routing every CLI backend
+/// through the same `executor::build_*_command` helpers so the two
+/// runners produce byte-identical commands for matching inputs.
+fn build_state_command(
+    backend: Backend,
+    model: &str,
+    system_prompt: &str,
+    user_content: &str,
+    extra_args: &[String],
+    state_id: &str,
+) -> Result<String, RunError> {
+    match backend {
+        Backend::ClaudeCli => Ok(executor::build_claude_command(
+            model,
+            Some(system_prompt),
+            user_content,
+            extra_args,
+        )),
+        Backend::Codex => Ok(executor::build_codex_command(
+            model,
+            Some(system_prompt),
+            user_content,
+            extra_args,
+        )),
+        Backend::Ollama => {
+            // Ollama has no separate system slot, so we inline the prompt
+            // the same way the linear runner does. Keeping the format
+            // identical means a user comparing linear and graph runs sees
+            // the same text shape land on disk.
+            let mut prompt = String::new();
+            prompt.push_str(&format!("System: {system_prompt}\n\n"));
+            prompt.push_str(&format!("User: {user_content}"));
+            Ok(executor::build_ollama_command(model, &prompt, extra_args))
+        }
+        Backend::Api => Err(RunError::GraphRuntime {
+            state: state_id.to_string(),
+            reason: "graph driver does not yet support the api backend; use claude-cli, codex, or ollama".to_string(),
+        }),
+    }
+}
+
 /// Spawn one state-step on the executor and return the raw stdout.
 ///
 /// Almost a copy of `run_step_via_executor` from the linear runner, but
 /// scoped to the graph driver so the linear path stays untouched. The
 /// `attempt` index is folded into the executor task ID so retries do not
 /// collide on the per-process job table.
+///
+/// `extra_args` is the resolved per-state backend-keyed override slice
+/// (#356). The caller cascades state → agent → empty before calling
+/// here, so the slice is always the right one for the backend in use.
 #[allow(clippy::too_many_arguments)]
 async fn run_state_via_executor(
     executor: &dyn ExecutorBoxed,
@@ -691,6 +789,7 @@ async fn run_state_via_executor(
     user_content: &str,
     model: &str,
     backend: Backend,
+    extra_args: &[String],
     output_path: &Path,
     attempt: usize,
 ) -> Result<String, RunError> {
@@ -701,30 +800,14 @@ async fn run_state_via_executor(
     let short_id = &chrono::Utc::now().timestamp_millis().to_string()[8..];
     let task_id = format!("kuro-{project}-{flow_name}-graph-{state_id}-a{attempt}-{short_id}");
 
-    let command = match backend {
-        Backend::ClaudeCli => {
-            executor::build_claude_command(model, Some(system_prompt), user_content, &[])
-        }
-        Backend::Codex => {
-            executor::build_codex_command(model, Some(system_prompt), user_content, &[])
-        }
-        Backend::Ollama => {
-            // Ollama has no separate system slot, so we inline the prompt
-            // the same way the linear runner does. Keeping the format
-            // identical means a user comparing linear and graph runs sees
-            // the same text shape land on disk.
-            let mut prompt = String::new();
-            prompt.push_str(&format!("System: {system_prompt}\n\n"));
-            prompt.push_str(&format!("User: {user_content}"));
-            executor::build_ollama_command(model, &prompt, &[])
-        }
-        Backend::Api => {
-            return Err(RunError::GraphRuntime {
-                state: state_id.to_string(),
-                reason: "graph driver does not yet support the api backend; use claude-cli, codex, or ollama".to_string(),
-            });
-        }
-    };
+    let command = build_state_command(
+        backend,
+        model,
+        system_prompt,
+        user_content,
+        extra_args,
+        state_id,
+    )?;
 
     let output_format = match backend {
         Backend::ClaudeCli => OutputFormat::ClaudeStreamJson,
@@ -1107,6 +1190,208 @@ mod tests {
         let note = malformed_retry_note(&err);
         assert!(note.contains("malformed"));
         assert!(note.contains("Reply again with a JSON object"));
+    }
+
+    fn make_test_agent(backend: Backend, extra: &[(Backend, Vec<&str>)]) -> Agent {
+        let mut extra_args = std::collections::HashMap::new();
+        for (b, args) in extra {
+            extra_args.insert(*b, args.iter().map(|s| (*s).to_string()).collect());
+        }
+        Agent {
+            id: "agent-id".to_string(),
+            name: "Tester".to_string(),
+            title: None,
+            description: None,
+            role: "role".to_string(),
+            model: "test-model".to_string(),
+            backend,
+            rules: Vec::new(),
+            skills: Vec::new(),
+            env: std::collections::HashMap::new(),
+            extra_args,
+        }
+    }
+
+    fn make_state_with_extra(extra: &[(&str, Vec<&str>)]) -> GraphState {
+        let mut m = std::collections::HashMap::new();
+        for (key, args) in extra {
+            m.insert(
+                (*key).to_string(),
+                args.iter().map(|s| (*s).to_string()).collect(),
+            );
+        }
+        GraphState {
+            role: Some("dev".to_string()),
+            task: Some("do work".to_string()),
+            extra_args: m,
+            ..Default::default()
+        }
+    }
+
+    // --- #356: extra_args threading through graph runner ----------------
+
+    #[test]
+    fn build_state_command_threads_extra_args_for_codex() {
+        // AC #1: a codex command built for a graph state with
+        // `extra_args.codex: ["--add-dir", "/tmp/x"]` must include the
+        // shell-escaped token in the resulting argv string.
+        let cmd = build_state_command(
+            Backend::Codex,
+            "default",
+            "sys",
+            "usr",
+            &["--add-dir".to_string(), "/tmp/x".to_string()],
+            "state-id",
+        )
+        .expect("codex command must build");
+        assert!(
+            cmd.contains("'--add-dir'") && cmd.contains("'/tmp/x'"),
+            "codex argv missing extra_args tokens: {cmd}"
+        );
+        // Prompt must remain the trailing argv slot (issue #236 contract).
+        assert!(cmd.ends_with("'sys\n\nusr'"), "prompt not last: {cmd}");
+    }
+
+    #[test]
+    fn build_state_command_threads_extra_args_for_claude_cli() {
+        // AC #2: same threading for claude-cli backend.
+        let cmd = build_state_command(
+            Backend::ClaudeCli,
+            "default",
+            "sys",
+            "usr",
+            &["--add-dir".to_string(), "/tmp/x".to_string()],
+            "state-id",
+        )
+        .expect("claude-cli command must build");
+        assert!(
+            cmd.contains("'--add-dir'") && cmd.contains("'/tmp/x'"),
+            "claude-cli argv missing extra_args tokens: {cmd}"
+        );
+    }
+
+    #[test]
+    fn build_state_command_threads_extra_args_for_ollama() {
+        // AC #2: same threading for ollama backend. Tokens land between
+        // `run <model>` and the trailing prompt slot.
+        let cmd = build_state_command(
+            Backend::Ollama,
+            "llama3",
+            "sys",
+            "usr",
+            &["--keepalive".to_string(), "10m".to_string()],
+            "state-id",
+        )
+        .expect("ollama command must build");
+        assert!(
+            cmd.contains("'--keepalive'") && cmd.contains("'10m'"),
+            "ollama argv missing extra_args tokens: {cmd}"
+        );
+        // The model token must come before the override tokens, which must
+        // come before the trailing prompt. Pin the order so a future
+        // refactor cannot silently move the prompt off the end.
+        let model_idx = cmd.find("'llama3'").expect("model present");
+        let keepalive_idx = cmd.find("'--keepalive'").expect("flag present");
+        assert!(
+            model_idx < keepalive_idx,
+            "extra_args must come after the model: {cmd}"
+        );
+        assert!(cmd.ends_with("'System: sys\n\nUser: usr'"));
+    }
+
+    #[test]
+    fn build_state_command_empty_extra_args_produces_clean_command() {
+        // AC #3: an empty extra_args slice must produce a valid command
+        // with no stray empty tokens (regression anchor: the pre-fix
+        // graph path passed &[] hard-coded, and the resulting command
+        // for that path is the byte-identical baseline we must preserve).
+        for backend in [Backend::ClaudeCli, Backend::Codex, Backend::Ollama] {
+            let with_empty = build_state_command(backend, "default", "sys", "usr", &[], "state-id")
+                .unwrap_or_else(|e| panic!("{backend:?} build failed: {e}"));
+            assert!(
+                !with_empty.contains("''"),
+                "{backend:?} command contains empty tokens: {with_empty}"
+            );
+            assert!(
+                !with_empty.contains("  "),
+                "{backend:?} command contains double spaces: {with_empty}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_state_command_rejects_api_backend() {
+        // The api backend has no argv to extend. The graph driver returns
+        // GraphRuntime for it; the refactor must preserve that contract.
+        let err = build_state_command(Backend::Api, "default", "sys", "usr", &[], "state-id")
+            .expect_err("api backend must error");
+        match err {
+            RunError::GraphRuntime { state, reason } => {
+                assert_eq!(state, "state-id");
+                assert!(reason.contains("api backend"));
+            }
+            other => panic!("expected GraphRuntime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_state_extra_args_state_replaces_agent() {
+        // AC #4: when both state-level and agent-level extra_args are set
+        // for the same backend, the state-level set replaces the agent's.
+        // Mirrors `step_extra_args_overrides_agent_extra_args` in the
+        // linear-runner config tests.
+        let agent = make_test_agent(
+            Backend::Codex,
+            &[(Backend::Codex, vec!["-c", "from_agent=true"])],
+        );
+        let state = make_state_with_extra(&[("codex", vec!["-c", "from_state=true"])]);
+        let resolved = resolve_state_extra_args(&state, &agent, Backend::Codex);
+        assert_eq!(
+            resolved,
+            vec!["-c".to_string(), "from_state=true".to_string()],
+            "state map must replace agent map when non-empty"
+        );
+    }
+
+    #[test]
+    fn resolve_state_extra_args_falls_back_to_agent_when_state_empty() {
+        // The cascade is replace-not-merge: an empty state map falls back
+        // to the agent map for the effective backend.
+        let agent = make_test_agent(Backend::Codex, &[(Backend::Codex, vec!["--from-agent"])]);
+        let state = make_state_with_extra(&[]);
+        let resolved = resolve_state_extra_args(&state, &agent, Backend::Codex);
+        assert_eq!(resolved, vec!["--from-agent".to_string()]);
+    }
+
+    #[test]
+    fn resolve_state_extra_args_state_non_empty_other_backend_clears() {
+        // Documented #236 intent: a non-empty state map fully replaces
+        // the agent map even when it has no entry for the effective
+        // backend -- the lookup yields empty, no tokens are added.
+        let agent = make_test_agent(
+            Backend::Codex,
+            &[(Backend::Codex, vec!["-c", "from_agent=true"])],
+        );
+        // State declares only claude-cli overrides; the effective backend
+        // (codex) lookup must miss and return empty -- not silently fall
+        // through to the agent's codex entry.
+        let state = make_state_with_extra(&[("claude-cli", vec!["--something"])]);
+        let resolved = resolve_state_extra_args(&state, &agent, Backend::Codex);
+        assert!(
+            resolved.is_empty(),
+            "non-empty state map with no match for effective backend must yield empty, got: {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_state_extra_args_both_empty_returns_empty() {
+        // Default case: nothing configured anywhere -> empty slice. This
+        // is the pre-fix byte-identical baseline for graph runs that
+        // never touch extra_args.
+        let agent = make_test_agent(Backend::Codex, &[]);
+        let state = make_state_with_extra(&[]);
+        let resolved = resolve_state_extra_args(&state, &agent, Backend::Codex);
+        assert!(resolved.is_empty());
     }
 
     #[test]

@@ -473,7 +473,52 @@ pub fn load_flow_any_from_str(contents: &str) -> Result<Flow, ConfigError> {
 pub fn load_graph_flow_from_str(contents: &str) -> Result<GraphFlow, ConfigError> {
     let raw: GraphFlow = serde_yaml::from_str(contents)?;
     validate_graph_flow(&raw)?;
+    validate_graph_state_extra_args(&raw)?;
     Ok(raw)
+}
+
+/// Validate the `extra_args` map on every [`GraphState`] in `g` (#356).
+///
+/// Two checks per state:
+/// 1. Non-empty `extra_args` is rejected on shell (`run:`), final
+///    (`final:`), and human (`human: true`) states. These shapes do not
+///    spawn the executor and the field would be silently ignored.
+///    Mirrors the linear-runner rejection of `extra_args` on shell and
+///    conversation steps in [`validate_and_resolve`].
+/// 2. Each backend key passes through [`validate_extra_args`], which
+///    rejects unknown backends and the `api` backend. The returned typed
+///    map is discarded -- the runtime re-resolves from the raw
+///    string-keyed form via `Backend::yaml_name`, so the typed result is
+///    only useful as an early error-feedback signal here.
+///
+/// Called by both YAML and Markdown loaders so the rejection is
+/// symmetric across on-disk formats.
+pub(crate) fn validate_graph_state_extra_args(g: &GraphFlow) -> Result<(), ConfigError> {
+    for (id, state) in &g.graph {
+        if state.extra_args.is_empty() {
+            continue;
+        }
+        if state.is_shell() {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' uses 'run:' and cannot set 'extra_args' -- shell states don't call an LLM"
+            )));
+        }
+        if state.is_final() {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' is 'final:' and cannot set 'extra_args' -- terminal states don't call an LLM"
+            )));
+        }
+        if state.is_human() {
+            return Err(ConfigError::Validation(format!(
+                "graph state '{id}' is 'human:' and cannot set 'extra_args' -- human-handoff states don't call an LLM"
+            )));
+        }
+        // Validate backend keys against the supported list. Discard the
+        // typed map: the runtime resolves entries from the raw map at
+        // call time so we don't need to thread two shapes through.
+        let _ = validate_extra_args(state.extra_args.clone(), &format!("graph state '{id}'"))?;
+    }
+    Ok(())
 }
 
 // --- External-prompt resolution (issue #258) ---
@@ -3528,6 +3573,230 @@ graph:
         let yaml = serde_yaml::to_string(&parsed).expect("serialize round-trip");
         let reparsed = load_graph_flow_from_str(&yaml).expect("re-parse round-trip");
         assert_eq!(parsed, reparsed);
+    }
+
+    // --- #356: per-state extra_args parsing + validation -----------------
+
+    #[test]
+    fn graph_state_extra_args_parses_per_backend() {
+        // Acceptance: a graph state may declare `extra_args:` keyed by
+        // backend. The parser keeps the raw string-keyed map; the runner
+        // resolves it via `Backend::yaml_name` at call time.
+        let yaml = r#"
+version: "1"
+name: with-extra
+initial: build
+graph:
+  build:
+    role: developer
+    task: "build it"
+    extra_args:
+      codex:
+        - "--add-dir"
+        - "/tmp/x"
+    next:
+      - done: "ship"
+      - rework: "fix"
+  rework:
+    role: developer
+    task: "fix it"
+    next:
+      - done: "second try"
+      - build: "back to build"
+  done:
+    final: "shipped"
+"#;
+        let flow = load_graph_flow_from_str(yaml).expect("graph with state extra_args must parse");
+        let build = &flow.graph["build"];
+        assert_eq!(
+            build.extra_args.get("codex"),
+            Some(&vec!["--add-dir".to_string(), "/tmp/x".to_string()])
+        );
+        // Other states default to an empty map (skip_serializing_if when
+        // empty, default-on-deserialize when absent).
+        assert!(flow.graph["rework"].extra_args.is_empty());
+    }
+
+    #[test]
+    fn graph_state_extra_args_rejects_unknown_backend() {
+        // Acceptance: unknown backend keys surface a validation error that
+        // names the state ID and lists the supported backends. Mirrors
+        // `unknown_backend_key_in_extra_args_is_rejected` for the
+        // linear-runner path.
+        let yaml = r#"
+version: "1"
+name: bad-backend
+initial: build
+graph:
+  build:
+    role: developer
+    task: "build it"
+    extra_args:
+      gpt-4: ["--flag"]
+    next:
+      - done: "ship"
+      - rework: "fix"
+  rework:
+    role: developer
+    task: "fix it"
+    next:
+      - done: "second try"
+      - build: "back to build"
+  done:
+    final: "shipped"
+"#;
+        let err = load_graph_flow_from_str(yaml).expect_err("unknown backend key must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("graph state 'build'"),
+            "error must name the offending state: {msg}"
+        );
+        assert!(
+            msg.contains("gpt-4"),
+            "error must name the offending key: {msg}"
+        );
+        assert!(
+            msg.contains("claude-cli") && msg.contains("codex") && msg.contains("ollama"),
+            "error must list valid backends: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_state_extra_args_rejected_on_shell_state() {
+        // Shell states (`run:`) and final states (`final:`) do not call
+        // an LLM, so `extra_args:` would be silently dropped at
+        // command-build time. Reject early -- mirror the linear-runner
+        // rejection on shell steps.
+        let yaml = r#"
+version: "1"
+name: bad-shell
+initial: verify
+graph:
+  verify:
+    run: "true"
+    extra_args:
+      codex: ["--add-dir", "/tmp/x"]
+    next:
+      - done: "pass"
+      - aborted: "fail"
+  done:
+    final: "shipped"
+  aborted:
+    final: "aborted"
+"#;
+        let err = load_graph_flow_from_str(yaml).expect_err("extra_args on shell state must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("graph state 'verify'") && msg.contains("extra_args"),
+            "shell rejection must name state and field: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_state_extra_args_rejected_on_final_state() {
+        let yaml = r#"
+version: "1"
+name: bad-final
+initial: build
+graph:
+  build:
+    role: developer
+    task: "build it"
+    next:
+      - done: "ship"
+      - rework: "fix"
+  rework:
+    role: developer
+    task: "fix it"
+    next:
+      - done: "second try"
+      - build: "back to build"
+  done:
+    final: "shipped"
+    extra_args:
+      codex: ["--add-dir", "/tmp/x"]
+"#;
+        let err = load_graph_flow_from_str(yaml).expect_err("extra_args on final state must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("graph state 'done'") && msg.contains("extra_args"),
+            "final rejection must name state and field: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_state_extra_args_rejected_on_human_state() {
+        let yaml = r#"
+version: "1"
+name: bad-human
+initial: ask
+graph:
+  ask:
+    human: true
+    extra_args:
+      codex: ["--add-dir", "/tmp/x"]
+    next:
+      - done: "go on"
+  done:
+    final: "shipped"
+"#;
+        let err = load_graph_flow_from_str(yaml).expect_err("extra_args on human state must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("graph state 'ask'") && msg.contains("extra_args"),
+            "human rejection must name state and field: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_state_extra_args_rejects_api_backend() {
+        // The api backend has no argv to extend; reject explicitly with
+        // the same wording as the agent/step paths.
+        let yaml = r#"
+version: "1"
+name: bad-api
+initial: build
+graph:
+  build:
+    role: developer
+    task: "build it"
+    extra_args:
+      api: ["--something"]
+    next:
+      - done: "ship"
+      - rework: "fix"
+  rework:
+    role: developer
+    task: "fix it"
+    next:
+      - done: "second try"
+      - build: "back to build"
+  done:
+    final: "shipped"
+"#;
+        let err = load_graph_flow_from_str(yaml).expect_err("api in extra_args must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("api") && msg.contains("graph state 'build'"),
+            "api rejection must mention backend and state: {msg}"
+        );
+    }
+
+    #[test]
+    fn graph_state_extra_args_empty_map_round_trips_clean() {
+        // Anchor for AC #5 / risk-register entry: a graph YAML with no
+        // `extra_args` on any state must round-trip with `extra_args`
+        // omitted from the serialized output (serde skip_serializing_if
+        // = HashMap::is_empty), so existing fixtures stay byte-equivalent.
+        let flow = load_graph_flow_from_str(GRAPH_CONFIG).unwrap();
+        for (_, state) in &flow.graph {
+            assert!(state.extra_args.is_empty(), "fixture must default to empty");
+        }
+        let yaml = serde_yaml::to_string(&flow).expect("serialize");
+        assert!(
+            !yaml.contains("extra_args"),
+            "round-tripped YAML must not emit extra_args when empty: {yaml}"
+        );
     }
 
     // --- Graph reachability + dead-end validator tests (issue #238) ---

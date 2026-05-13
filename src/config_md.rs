@@ -38,7 +38,7 @@
 
 use indexmap::IndexMap;
 
-use crate::config::ConfigError;
+use crate::config::{ConfigError, validate_graph_state_extra_args};
 use crate::core::{GraphFlow, GraphState, SelectEntry, SelectReason, Version, validate_graph_flow};
 
 /// Main entry point: parse a Markdown flow file into a [`GraphFlow`].
@@ -48,6 +48,11 @@ use crate::core::{GraphFlow, GraphState, SelectEntry, SelectReason, Version, val
 pub fn load_graph_flow_from_md(contents: &str) -> Result<GraphFlow, ConfigError> {
     let flow = parse_md_flow(contents)?;
     validate_graph_flow(&flow)?;
+    // The markdown surface has no syntax for per-state `extra_args:`
+    // today, but we run the validator anyway so any future MD-shape
+    // extension is checked through the same gate as the YAML loader.
+    // No-op while every parsed state has an empty `extra_args` map.
+    validate_graph_state_extra_args(&flow)?;
     Ok(flow)
 }
 
@@ -133,6 +138,7 @@ impl ParseState {
             final_desc: self.current_final.take(),
             human: None,
             select: transitions,
+            extra_args: std::collections::HashMap::new(),
         };
 
         if self.states.contains_key(&id) {

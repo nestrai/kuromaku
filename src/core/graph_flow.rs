@@ -8,6 +8,8 @@
 //! Dependency direction: `core` does not import from any parser. Parsers
 //! depend inward on `core`.
 
+use std::collections::HashMap;
+
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
@@ -143,6 +145,24 @@ pub struct GraphState {
     /// optional reason string. The YAML key is `next:`.
     #[serde(default, rename = "next", skip_serializing_if = "Option::is_none")]
     pub select: Option<Vec<SelectEntry>>,
+    /// Backend-keyed extra CLI arguments for this state (#356, mirrors
+    /// the linear-runner step-level field from #236). Same raw YAML
+    /// shape as `Step::extra_args` / `Agent::extra_args`: keys are
+    /// backend names (`claude-cli`, `codex`, `ollama`), values are
+    /// argv tokens spliced into the executor command at runtime.
+    ///
+    /// Stored in the string-keyed form (not `HashMap<Backend, ...>`)
+    /// to avoid pulling `crate::config::Backend` into the `core`
+    /// layer; the runner resolves entries via `Backend::yaml_name`.
+    /// Validation of the keys happens in the parser
+    /// (`crate::config::load_graph_flow_from_str`).
+    ///
+    /// Cascade with the agent-level `extra_args` is replace-not-merge,
+    /// matching `resolve_extra_args` in the linear runner: a non-empty
+    /// state map fully shadows the agent map, even if it has no entry
+    /// for the effective backend.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra_args: HashMap<String, Vec<String>>,
 }
 
 impl GraphState {
