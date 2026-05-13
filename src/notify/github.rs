@@ -467,6 +467,36 @@ pub fn format_human_input(comments: &[IssueComment], paused_at: &str) -> String 
     out
 }
 
+/// Render a single body of human input from a local source for on-disk
+/// persistence (issue #360).
+///
+/// Local sources -- `--message`, `--message-file <path>`, stdin -- emit
+/// one body with no author metadata, in contrast with [`format_human_input`]
+/// which folds N GitHub comments (with `@author at <ts>` headers) into the
+/// synthetic step. The header here names the *source* so the audit trail
+/// reads "Human input received since pause via --message" or "via stdin" --
+/// otherwise the on-disk body cannot tell a CLI-provided override from a
+/// GH comment. Keeps the `Human input received since pause at <ts>` lead
+/// line identical to the GH renderer so `kuro show-output` sees the same
+/// recognisable shape regardless of how the input arrived.
+///
+/// Empty input collapses to an empty string -- the caller decides whether
+/// to skip writing a synthetic step at all. Mirrors [`format_human_input`]'s
+/// behaviour so the two renderers share the same "empty is not an error"
+/// contract.
+pub fn format_local_human_input(body: &str, source: &str, paused_at: &str) -> String {
+    if body.is_empty() {
+        return String::new();
+    }
+    let mut out =
+        format!("Human input received since pause at {paused_at} (via {source}):\n\n---\n",);
+    out.push_str(body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
 /// Take the first `max_lines` non-empty lines and join them with `\n`.
 ///
 /// Issue bodies tend to start with a blank line or a heading; skipping empty
@@ -802,6 +832,48 @@ mod tests {
             &[comment("alice", "2026-05-07T10:30:00Z", raw)],
             "2026-05-07T10:00:00Z",
         );
+        assert!(s.contains(raw), "raw markdown not present in body: {s}");
+    }
+
+    // --- format_local_human_input (issue #360) ---
+
+    #[test]
+    fn format_local_human_input_empty_collapses_to_empty_string() {
+        // Parity with `format_human_input`: an empty body means "no input",
+        // and the caller decides whether to write a synthetic step at all.
+        assert!(format_local_human_input("", "--message", "2026-05-13T10:00:00Z").is_empty());
+    }
+
+    #[test]
+    fn format_local_human_input_renders_header_with_source() {
+        // The header must surface the source so an auditor reading the
+        // synthetic step can tell a CLI override from a GH comment.
+        let s = format_local_human_input("approve", "--message", "2026-05-13T10:00:00Z");
+        assert!(
+            s.contains("Human input received since pause at 2026-05-13T10:00:00Z (via --message)"),
+            "expected source in header, got: {s}"
+        );
+        // Body sits below the `---` separator, identical framing shape to
+        // the GH renderer so `kuro show-output` reads the same.
+        assert!(s.contains("\n---\n"), "expected `---` separator: {s}");
+        assert!(s.contains("approve"), "expected body verbatim: {s}");
+    }
+
+    #[test]
+    fn format_local_human_input_appends_trailing_newline_when_missing() {
+        // Mirrors `format_human_input`'s body normalisation so two writers
+        // never disagree on whether the persisted file ends with `\n`.
+        let s = format_local_human_input("no newline", "stdin", "2026-05-13T10:00:00Z");
+        assert!(s.ends_with('\n'), "expected trailing newline, got: {s:?}");
+    }
+
+    #[test]
+    fn format_local_human_input_preserves_markdown_verbatim() {
+        // Operators paste code fences and headings into `--message-file`;
+        // the body must round-trip untouched so the next agent reads
+        // exactly what the human wrote.
+        let raw = "### Decision\n\n```rust\nfn ok() {}\n```\n- bullet";
+        let s = format_local_human_input(raw, "--message-file feedback.md", "2026-05-13T10:00:00Z");
         assert!(s.contains(raw), "raw markdown not present in body: {s}");
     }
 

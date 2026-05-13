@@ -195,13 +195,29 @@ fn run_kuro(
     gh_dir: &Path,
     home_dir: &Path,
 ) -> std::process::Output {
+    run_kuro_with_id(project, flow, ollama_shim, gh_dir, home_dir, "139")
+}
+
+/// `run_kuro` parametrised over the `id` template var (issue #360).
+///
+/// Non-numeric ids (e.g. `local-only`) skip the GH-comments path on
+/// resume, so the local-input branch is exercised in isolation. Numeric
+/// ids preserve the legacy #340 behaviour.
+fn run_kuro_with_id(
+    project: &Path,
+    flow: &Path,
+    ollama_shim: &Path,
+    gh_dir: &Path,
+    home_dir: &Path,
+    id_var: &str,
+) -> std::process::Output {
     let bin = env!("CARGO_BIN_EXE_kuro");
     let host_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{host_path}", gh_dir.display());
     Command::new(bin)
         .args(["run", "--file"])
         .arg(flow)
-        .args(["--var", "id=139"])
+        .args(["--var", &format!("id={id_var}")])
         .current_dir(project)
         .env("HOME", home_dir)
         .env("OLLAMA_PATH", ollama_shim)
@@ -220,18 +236,64 @@ fn resume_kuro(
     gh_dir: &Path,
     home_dir: &Path,
 ) -> std::process::Output {
+    spawn_resume(project, run_id, ollama_shim, gh_dir, home_dir, &[], None)
+}
+
+/// `resume_kuro` with extra args appended after `<run-id>` and an
+/// optional stdin payload (issue #360).
+///
+/// `extra_args` carries flags like `["--message", "approve"]`; `stdin_in`
+/// pipes a body in when provided. The test seam is in [`spawn_resume`]
+/// so the existing GH-only tests stay readable and the local-input
+/// tests do not have to copy the env wiring.
+fn spawn_resume(
+    project: &Path,
+    run_id: &str,
+    ollama_shim: &Path,
+    gh_dir: &Path,
+    home_dir: &Path,
+    extra_args: &[&str],
+    stdin_in: Option<&str>,
+) -> std::process::Output {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
     let bin = env!("CARGO_BIN_EXE_kuro");
     let host_path = std::env::var("PATH").unwrap_or_default();
     let path = format!("{}:{host_path}", gh_dir.display());
-    Command::new(bin)
-        .args(["resume", run_id])
+    let mut cmd = Command::new(bin);
+    cmd.args(["resume", run_id])
+        .args(extra_args)
         .current_dir(project)
         .env("HOME", home_dir)
         .env("OLLAMA_PATH", ollama_shim)
         .env("PATH", path)
-        .env_remove("RUST_LOG")
-        .output()
-        .expect("spawn kuro resume")
+        .env_remove("RUST_LOG");
+
+    // Pipe stdin when the test provides a body; otherwise close stdin
+    // (Stdio::null) so the binary's non-TTY-stdin path observes EOF
+    // rather than inheriting the test runner's stdin, which on some CI
+    // setups can stall the read.
+    cmd.stdin(if stdin_in.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    });
+
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn kuro resume");
+    if let Some(body) = stdin_in {
+        let mut stdin_handle = child.stdin.take().expect("stdin piped");
+        stdin_handle
+            .write_all(body.as_bytes())
+            .expect("write stdin body");
+        // Drop the handle to close stdin so the child sees EOF.
+        drop(stdin_handle);
+    }
+    child.wait_with_output().expect("wait kuro resume")
 }
 
 fn latest_run_dir(home: &Path, project_name: &str) -> PathBuf {
@@ -436,5 +498,345 @@ fn resume_with_no_new_comments_keeps_today_behavior() {
     assert!(
         !log.contains("Context from previous state 'ask'"),
         "reviewer prompt must NOT carry an `ask` prior_context block when no comments fired; got:\n{log}"
+    );
+}
+
+// --- #360: local human input (--message / stdin / hard error) ------------
+
+/// Phase 1 helper for the #360 tests: spin up a project pinned to a
+/// non-numeric `vars.id` so the GH-comments path on resume short-circuits.
+/// Returns the captured run_id.
+fn pause_run_with_non_numeric_id(
+    project: &tempfile::TempDir,
+    home: &tempfile::TempDir,
+    ollama_shim: &Path,
+    ollama_log: &Path,
+    gh_dir: &Path,
+) -> String {
+    let flow = write_flow(project.path());
+    let run_out = run_kuro_with_id(
+        project.path(),
+        &flow,
+        ollama_shim,
+        gh_dir,
+        home.path(),
+        "local-only",
+    );
+    assert!(
+        run_out.status.success(),
+        "phase 1 kuro run must succeed; status={:?}\nstdout={}\nstderr={}\nshim log:\n{}",
+        run_out.status,
+        String::from_utf8_lossy(&run_out.stdout),
+        String::from_utf8_lossy(&run_out.stderr),
+        std::fs::read_to_string(ollama_log).unwrap_or_default(),
+    );
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let run_dir = latest_run_dir(home.path(), &project_name);
+    let manifest = std::fs::read_to_string(run_dir.join("manifest.yaml")).unwrap();
+    assert!(
+        manifest.contains("paused_at_state: ask"),
+        "phase 1 must record paused_at_state: ask, got:\n{manifest}"
+    );
+    run_dir.file_name().unwrap().to_string_lossy().to_string()
+}
+
+/// Walk a run's `steps/` directory and return the on-disk body of the
+/// synthetic step that records the paused state's human input. Panics if
+/// no body file exists -- callers use this only on success paths.
+fn read_synthetic_human_body(home: &Path, project_name: &str, state_id: &str) -> String {
+    let stacks = home.join(".koto/stacks").join(project_name);
+    let run_dir = std::fs::read_dir(&stacks)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .max()
+        .expect("at least one run dir");
+    let steps_dir = run_dir.join("steps");
+    let suffix = format!("-{state_id}.md");
+    let body_path = std::fs::read_dir(&steps_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(&suffix))
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected a NN-{state_id}.md under {}",
+                steps_dir.display()
+            )
+        });
+    std::fs::read_to_string(body_path).unwrap()
+}
+
+#[test]
+fn resume_injects_message_flag_as_prior_context() {
+    // Acceptance criterion: `kuro resume <run-id> --message "..."` writes
+    // the body as a `kind: human` step and surfaces it to the next agent
+    // as prior_context. The flow's `vars.id` is non-numeric so the GH
+    // path short-circuits -- the only source of human input is --message.
+    let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let (_ollama_dir, ollama_shim, ollama_log) = install_ollama_shim();
+    // Benign gh shim -- non-numeric id means the runner never asks for
+    // comments, but having a working shim on PATH defends against
+    // accidental calls polluting the assertion.
+    let (_gh_dir, gh_shim) = install_gh_shim("[]", _ollama_dir.path());
+    let gh_dir = gh_shim.parent().unwrap();
+
+    let run_id =
+        pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
+
+    let resume_out = spawn_resume(
+        project.path(),
+        &run_id,
+        &ollama_shim,
+        gh_dir,
+        home.path(),
+        &["--message", "ship it"],
+        None,
+    );
+    assert!(
+        resume_out.status.success(),
+        "kuro resume --message must succeed; status={:?}\nstdout={}\nstderr={}\nollama log:\n{}",
+        resume_out.status,
+        String::from_utf8_lossy(&resume_out.stdout),
+        String::from_utf8_lossy(&resume_out.stderr),
+        std::fs::read_to_string(&ollama_log).unwrap_or_default(),
+    );
+
+    // Synthetic body persisted with the documented header shape -- the
+    // `(via --message)` tag is the audit signal that distinguishes a
+    // local body from a GH-comment body.
+    let body = read_synthetic_human_body(home.path(), &project_name, "ask");
+    assert!(
+        body.contains("Human input received since pause"),
+        "synthetic body must use the documented header, got:\n{body}"
+    );
+    assert!(
+        body.contains("(via --message)"),
+        "synthetic body must surface the local source, got:\n{body}"
+    );
+    assert!(
+        body.contains("ship it"),
+        "synthetic body must carry the message verbatim, got:\n{body}"
+    );
+
+    // The reviewer's prompt carries the body via the standard
+    // prior_context header, identical to the GH path.
+    let log = std::fs::read_to_string(&ollama_log).unwrap_or_default();
+    assert!(
+        log.contains("ship it"),
+        "reviewer prompt must include the --message body; ollama log:\n{log}"
+    );
+    assert!(
+        log.contains("Context from previous state 'ask'"),
+        "reviewer prompt must use the standard prior_context header; ollama log:\n{log}"
+    );
+}
+
+#[test]
+fn resume_injects_stdin_as_prior_context() {
+    // Acceptance criterion: `echo "approve" | kuro resume <run-id>`
+    // delivers the piped body the same way `--message` does. The stdin
+    // path is the one operators reach for by default in shell pipelines,
+    // so it gets its own end-to-end assertion rather than only the
+    // resolver unit test.
+    let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let (_ollama_dir, ollama_shim, ollama_log) = install_ollama_shim();
+    let (_gh_dir, gh_shim) = install_gh_shim("[]", _ollama_dir.path());
+    let gh_dir = gh_shim.parent().unwrap();
+
+    let run_id =
+        pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
+
+    let resume_out = spawn_resume(
+        project.path(),
+        &run_id,
+        &ollama_shim,
+        gh_dir,
+        home.path(),
+        &[],
+        Some("approve\n"),
+    );
+    assert!(
+        resume_out.status.success(),
+        "kuro resume via stdin must succeed; status={:?}\nstdout={}\nstderr={}\nollama log:\n{}",
+        resume_out.status,
+        String::from_utf8_lossy(&resume_out.stdout),
+        String::from_utf8_lossy(&resume_out.stderr),
+        std::fs::read_to_string(&ollama_log).unwrap_or_default(),
+    );
+
+    let body = read_synthetic_human_body(home.path(), &project_name, "ask");
+    assert!(
+        body.contains("(via stdin)"),
+        "synthetic body must surface stdin as the source, got:\n{body}"
+    );
+    assert!(
+        body.contains("approve"),
+        "synthetic body must carry the stdin payload, got:\n{body}"
+    );
+
+    let log = std::fs::read_to_string(&ollama_log).unwrap_or_default();
+    assert!(
+        log.contains("approve"),
+        "reviewer prompt must include the stdin body; ollama log:\n{log}"
+    );
+    assert!(
+        log.contains("Context from previous state 'ask'"),
+        "reviewer prompt must carry the prior_context header; ollama log:\n{log}"
+    );
+}
+
+#[test]
+fn resume_errors_when_no_input_and_no_gh_source() {
+    // Acceptance criterion: with no `--message`, no piped stdin, and a
+    // non-numeric `vars.id`, the operator has no input channel -- the
+    // command must exit non-zero with an actionable hint, not silently
+    // route through `next[0]`.
+    let project = make_project();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let (_ollama_dir, ollama_shim, ollama_log) = install_ollama_shim();
+    let (_gh_dir, gh_shim) = install_gh_shim("[]", _ollama_dir.path());
+    let gh_dir = gh_shim.parent().unwrap();
+
+    let run_id =
+        pause_run_with_non_numeric_id(&project, &home, &ollama_shim, &ollama_log, gh_dir);
+
+    let resume_out = spawn_resume(
+        project.path(),
+        &run_id,
+        &ollama_shim,
+        gh_dir,
+        home.path(),
+        &[],
+        None, // closes stdin so the non-TTY-stdin path observes EOF
+    );
+    assert!(
+        !resume_out.status.success(),
+        "kuro resume with no input + non-numeric id must fail; status={:?}\nstdout={}",
+        resume_out.status,
+        String::from_utf8_lossy(&resume_out.stdout),
+    );
+    let stderr = String::from_utf8_lossy(&resume_out.stderr);
+    assert!(
+        stderr.contains("no human input provided"),
+        "stderr must explain the missing input, got:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("--message") && stderr.contains("stdin"),
+        "stderr must hint at the recovery paths, got:\n{stderr}"
+    );
+
+    // The reviewer state must NOT have been invoked -- the run aborts
+    // before routing past the human handoff.
+    let log = std::fs::read_to_string(&ollama_log).unwrap_or_default();
+    assert!(
+        !log.contains("state `review`"),
+        "reviewer must not run when resume aborts; ollama log:\n{log}"
+    );
+}
+
+#[test]
+fn resume_message_flag_wins_over_gh_comments() {
+    // Pins design decision B: with both a GH source (numeric `vars.id`
+    // + non-empty comments) AND a local `--message`, the local body
+    // becomes the synthetic step content and a `[warn]` surfaces the
+    // conflict on stderr. The acceptance criterion phrases this as
+    // "behaviour is unchanged when GH is the only source"; this test
+    // adds the converse case to lock the precedence rule.
+    let project = make_project();
+    let project_name = project
+        .path()
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let home = tempfile::tempdir().expect("home tempdir");
+    let (_ollama_dir, ollama_shim, _ollama_log) = install_ollama_shim();
+
+    // Phase 1: pause with numeric id=139 + empty pre-pause comments.
+    let (_gh_pre_dir, gh_pre_shim) = install_gh_shim("[]", _ollama_dir.path());
+    let gh_pre_dir = gh_pre_shim.parent().unwrap();
+    let flow = write_flow(project.path());
+    let run_out = run_kuro(project.path(), &flow, &ollama_shim, gh_pre_dir, home.path());
+    assert!(
+        run_out.status.success(),
+        "phase 1 kuro run must succeed; stderr={}",
+        String::from_utf8_lossy(&run_out.stderr),
+    );
+    let run_dir = latest_run_dir(home.path(), &project_name);
+    let run_id = run_dir.file_name().unwrap().to_string_lossy().to_string();
+
+    // Phase 2: gh shim now returns a post-pause comment AND we pass
+    // --message. Local must win.
+    let comments_json = r#"[
+      {"author": {"login": "human-reviewer"},
+       "createdAt": "2099-01-01T00:00:00Z",
+       "body": "GH_COMMENT_BODY"}
+    ]"#;
+    let (_gh_post_dir, gh_post_shim) = install_gh_shim(comments_json, _ollama_dir.path());
+    let gh_post_dir = gh_post_shim.parent().unwrap();
+
+    let resume_out = spawn_resume(
+        project.path(),
+        &run_id,
+        &ollama_shim,
+        gh_post_dir,
+        home.path(),
+        &["--message", "override-body"],
+        None,
+    );
+    assert!(
+        resume_out.status.success(),
+        "resume must succeed in conflict case; stderr={}",
+        String::from_utf8_lossy(&resume_out.stderr),
+    );
+
+    // Local body wins -- GH body must not appear in the synthetic step.
+    let body = read_synthetic_human_body(home.path(), &project_name, "ask");
+    assert!(
+        body.contains("override-body"),
+        "synthetic body must carry local --message verbatim, got:\n{body}"
+    );
+    assert!(
+        !body.contains("GH_COMMENT_BODY"),
+        "synthetic body must NOT carry GH comment when --message is set, got:\n{body}"
+    );
+    assert!(
+        body.contains("(via --message)"),
+        "synthetic body must surface the local source, got:\n{body}"
+    );
+
+    // The `[warn]` line names the conflict on stderr so the operator
+    // sees that GH comments were available but ignored.
+    let stderr = String::from_utf8_lossy(&resume_out.stderr);
+    assert!(
+        stderr.contains("[warn]")
+            && stderr.contains("local input")
+            && stderr.contains("GitHub comments"),
+        "stderr must surface the local-vs-GH conflict warning, got:\n{stderr}"
     );
 }

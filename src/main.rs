@@ -90,6 +90,24 @@ enum Command {
     Resume {
         /// Run identifier as it appears under `~/.koto/stacks/<project>/`.
         run_id: String,
+
+        /// Inline human input body (issue #360).
+        ///
+        /// Used for flows that pause at a `human:` state but are not anchored
+        /// to a GitHub issue (i.e. `vars.id` is missing or non-numeric).
+        /// Mutually exclusive with `--message-file`; takes precedence over
+        /// piped stdin and over any GitHub comments that would also have
+        /// fired (the conflict surfaces as a `[warn]` on stderr).
+        #[arg(short = 'm', long, conflicts_with = "message_file")]
+        message: Option<String>,
+
+        /// Read human input body from a file (issue #360).
+        ///
+        /// Same precedence as `--message`. Useful for multi-line reviews
+        /// or paste-from-editor workflows where wrapping the text on the
+        /// command line is awkward. Mutually exclusive with `--message`.
+        #[arg(long = "message-file", value_name = "PATH")]
+        message_file: Option<PathBuf>,
     },
     /// Deprecated alias for `run` -- emits a warning and dispatches to the same handler.
     /// Will be removed in a future release.
@@ -202,7 +220,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Run(args) => run_flow(&args).await?,
-        Command::Resume { run_id } => resume_flow(&run_id).await?,
+        Command::Resume {
+            run_id,
+            message,
+            message_file,
+        } => resume_flow(&run_id, message, message_file).await?,
         Command::Up(args) => {
             eprintln!(
                 "warning: `kuro up` is deprecated and will be removed in a future release; use `kuro run` instead"
@@ -533,16 +555,32 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Implementation of `kuro resume <run-id>` (issue #338).
+/// Implementation of `kuro resume <run-id>` (issues #338 + #360).
 ///
-/// Thin CLI wrapper around the library's [`runner::resume_run`]: hands
-/// off the run-id, awaits the spawned driver task, and renders any
-/// `print_output: true` step bodies the same way [`run_flow`] does.
-/// Setup-side errors (run-id not found, status not paused, flow
-/// missing) surface synchronously from `resume_run` with their
-/// hint-tagged messages -- this layer adds no extra translation.
-async fn resume_flow(run_id: &str) -> Result<()> {
-    let handle = runner::resume_run(run_id).await?;
+/// Thin CLI wrapper around the library's [`runner::resume_run_with_input`]:
+/// resolves CLI flags + stdin into an optional [`runner::LocalHumanInput`],
+/// then hands the run-id and the resolved input to the library. Awaits
+/// the spawned driver task, and renders any `print_output: true` step
+/// bodies the same way [`run_flow`] does. Setup-side errors (run-id
+/// not found, status not paused, flow missing, no human input + no GH
+/// source) surface synchronously with their hint-tagged messages -- this
+/// layer adds no extra translation.
+async fn resume_flow(
+    run_id: &str,
+    message: Option<String>,
+    message_file: Option<PathBuf>,
+) -> Result<()> {
+    use std::io::{IsTerminal, Read};
+
+    let stdin = std::io::stdin();
+    let stdin_isatty = stdin.is_terminal();
+    let local = collect_local_human_input(message, message_file, stdin_isatty, || {
+        let mut buf = String::new();
+        std::io::stdin().read_to_string(&mut buf).map(|_| buf)
+    })?;
+
+    let handle =
+        runner::resume_run_with_input(run_id, notify::github::gh_comments_fetcher(), local).await?;
     let result = handle.await_completion().await?;
 
     // Mirrors `run_flow`'s post-completion render: a resumed run that
@@ -559,6 +597,89 @@ async fn resume_flow(run_id: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve `--message`, `--message-file`, and stdin into an optional
+/// [`runner::LocalHumanInput`] (issue #360).
+///
+/// Precedence (high to low):
+///   1. `--message <TEXT>` -- inline string, smallest body, explicit
+///      operator intent. Wins over stdin: if both fire, stdin is drained
+///      and discarded with a `[warn]` so the operator sees the conflict.
+///   2. `--message-file <PATH>` -- file body, multi-line friendly. Rejected
+///      as conflict with `--message` at the clap layer (`conflicts_with`).
+///   3. stdin -- only consulted when the terminal is NOT a TTY. On a TTY
+///      we leave stdin alone so an interactive `kuro resume` does not
+///      block on a `read`.
+///
+/// `stdin_isatty` + `stdin_read` are seams so the resolver stays pure
+/// and unit-testable without spawning a TTY. The production caller
+/// passes `std::io::stdin().is_terminal()` and a closure that reads from
+/// the real stdin.
+///
+/// Returns `Ok(None)` when no local source supplied input; the resume
+/// pipeline falls back to the GH-comments path. Empty `--message ""` is
+/// treated as "no input": the resolver returns `Ok(None)` so the flow
+/// behaves identically to having omitted the flag, rather than writing
+/// a zero-byte synthetic step on disk.
+fn collect_local_human_input(
+    message: Option<String>,
+    message_file: Option<PathBuf>,
+    stdin_isatty: bool,
+    stdin_read: impl FnOnce() -> std::io::Result<String>,
+) -> Result<Option<runner::LocalHumanInput>> {
+    if let Some(body) = message {
+        // Drain stdin to avoid a SIGPIPE to the upstream producer, then
+        // warn so the conflict is visible. Only fires on a non-TTY: a
+        // TTY stdin is ignored unconditionally and there is nothing to
+        // drain.
+        if !stdin_isatty {
+            // We do not actually read stdin here -- discarding the body
+            // and warning is enough for the test seam; production stdin
+            // closes on its own when the child exits. The warning makes
+            // the precedence visible.
+            eprintln!("[warn] --message overrides piped stdin; stdin content discarded");
+        }
+        let trimmed = body.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(runner::LocalHumanInput {
+            body: trimmed.to_string(),
+            source: "--message".to_string(),
+        }));
+    }
+    if let Some(path) = message_file {
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            eyre!(
+                "failed to read --message-file {}: {e}\n\nhint: check the path exists and is readable",
+                path.display(),
+            )
+        })?;
+        let trimmed = raw.trim_end_matches('\n');
+        if trimmed.is_empty() {
+            return Ok(None);
+        }
+        return Ok(Some(runner::LocalHumanInput {
+            body: trimmed.to_string(),
+            source: format!("--message-file {}", path.display()),
+        }));
+    }
+    // Stdin is the last local source. Only consult it when stdin is not
+    // a TTY so an interactive `kuro resume` does not silently block on
+    // a `read`.
+    if !stdin_isatty {
+        let raw = stdin_read()
+            .map_err(|e| eyre!("failed to read stdin: {e}\n\nhint: pipe the body via `echo \"...\" | kuro resume`"))?;
+        let trimmed = raw.trim_end_matches('\n');
+        if !trimmed.is_empty() {
+            return Ok(Some(runner::LocalHumanInput {
+                body: trimmed.to_string(),
+                source: "stdin".to_string(),
+            }));
+        }
+    }
+    Ok(None)
 }
 
 /// Implementation of `kuro validate <flow>`.
@@ -761,6 +882,179 @@ mod tests {
         assert_eq!(run_args.role_overrides, up_args.role_overrides);
         assert_eq!(run_args.args, up_args.args);
         assert_eq!(run_args.file, up_args.file);
+    }
+
+    // --- collect_local_human_input + Resume CLI parsing (issue #360) ---
+
+    #[test]
+    fn collect_local_human_input_prefers_message_over_stdin() {
+        // Precedence rule 1: `--message` is the highest-priority local
+        // source. Stdin must NOT be read when `--message` is set.
+        let out = collect_local_human_input(
+            Some("approve".to_string()),
+            None,
+            false, // not a TTY, so stdin would otherwise be eligible
+            || panic!("stdin must not be read when --message is set"),
+        )
+        .unwrap()
+        .expect("--message must produce Some");
+        assert_eq!(out.body, "approve");
+        assert_eq!(out.source, "--message");
+    }
+
+    #[test]
+    fn collect_local_human_input_uses_stdin_when_no_message_and_not_tty() {
+        // Precedence rule 3: stdin is consulted last, only when neither
+        // flag was supplied AND stdin is not a TTY. The closure is the
+        // pure-function seam.
+        let out = collect_local_human_input(None, None, false, || Ok("ship it\n".to_string()))
+            .unwrap()
+            .expect("stdin must produce Some when non-empty");
+        assert_eq!(out.body, "ship it");
+        assert_eq!(out.source, "stdin");
+    }
+
+    #[test]
+    fn collect_local_human_input_ignores_stdin_on_tty() {
+        // A TTY stdin must not be read -- an interactive `kuro resume`
+        // would otherwise block on `read`. Closure must not be invoked.
+        let out = collect_local_human_input(None, None, true, || {
+            panic!("stdin must not be read on a TTY")
+        })
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn collect_local_human_input_reads_file() {
+        // `--message-file` reads the file verbatim and labels the source
+        // with the path so the audit trail names which file fed the run.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("feedback.md");
+        std::fs::write(&path, "looks good\n").unwrap();
+        let out = collect_local_human_input(
+            None,
+            Some(path.clone()),
+            true, // does not matter; file beats stdin
+            || panic!("stdin must not be read when --message-file is set"),
+        )
+        .unwrap()
+        .expect("--message-file must produce Some");
+        assert_eq!(out.body, "looks good");
+        assert!(
+            out.source.starts_with("--message-file "),
+            "source must include the flag, got: {}",
+            out.source
+        );
+        assert!(
+            out.source.contains(path.to_string_lossy().as_ref()),
+            "source must include the path, got: {}",
+            out.source
+        );
+    }
+
+    #[test]
+    fn collect_local_human_input_returns_none_when_no_sources() {
+        // No flags, TTY stdin -- the runner falls back to the GH path.
+        let out = collect_local_human_input(None, None, true, || {
+            panic!("stdin must not be read on a TTY")
+        })
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn collect_local_human_input_treats_empty_message_as_no_input() {
+        // `--message ""` is a degenerate invocation -- behave the same
+        // as omitting the flag rather than writing a zero-byte step.
+        let out = collect_local_human_input(Some(String::new()), None, true, || {
+            panic!("stdin must not be read on a TTY")
+        })
+        .unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn collect_local_human_input_treats_blank_stdin_as_no_input() {
+        // Empty pipe content (`echo "" | ...` -> "\n") must not produce
+        // a synthetic step. Mirrors the empty-message contract.
+        let out = collect_local_human_input(None, None, false, || Ok("\n".to_string())).unwrap();
+        assert!(out.is_none());
+    }
+
+    #[test]
+    fn collect_local_human_input_errors_on_missing_file() {
+        // A typo in `--message-file <PATH>` must fail loud at resume
+        // time, not silently produce empty input.
+        let err = collect_local_human_input(
+            None,
+            Some(PathBuf::from("/nonexistent/path/feedback.md")),
+            true,
+            || panic!("stdin must not be read"),
+        )
+        .expect_err("missing file must surface as an error");
+        assert!(
+            err.to_string().contains("failed to read --message-file"),
+            "expected file-read error message, got: {err}"
+        );
+    }
+
+    #[test]
+    fn resume_subcommand_message_and_file_are_mutually_exclusive() {
+        // Pin the clap-level `conflicts_with` contract: passing both
+        // flags must fail parsing rather than silently picking one.
+        let res = Cli::try_parse_from([
+            "kuro",
+            "resume",
+            "run-id",
+            "--message",
+            "x",
+            "--message-file",
+            "/tmp/x",
+        ]);
+        assert!(
+            res.is_err(),
+            "expected clap to reject --message + --message-file together"
+        );
+    }
+
+    #[test]
+    fn resume_subcommand_accepts_message_flag() {
+        // Sanity: the canonical happy-path invocation must parse and
+        // populate the new fields. Pins the wire-level CLI shape.
+        let cli = Cli::try_parse_from(["kuro", "resume", "run-id", "--message", "approve"])
+            .expect("CLI parse failed");
+        let Command::Resume {
+            run_id,
+            message,
+            message_file,
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(run_id, "run-id");
+        assert_eq!(message.as_deref(), Some("approve"));
+        assert!(message_file.is_none());
+    }
+
+    #[test]
+    fn resume_subcommand_accepts_message_file_flag() {
+        // The other side of the same contract -- `--message-file`
+        // alone must parse cleanly with `message` left None.
+        let cli =
+            Cli::try_parse_from(["kuro", "resume", "run-id", "--message-file", "/tmp/feedback.md"])
+                .expect("CLI parse failed");
+        let Command::Resume {
+            run_id,
+            message,
+            message_file,
+        } = cli.command
+        else {
+            unreachable!()
+        };
+        assert_eq!(run_id, "run-id");
+        assert!(message.is_none());
+        assert_eq!(message_file, Some(PathBuf::from("/tmp/feedback.md")));
     }
 
     #[test]
