@@ -9,6 +9,17 @@ Repo: `nestrai/kuromaku` on GitHub.
 
 Legacy naming: the config directory is `.kuro/` (formerly `.koto/`). Both names appear in the codebase.
 
+## Session start: discover the seed cascade
+
+Run `kuro context` once at the start of any session in a kuromaku-managed repo. This prints the resolved seed cascade -- which seeds are active, which agents/rules/flows each one contributes, and which version wins after conflict resolution.
+
+```
+kuro context                 # human-readable inventory
+kuro context --format json   # stable v1 wire format for AI clients
+```
+
+Do NOT invent new agents or rules without checking whether the cascade already provides them. The kuromaku ecosystem is built around reuse across seeds; duplicating agents here defeats that. If `kuro context` is unavailable (older binary, kuro not on PATH), read each seed's root `SEED.md` directly -- those summarise what the seed offers.
+
 ## Build
 
 Requires Rust stable (see `rust-toolchain.toml`). Optionally use `nix develop` for a pinned toolchain.

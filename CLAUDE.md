@@ -4,6 +4,10 @@
 
 kuromaku is a CLI tool for reproducible AI agent teams with persistent shared state. Define your team in a YAML file (`.kuro/config.yaml`), run `kuro run`. The binary is `kuro`; the project name is `kuromaku` (kubernetes/kubectl pattern).
 
+## Session start: discover the seed cascade
+
+In any kuromaku-managed repo, run `kuro context` once at the start of a session. It prints the resolved seed cascade with the agents, rules and flows already available so you do not duplicate things that exist in seeds. `--format json` is the stable v1 wire format if you want to embed the inventory in your working memory. See `.kuro/SEED.md` (when present) for a short per-seed summary of what each seed contributes.
+
 ## Language and tooling
 
 - **Language:** Rust (edition 2024, stable toolchain)
