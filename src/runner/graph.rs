@@ -119,6 +119,66 @@ fn unknown_edge_retry_note(picked: &str, allowed: &[String]) -> String {
     )
 }
 
+/// What the graph driver does when it reaches a `human: true` state
+/// mid-run (issue #361).
+///
+/// Today's default -- `Pause` -- returns [`GraphRunOutcome::Paused`] so
+/// the caller records `status: paused` and the operator separately runs
+/// `kuro resume <run-id>`. `Inline` -- set by [`super::execute_flow`]
+/// when stdin and stdout are both TTYs and `--no-interactive` was not
+/// passed -- opens an inline prompt, reads the operator's body from
+/// stdin, writes the same synthetic `kind: human` step record the
+/// resume path writes (issues #340 + #360), and walks the first
+/// declared `next:` entry in the same process. The two arms produce
+/// byte-identical on-disk artefacts so a downstream auditor cannot tell
+/// whether the run was inline or resumed.
+///
+/// The reader is a boxed trait object so the inline arm is testable
+/// without allocating a real TTY: a unit test passes a fake reader that
+/// returns canned input, and the driver runs end-to-end against a
+/// tempdir-backed stack. Production wires
+/// [`super::StdinInteractiveReader`].
+pub enum HumanHandoffPolicy {
+    /// Suspend at the human state. Caller records the manifest's
+    /// `status: paused` block. Default whenever stdin/stdout are not
+    /// both TTYs, or when `--no-interactive` was passed.
+    Pause,
+    /// Prompt inline, capture the operator's body, write a synthetic
+    /// `kind: human` step record on disk, advance via `next[0]` in the
+    /// same process. The reader abstracts stdin so unit tests can drive
+    /// the inline arm without a TTY.
+    Inline {
+        /// Boxed so the trait is dyn-compatible (the driver mutates the
+        /// reader via `&mut self` across `await` points).
+        input: Box<dyn HumanInputReader>,
+    },
+}
+
+/// Source of inline human input for the [`HumanHandoffPolicy::Inline`]
+/// arm of [`run_graph_flow`] (issue #361).
+///
+/// `read` renders the prompt to stderr and blocks until the operator
+/// submits a body. The terminator is implementation-defined; the
+/// production reader treats a blank line OR Ctrl-D (EOF) as the end of
+/// input. An empty body is legal -- the caller will then write no
+/// synthetic step on disk, mirroring `kuro resume`'s "empty input is
+/// not an error" contract (#340).
+///
+/// `allowed_targets` carries the IDs of the state's `next:` entries so
+/// the prompt can list the operator's onward choices. v1 always routes
+/// through `next[0]` regardless of input content; the parameter is on
+/// the trait surface today so a future issue that adds token-based
+/// routing can use it without a signature change.
+#[async_trait::async_trait]
+pub trait HumanInputReader: Send {
+    async fn read(
+        &mut self,
+        state_id: &str,
+        task: Option<&str>,
+        allowed_targets: &[String],
+    ) -> std::io::Result<String>;
+}
+
 /// Lifecycle outcome of a graph-flow run.
 ///
 /// Pause is not an error -- a `human: true` state suspends the run so a
@@ -203,6 +263,7 @@ pub async fn run_graph_flow(
     state_to_agent: &HashMap<String, String>,
     ctx: &RunContext,
     resume: Option<ResumeFrom>,
+    mut policy: HumanHandoffPolicy,
 ) -> Result<GraphRunOutcome, RunError> {
     // Announce dispatch into the graph runtime on stderr so callers and
     // tests can confirm we did not silently fall through to the linear
@@ -324,13 +385,109 @@ pub async fn run_graph_flow(
                 current = next_state;
                 continue;
             }
-            let paused_at = chrono::Utc::now();
-            ui::print_graph_paused(&current);
-            return Ok(GraphRunOutcome::Paused {
-                steps: results,
-                paused_at_state: current,
-                paused_at,
-            });
+            // Pause vs inline split (issue #361). The default `Pause`
+            // arm preserves today's contract byte-for-byte: emit the
+            // pause banner and return `GraphRunOutcome::Paused` so the
+            // caller records `status: paused` and the operator runs
+            // `kuro resume` separately. The `Inline` arm -- only
+            // reached when execute_flow sees a TTY and the operator
+            // did not pass `--no-interactive` -- reads the body
+            // inline, writes the same synthetic `kind: human` step
+            // record the resume path writes (#340 + #360), and walks
+            // through the first declared `next:` entry. AC4 requires
+            // byte-identical on-disk artefacts between the two paths,
+            // so both arms route through `synthesize_human_step_from_local`.
+            match &mut policy {
+                HumanHandoffPolicy::Pause => {
+                    let paused_at = chrono::Utc::now();
+                    ui::print_graph_paused(&current);
+                    return Ok(GraphRunOutcome::Paused {
+                        steps: results,
+                        paused_at_state: current,
+                        paused_at,
+                    });
+                }
+                HumanHandoffPolicy::Inline { input } => {
+                    // Resolve the onward target up front so the reader
+                    // can show the operator what their input is
+                    // gating. v1 always picks `next[0]` regardless of
+                    // input content; token-routing is explicitly out
+                    // of scope for #361 (see the issue's OUT block).
+                    let allowed_targets: Vec<String> = state
+                        .select
+                        .as_ref()
+                        .map(|es| es.iter().map(|e| e.target.clone()).collect())
+                        .unwrap_or_default();
+                    let advance = state
+                        .select
+                        .as_ref()
+                        .and_then(|s| s.first())
+                        .ok_or_else(|| RunError::GraphRuntime {
+                            state: current.clone(),
+                            reason: format!(
+                                "human state '{current}' has no `next:` entries; cannot advance from inline handoff -- declare at least one outgoing edge"
+                            ),
+                        })?;
+                    let next_state = advance.target.clone();
+
+                    let body = input
+                        .read(&current, state.task.as_deref(), &allowed_targets)
+                        .await
+                        .map_err(|e| RunError::GraphRuntime {
+                            state: current.clone(),
+                            reason: format!("failed to read inline human input: {e}"),
+                        })?;
+
+                    // The synthetic step's `started_at` is "now"
+                    // rather than a pause-start time -- there is no
+                    // pause in the inline path. `format_local_human_input`
+                    // still uses the "Human input received since pause
+                    // at <ts>" header so AC4's byte-equivalence with
+                    // the resume path holds; the only intentional
+                    // drift is the timestamp value itself, which
+                    // names when the operator submitted the body.
+                    let now = chrono::Utc::now().to_rfc3339();
+                    let local = super::flow_api::LocalHumanInput {
+                        body: body.trim_end_matches('\n').to_string(),
+                        source: "stdin (interactive)".to_string(),
+                    };
+                    let synthetic_step_num = step_num + 1;
+                    if let Some((rec, formatted)) =
+                        super::flow_api::synthesize_human_step_from_local(
+                            synthetic_step_num,
+                            &current,
+                            &now,
+                            &local,
+                        )
+                    {
+                        stack::write_run_step(&ctx.run_path, synthetic_step_num, &rec, &formatted)
+                            .map_err(|e| RunError::Stack {
+                                step: current.clone(),
+                                source: e,
+                            })?;
+                        // Route the next agent's prior_context to the
+                        // synthetic record. Its `step_id == current`,
+                        // so the next state's `read_run_step_content`
+                        // lookup resolves to this body.
+                        prior_state = Some(current.clone());
+                        step_num = synthetic_step_num;
+                    } else {
+                        // Empty body collapses to no synthetic record;
+                        // the next agent runs without prior_context,
+                        // mirroring #340's "empty input is not an
+                        // error" contract.
+                        prior_state = None;
+                    }
+
+                    ui::print_graph_transition(
+                        &advance.target,
+                        &next_state,
+                        "inline handoff -- operator input recorded",
+                    );
+                    current = next_state;
+                    continue;
+                }
+            }
         }
 
         // Non-terminal state must have select entries.
@@ -1640,9 +1797,16 @@ mod tests {
         let state_to_agent: HashMap<String, String> = HashMap::new();
 
         let before = chrono::Utc::now();
-        let outcome = run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx, None)
-            .await
-            .expect("pause must be Ok, not Err");
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            None,
+            HumanHandoffPolicy::Pause,
+        )
+        .await
+        .expect("pause must be Ok, not Err");
         let after = chrono::Utc::now();
 
         match outcome {
@@ -1691,9 +1855,16 @@ mod tests {
         let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
         let state_to_agent: HashMap<String, String> = HashMap::new();
 
-        run_graph_flow(&flow, &agents_by_id, &state_to_agent, &ctx, None)
-            .await
-            .expect("pause must succeed");
+        run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            None,
+            HumanHandoffPolicy::Pause,
+        )
+        .await
+        .expect("pause must succeed");
 
         // The driver always initialises `<run>/steps/`. Assert the
         // directory exists but holds no per-step files for the human
@@ -1784,6 +1955,7 @@ mod tests {
                 step_num_offset: 0,
                 human_input_step_id: None,
             }),
+            HumanHandoffPolicy::Pause,
         )
         .await
         .expect("resume from human state must succeed");
@@ -1839,6 +2011,7 @@ mod tests {
                 step_num_offset: 0,
                 human_input_step_id: None,
             }),
+            HumanHandoffPolicy::Pause,
         )
         .await;
 
@@ -1912,6 +2085,7 @@ mod tests {
                 step_num_offset: 0,
                 human_input_step_id: None,
             }),
+            HumanHandoffPolicy::Pause,
         )
         .await
         .expect("resume into a final state must terminate cleanly");
@@ -2069,6 +2243,7 @@ mod tests {
                 step_num_offset: 1,
                 human_input_step_id: Some("ask".to_string()),
             }),
+            HumanHandoffPolicy::Pause,
         )
         .await
         .expect("resume with synthetic human step must succeed");
@@ -2128,6 +2303,7 @@ mod tests {
                 step_num_offset: 0,
                 human_input_step_id: None,
             }),
+            HumanHandoffPolicy::Pause,
         )
         .await
         .expect("resume with no synthetic step must succeed cleanly");
@@ -2280,6 +2456,7 @@ mod tests {
                 step_num_offset: 1,
                 human_input_step_id: Some("ask".to_string()),
             }),
+            HumanHandoffPolicy::Pause,
         )
         .await
         .expect("two-shell resume must complete");
@@ -2297,6 +2474,333 @@ mod tests {
                     } => format!("Paused({paused_at_state})"),
                 }
             ),
+        }
+    }
+
+    // --- Inline human-handoff driver tests (issue #361) -----------------
+    //
+    // Exercise the `HumanHandoffPolicy::Inline` arm against a stub
+    // reader so the driver-side contract (write synthetic step, route
+    // prior_state, advance via next[0]) is pinned without spinning up
+    // a real TTY. The integration test in `tests/inline_human.rs`
+    // covers the end-to-end shape including the production
+    // StdinInteractiveReader.
+
+    /// Stub reader that returns a canned body on the first call and
+    /// panics on any subsequent call -- the driver must only read once
+    /// per human-state visit, so re-entry is a bug.
+    struct StubReader {
+        body: String,
+        used: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl HumanInputReader for StubReader {
+        async fn read(
+            &mut self,
+            _state_id: &str,
+            _task: Option<&str>,
+            _allowed_targets: &[String],
+        ) -> std::io::Result<String> {
+            assert!(!self.used, "stub reader must be called at most once");
+            self.used = true;
+            Ok(self.body.clone())
+        }
+    }
+
+    fn inline_flow_human_then_final() -> GraphFlow {
+        // Smallest valid inline flow: `initial: ask`, `ask: human ->
+        // next: done`, `done: final`. The driver reaches the human
+        // state on the first iteration; the inline arm writes the
+        // synthetic step and advances to `done`.
+        let mut graph: IndexMap<String, GraphState> = IndexMap::new();
+        graph.insert(
+            "ask".to_string(),
+            GraphState {
+                human: Some(true),
+                task: Some("review and respond".to_string()),
+                select: Some(vec![SelectEntry {
+                    target: "done".to_string(),
+                    reason: Some(SelectReason::Single("after human input".to_string())),
+                }]),
+                ..Default::default()
+            },
+        );
+        graph.insert(
+            "done".to_string(),
+            GraphState {
+                final_desc: Some("inline complete".to_string()),
+                ..Default::default()
+            },
+        );
+        GraphFlow {
+            name: "inline-test".to_string(),
+            initial: "ask".to_string(),
+            graph,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_human_writes_synthetic_step_and_advances() {
+        // Acceptance (#361 AC1 + AC4): the inline arm writes the same
+        // synthetic `kind: human` step record the resume path writes
+        // (#340/#360) and advances through `next[0]` in the same
+        // process. Assert the on-disk artefact carries the body and
+        // the documented header; the outcome is `Final("done")` --
+        // no separate `kuro resume` was needed.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "inline-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = inline_flow_human_then_final();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let reader = StubReader {
+            body: "approve everything".to_string(),
+            used: false,
+        };
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            None,
+            HumanHandoffPolicy::Inline {
+                input: Box::new(reader),
+            },
+        )
+        .await
+        .expect("inline arm must succeed with stub reader");
+
+        match outcome {
+            GraphRunOutcome::Final { final_state, .. } => {
+                assert_eq!(
+                    final_state, "done",
+                    "inline arm must walk past `ask` to `done` in one invocation"
+                );
+            }
+            GraphRunOutcome::Paused {
+                paused_at_state, ..
+            } => {
+                panic!("inline arm must NOT pause; got Paused({paused_at_state})")
+            }
+        }
+
+        // The synthetic step must land on disk at step_num=1
+        // (`01-ask.md`) -- no prior step incremented step_num before
+        // the human state. Its body carries the documented header AND
+        // the stub's body verbatim.
+        let body = stack::read_run_step_content(&ctx.run_path, "ask")
+            .expect("synthetic record must be readable via step_id `ask`");
+        assert!(
+            body.contains("Human input received since pause"),
+            "synthetic body must use the documented header; got:\n{body}"
+        );
+        assert!(
+            body.contains("(via stdin (interactive))"),
+            "synthetic body must surface the inline source; got:\n{body}"
+        );
+        assert!(
+            body.contains("approve everything"),
+            "synthetic body must carry the stub payload; got:\n{body}"
+        );
+    }
+
+    /// Stub reader that returns an empty body (the operator pressed
+    /// Ctrl-D immediately, or piped `< /dev/null`). The driver must
+    /// still advance -- empty input is not an error per #340.
+    struct EmptyReader;
+    #[async_trait::async_trait]
+    impl HumanInputReader for EmptyReader {
+        async fn read(
+            &mut self,
+            _state_id: &str,
+            _task: Option<&str>,
+            _allowed_targets: &[String],
+        ) -> std::io::Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn inline_human_empty_body_advances_without_synthetic_step() {
+        // Acceptance: empty input is not an error -- the driver
+        // advances to next[0] without writing a synthetic step on
+        // disk. Mirrors `kuro resume`'s empty-input contract from
+        // #340.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "inline-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = inline_flow_human_then_final();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            None,
+            HumanHandoffPolicy::Inline {
+                input: Box::new(EmptyReader),
+            },
+        )
+        .await
+        .expect("inline arm must succeed even with empty body");
+
+        match outcome {
+            GraphRunOutcome::Final { final_state, .. } => {
+                assert_eq!(final_state, "done");
+            }
+            other => panic!(
+                "expected Final(done) with empty body, got: {}",
+                match other {
+                    GraphRunOutcome::Final { final_state, .. } => format!("Final({final_state})"),
+                    GraphRunOutcome::Paused {
+                        paused_at_state, ..
+                    } => format!("Paused({paused_at_state})"),
+                }
+            ),
+        }
+
+        // No synthetic step on disk for the empty case.
+        let steps_dir = ctx.run_path.join(stack::STEPS_SUBDIR);
+        let entries: Vec<String> = std::fs::read_dir(&steps_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            entries.iter().all(|n| !n.ends_with("-ask.md")),
+            "empty inline body must NOT write a synthetic step; got: {entries:?}"
+        );
+    }
+
+    /// Stub reader that should never be invoked -- used to prove the
+    /// `Pause` policy keeps today's behaviour byte-for-byte.
+    struct NeverCalledReader;
+    #[async_trait::async_trait]
+    impl HumanInputReader for NeverCalledReader {
+        async fn read(
+            &mut self,
+            _state_id: &str,
+            _task: Option<&str>,
+            _allowed_targets: &[String],
+        ) -> std::io::Result<String> {
+            panic!("NeverCalledReader must not be called -- pause policy was active");
+        }
+    }
+
+    #[tokio::test]
+    async fn pause_policy_returns_paused_outcome_unchanged() {
+        // Acceptance (#361 AC5): the existing pause + resume code path
+        // is unchanged. Pin it explicitly so a future refactor that
+        // touches the inline arm cannot regress this contract by
+        // accident. Mirror of `human_state_returns_paused_outcome`
+        // above; the only difference is the explicit policy argument.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "human-pause-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        let flow = graph_flow_with_human_initial();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let outcome = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            None,
+            HumanHandoffPolicy::Pause,
+        )
+        .await
+        .expect("pause must be Ok");
+        match outcome {
+            GraphRunOutcome::Paused {
+                paused_at_state, ..
+            } => {
+                assert_eq!(paused_at_state, "ask");
+            }
+            GraphRunOutcome::Final { final_state, .. } => {
+                panic!("Pause policy must not advance; got Final({final_state})")
+            }
+        }
+
+        // Sanity: confirm the never-called reader stub is also
+        // dyn-compatible with the trait. If the trait gained a method
+        // that StubReader implements but NeverCalledReader does not,
+        // the build would fail here.
+        let _never: Box<dyn HumanInputReader> = Box::new(NeverCalledReader);
+    }
+
+    #[tokio::test]
+    async fn inline_human_no_next_entries_errors() {
+        // Defensive: a human state with no `next:` entries can't be
+        // advanced from. Pause arm would suspend forever; the inline
+        // arm must fail loud with a clear GraphRuntime error pointing
+        // at the offending state.
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = RunContext::new(
+            "inline-test".to_string(),
+            "test prompt".to_string(),
+            dir.path().to_path_buf(),
+            None,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        );
+        // Reuse the no-next-entries flow from the pause-arm fixture.
+        let flow = graph_flow_with_human_initial();
+        let agents_by_id: HashMap<String, crate::config::Agent> = HashMap::new();
+        let state_to_agent: HashMap<String, String> = HashMap::new();
+
+        let result = run_graph_flow(
+            &flow,
+            &agents_by_id,
+            &state_to_agent,
+            &ctx,
+            None,
+            HumanHandoffPolicy::Inline {
+                input: Box::new(StubReader {
+                    body: "irrelevant".to_string(),
+                    used: false,
+                }),
+            },
+        )
+        .await;
+
+        match result {
+            Err(RunError::GraphRuntime { state, reason }) => {
+                assert_eq!(state, "ask");
+                assert!(
+                    reason.contains("no `next:` entries"),
+                    "error must name the missing edges, got: {reason}"
+                );
+            }
+            Err(other) => panic!("expected GraphRuntime, got: {other:?}"),
+            Ok(_) => panic!("inline arm with no next: entries must Err"),
         }
     }
 }

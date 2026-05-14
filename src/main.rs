@@ -73,6 +73,18 @@ struct RunArgs {
     /// Path to the flow config file (overrides flow name lookup)
     #[arg(short, long)]
     file: Option<String>,
+
+    /// Force the non-interactive pause-and-exit path even on a TTY (issue #361).
+    ///
+    /// On a TTY the default is to prompt inline at `human:` states and
+    /// continue in the same process. Pass this flag in CI, scripts, or
+    /// any workflow that wants explicit two-step control through
+    /// `kuro resume <run-id>`. Non-TTY runs (piped stdout, captured
+    /// stdin) always behave as if this flag were set -- the flag exists
+    /// for the case where the operator is on a real terminal but still
+    /// wants the pause-and-resume contract.
+    #[arg(long = "no-interactive")]
+    no_interactive: bool,
 }
 
 #[derive(Subcommand)]
@@ -533,6 +545,7 @@ async fn run_flow(run_args: &RunArgs) -> Result<()> {
         role_overrides,
         bare_args,
         suppress_command_banner: false,
+        no_interactive: run_args.no_interactive,
     };
 
     let handle = runner::execute_flow(spec).await?;
@@ -842,6 +855,32 @@ mod tests {
             unreachable!()
         };
         assert_eq!(args.flow.as_deref(), Some("review-pr"));
+    }
+
+    #[test]
+    fn run_subcommand_accepts_no_interactive_flag() {
+        // Issue #361 AC3: `kuro run <flow> --no-interactive` must
+        // parse cleanly and surface `true` on `RunArgs::no_interactive`.
+        // Default (flag absent) is `false` so existing scripts keep
+        // their current behaviour.
+        let (cli, _) = parse_cli(&["kuro", "run", "review-pr", "--no-interactive"]);
+        let Command::Run(args) = cli.command else {
+            unreachable!()
+        };
+        assert!(
+            args.no_interactive,
+            "--no-interactive must flip the field to true"
+        );
+
+        // Default: absent flag is false.
+        let (cli, _) = parse_cli(&["kuro", "run", "review-pr"]);
+        let Command::Run(args) = cli.command else {
+            unreachable!()
+        };
+        assert!(
+            !args.no_interactive,
+            "no flag means inline-on-TTY default behaviour (false)"
+        );
     }
 
     #[test]

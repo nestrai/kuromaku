@@ -12,6 +12,11 @@ pub mod decision;
 // `initial:` to a `kind: final` state, asking the assigned agent to pick an
 // outgoing edge per visit (issue #240).
 pub mod graph;
+// `graph_interactive` carries the production stdin reader for the
+// inline human-handoff path (issue #361). Pulled into its own module
+// so the driver in `graph.rs` only talks to the
+// `graph::HumanInputReader` trait; the I/O surface stays separable.
+pub mod graph_interactive;
 
 use crate::config::{Agent, Backend, Step};
 use crate::executor::{self, ExecutionTask, ExecutorBoxed, OutputFormat};
@@ -1700,6 +1705,12 @@ mod flow_api {
         /// When true, suppress the `kuro run <flow>` banner that the CLI
         /// prints up front. MCP and other quiet callers set this to true.
         pub suppress_command_banner: bool,
+        /// When true, force the non-interactive pause-and-exit path even
+        /// on a TTY (issue #361). Default is false: a TTY-attached run
+        /// prompts inline at `human:` states and continues in the same
+        /// process; everything else (CI, piped stdout, MCP) falls back
+        /// to the pause-and-resume contract.
+        pub no_interactive: bool,
     }
 
     impl Default for ExecuteFlowSpec {
@@ -1711,6 +1722,7 @@ mod flow_api {
                 role_overrides: Vec::new(),
                 bare_args: HashMap::new(),
                 suppress_command_banner: false,
+                no_interactive: false,
             }
         }
     }
@@ -3534,6 +3546,15 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
         // borrow does not satisfy that.
         let seeds_owned = seeds.clone();
 
+        // Issue #361: select the human-handoff policy before spawning
+        // the driver. Resume runs (handled in
+        // `execute_graph_flow_resume_setup`) keep `Pause` -- the operator
+        // already invoked `kuro resume` separately, so prompting inline
+        // would double-handle the input channel.
+        let (stdin_tty, stdout_tty) = detect_interactive_tty_status();
+        let policy = select_human_handoff_policy(spec.no_interactive, stdin_tty, stdout_tty);
+        let gh_issue_id: Option<u64> = effective_vars.get("id").and_then(|s| s.parse::<u64>().ok());
+
         let join: JoinHandle<Result<FlowResult>> = tokio::spawn(async move {
             // The state arc carries cancellation; honour it before
             // spawning the first agent so a caller that flipped the flag
@@ -3545,10 +3566,18 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
             // `None` -> fresh run, drives from `graph.initial`. Resume
             // is wired through `execute_graph_flow_resume_setup` (#338),
             // which builds its own `ResumeFrom` from the persisted
-            // manifest before calling the driver.
-            let outcome =
-                super::graph::run_graph_flow(&graph, &agents_by_id, &state_to_agent, &ctx, None)
-                    .await?;
+            // manifest before calling the driver. The `policy` arg is
+            // `Inline` only when stdin and stdout are TTYs AND the
+            // operator did not pass `--no-interactive`.
+            let outcome = super::graph::run_graph_flow(
+                &graph,
+                &agents_by_id,
+                &state_to_agent,
+                &ctx,
+                None,
+                policy,
+            )
+            .await?;
             let total_elapsed = flow_start.elapsed();
             // Lifecycle outcome decomposition. The graph driver returns
             // either a `Final` (run reached a `kind: final` state) or a
@@ -3624,10 +3653,16 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
             let summary = super::build_summary(&results);
             match &pause_state_marker {
                 Some(state_id) => {
+                    // Issue #361: thread the run-id and the GH issue-id
+                    // hint into the pause banner so the operator sees
+                    // the exact `kuro resume` command and the channels
+                    // they can use to feed input back in.
                     ui::print_flow_paused(
                         &summary,
                         state_id,
                         &ctx.stack_path.display().to_string(),
+                        &ctx.run_id,
+                        gh_issue_id,
                     );
                 }
                 None => {
@@ -4019,6 +4054,62 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
         Some((record, body))
     }
 
+    /// Decide whether a graph run that hits a `human:` state should pause
+    /// or prompt inline (issue #361).
+    ///
+    /// Pure function over three boolean inputs so the truth table is
+    /// unit-testable without spawning a TTY:
+    ///
+    /// * `no_interactive` -- the operator passed `--no-interactive`.
+    ///   Forces `Pause` regardless of TTY status.
+    /// * `stdin_tty` -- stdin is a terminal. False under piped stdin
+    ///   (`echo ... | kuro run`, CI runners, MCP harness).
+    /// * `stdout_tty` -- stdout is a terminal. False when stdout is
+    ///   captured (`kuro run > log`, pipelines).
+    ///
+    /// Only `(false, true, true)` produces `Inline`; every other shape
+    /// falls back to `Pause`. The inline reader spawned for the `Inline`
+    /// arm is the production [`super::graph_interactive::StdinInteractiveReader`],
+    /// constructed lazily inside this function so unit tests (which do
+    /// not care which reader gets returned) can compare policy variants
+    /// without instantiating an actual stdin handle.
+    pub(crate) fn select_human_handoff_policy(
+        no_interactive: bool,
+        stdin_tty: bool,
+        stdout_tty: bool,
+    ) -> super::graph::HumanHandoffPolicy {
+        if no_interactive || !stdin_tty || !stdout_tty {
+            super::graph::HumanHandoffPolicy::Pause
+        } else {
+            super::graph::HumanHandoffPolicy::Inline {
+                input: Box::new(super::graph_interactive::StdinInteractiveReader),
+            }
+        }
+    }
+
+    /// Read TTY status for both stdin and stdout, honouring the
+    /// `KURO_FORCE_INTERACTIVE_HITL` test seam (issue #361).
+    ///
+    /// Production callers receive the real `IsTerminal` answer. The
+    /// integration test (`tests/inline_human.rs`) cannot easily allocate
+    /// a pseudo-terminal for a spawned `kuro run`, so it sets the env
+    /// var to `1` to force the inline arm with piped stdin. Returning
+    /// the tuple keeps the env-var read in exactly one place; the
+    /// downstream policy selector is pure.
+    ///
+    /// Never invoked from MCP / library callers -- they set
+    /// `ExecuteFlowSpec::no_interactive = true` explicitly.
+    pub(crate) fn detect_interactive_tty_status() -> (bool, bool) {
+        use std::io::IsTerminal;
+        if std::env::var_os("KURO_FORCE_INTERACTIVE_HITL").is_some() {
+            return (true, true);
+        }
+        (
+            std::io::stdin().is_terminal(),
+            std::io::stdout().is_terminal(),
+        )
+    }
+
     /// Carries the manifest-derived inputs the resume setup needs but the
     /// fresh-run setup does not. Fields are owned -- the setup function
     /// moves them into the spawned task and onto the `RunContext::resume`
@@ -4361,12 +4452,20 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
                 step_num_offset: prior_steps_count,
                 human_input_step_id,
             };
+            // Resume always uses `Pause` policy: the operator already
+            // invoked `kuro resume` (with `--message`, stdin, or a GH
+            // comments anchor), so inline prompting would double-handle
+            // the input channel. The driver still walks past the
+            // resumed human state via `skip_pause_once`, then any
+            // FUTURE human state in the same resumed run pauses again
+            // -- the operator can resume that pause separately too.
             let outcome = super::graph::run_graph_flow(
                 &graph,
                 &agents_by_id,
                 &state_to_agent,
                 &ctx,
                 Some(resume_from),
+                super::graph::HumanHandoffPolicy::Pause,
             )
             .await?;
             let total_elapsed = flow_start.elapsed();
@@ -4456,10 +4555,19 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
             let summary = super::build_summary(&all_results);
             match &pause_state_marker {
                 Some(state_id) => {
+                    // Issue #361: same banner shape as the fresh-run
+                    // path. A resumed run that pauses again at a later
+                    // human state must also show the resume hint -- the
+                    // operator may chain multiple resumes through one
+                    // long flow.
+                    let gh_issue_id: Option<u64> =
+                        effective_vars.get("id").and_then(|s| s.parse::<u64>().ok());
                     ui::print_flow_paused(
                         &summary,
                         state_id,
                         &ctx.stack_path.display().to_string(),
+                        &ctx.run_id,
+                        gh_issue_id,
                     );
                 }
                 None => {
@@ -4709,6 +4817,73 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
             )
             .expect("happy path returns Some");
             assert_eq!(out.0.output_file, "12-human-handoff.md");
+        }
+
+        // --- select_human_handoff_policy truth table (issue #361) ---
+
+        use super::select_human_handoff_policy;
+        use crate::runner::graph::HumanHandoffPolicy;
+
+        fn is_inline(p: &HumanHandoffPolicy) -> bool {
+            matches!(p, HumanHandoffPolicy::Inline { .. })
+        }
+
+        #[test]
+        fn select_policy_picks_inline_only_when_tty_and_not_forced() {
+            // Only the (no_interactive=false, stdin=true, stdout=true)
+            // cell of the truth table produces Inline. Pin every cell
+            // explicitly so a future refactor that flips the boolean
+            // logic gets caught.
+            assert!(
+                is_inline(&select_human_handoff_policy(false, true, true)),
+                "TTY + TTY without --no-interactive must produce Inline"
+            );
+        }
+
+        #[test]
+        fn select_policy_falls_back_to_pause_for_no_interactive() {
+            // AC3: `--no-interactive` overrides the TTY check, even
+            // when both streams are TTYs. The operator's intent to
+            // run via the resume contract wins.
+            assert!(
+                !is_inline(&select_human_handoff_policy(true, true, true)),
+                "--no-interactive must force Pause even on a TTY"
+            );
+        }
+
+        #[test]
+        fn select_policy_falls_back_to_pause_when_stdin_piped() {
+            // CI runners, MCP transports, and `echo ... | kuro run`
+            // all surface as non-TTY stdin. The driver must pause and
+            // tell the operator how to feed input separately.
+            assert!(
+                !is_inline(&select_human_handoff_policy(false, false, true)),
+                "piped stdin must fall back to Pause"
+            );
+        }
+
+        #[test]
+        fn select_policy_falls_back_to_pause_when_stdout_piped() {
+            // `kuro run > log.txt` and CI pipelines fold stdout into a
+            // file. The inline prompt header would still go to stderr,
+            // but the operator typing into stdin while stdout is
+            // captured is a confused workflow -- prefer the explicit
+            // pause-and-resume path.
+            assert!(
+                !is_inline(&select_human_handoff_policy(false, true, false)),
+                "piped stdout must fall back to Pause"
+            );
+        }
+
+        #[test]
+        fn select_policy_pause_when_neither_stream_is_tty() {
+            // The all-piped case: a background flow trigger or MCP
+            // run. Pause is mandatory; inline prompting would block
+            // forever on no real terminal.
+            assert!(
+                !is_inline(&select_human_handoff_policy(false, false, false)),
+                "all-piped must fall back to Pause"
+            );
         }
     }
 

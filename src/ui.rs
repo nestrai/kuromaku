@@ -682,7 +682,13 @@ pub fn print_flow_complete(
 /// pointing at the pause record. The per-step table is kept identical
 /// so an operator inspecting a paused run sees the same shape they see
 /// for a completed one.
-pub fn print_flow_paused(steps: &[StepResult], paused_at_state: &str, stack_path: &str) {
+pub fn print_flow_paused(
+    steps: &[StepResult],
+    paused_at_state: &str,
+    stack_path: &str,
+    run_id: &str,
+    gh_issue_id: Option<u64>,
+) {
     let t = &DARK;
     println!();
     println!(
@@ -741,6 +747,124 @@ pub fn print_flow_paused(steps: &[StepResult], paused_at_state: &str, stack_path
         "      {} {}",
         style::style("Pause recorded under").with(t.dim),
         style::style(stack_path).with(t.fg),
+    );
+
+    // Issue #361 / AC2: the pause banner spells out the EXACT next
+    // command an operator needs to resume the run, and names the
+    // channel(s) they can feed input through. Without this footer the
+    // operator has to grep docs (or source) to discover `kuro resume`.
+    println!();
+    println!("      {}", style::style("To resume this run:").with(t.dim));
+    for line in resume_hint_lines(run_id, gh_issue_id) {
+        if line.starts_with("OR") {
+            // The "or" separator carries dim styling; differentiate
+            // it from the actual command lines so the user's eye
+            // moves naturally down the list.
+            println!("      {}", style::style("or").with(t.dim));
+        } else {
+            // Command + descriptor on the same line; the helper
+            // already encoded the layout, here we just colour the
+            // two halves (command in fg, descriptor in dim).
+            let (cmd, descriptor) = line.split_once("    ").unwrap_or((line.as_str(), ""));
+            println!(
+                "          {}    {}",
+                style::style(cmd).with(t.fg),
+                style::style(descriptor).with(t.dim),
+            );
+        }
+    }
+}
+
+/// Build the resume-hint lines for a paused run (issue #361 / AC2).
+///
+/// Pure helper extracted from [`print_flow_paused`] so the exact
+/// wording is unit-testable without parsing ANSI-coloured output.
+/// Returns a vector of human-readable strings; the caller is
+/// responsible for the per-line styling. The string `"OR"` is a
+/// reserved sentinel value: the renderer prints a dim "or" separator
+/// in its place. Every other line is `"<command>    <descriptor>"`
+/// where the four-space separator splits the two columns.
+///
+/// Two layouts:
+///
+/// * `gh_issue_id == Some(n)` -- the run is anchored to a GitHub
+///   issue, so we show BOTH the bare `kuro resume` line (reads issue
+///   comments via #340) AND the `--message` line (#360).
+/// * `gh_issue_id == None` -- only `--message` / stdin makes sense;
+///   showing the bare command would mislead the operator into
+///   thinking they have nothing else to do.
+pub fn resume_hint_lines(run_id: &str, gh_issue_id: Option<u64>) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(issue_id) = gh_issue_id {
+        lines.push(format!(
+            "kuro resume {run_id}    (reads GitHub issue #{issue_id} comments)"
+        ));
+        lines.push("OR".to_string());
+        lines.push(format!(
+            "kuro resume {run_id} --message \"...\"    (inline feedback)"
+        ));
+    } else {
+        lines.push(format!(
+            "kuro resume {run_id} --message \"...\"    (inline feedback, or pipe via stdin)"
+        ));
+    }
+    lines
+}
+
+/// Render the inline human-handoff prompt header on stderr (issue #361).
+///
+/// Emitted by [`crate::runner::graph_interactive::StdinInteractiveReader`]
+/// just before it blocks on stdin. Stderr is the right stream: the
+/// per-state structured artefacts go to stdout, the run-level cues stay
+/// on stderr so a caller piping `kuro run > artifacts.log` still sees
+/// the prompt arrive on their TTY.
+///
+/// The header names the paused state, optionally surfaces the state's
+/// `task:` text (the briefing the human is reacting to), lists the
+/// declared onward states so the operator knows what their input is
+/// gating, and explains the terminator. v1 always advances through
+/// `next[0]` regardless of the input content -- the targets list is
+/// informational only.
+pub fn print_human_prompt(state_id: &str, task: Option<&str>, allowed_targets: &[String]) {
+    let t = &DARK;
+    eprintln!();
+    eprintln!(
+        "      {} {} {}",
+        style::style("⏸").with(t.yellow).attribute(Attribute::Bold),
+        style::style("inline handoff at").with(t.dim),
+        style::style(format!("`{state_id}`"))
+            .with(t.yellow)
+            .attribute(Attribute::Bold),
+    );
+    if let Some(t_text) = task {
+        // Show only the first line of `task:` so the prompt header
+        // stays compact. The full task body is part of the run
+        // artefacts on disk; the operator can `kuro show-output` it
+        // any time. A multi-line `task:` would otherwise blow up the
+        // visual rhythm of every other paused state.
+        let first_line = t_text.lines().next().unwrap_or(t_text);
+        eprintln!(
+            "        {} {}",
+            style::style("task").with(t.dim),
+            style::style(first_line).with(t.fg),
+        );
+    }
+    if !allowed_targets.is_empty() {
+        // Comma-joined list of onward target state IDs. v1 routes
+        // through `next[0]` deterministically; surfacing the full
+        // list still helps the operator understand what choices the
+        // flow author considered.
+        let joined = allowed_targets.join(", ");
+        eprintln!(
+            "        {} {}",
+            style::style("next").with(t.dim),
+            style::style(joined).with(t.fg),
+        );
+    }
+    eprintln!(
+        "        {} {}",
+        style::style("type your message; finish with a blank line or Ctrl-D").with(t.dim),
+        style::style("›").with(t.cyan),
     );
 }
 
@@ -1107,5 +1231,78 @@ mod tests {
             },
         ];
         print_step_pills(&pills);
+    }
+
+    // --- Resume-hint lines for the paused-flow banner (issue #361) ----
+
+    #[test]
+    fn resume_hint_lines_local_only_when_no_issue_id() {
+        // AC2: when `vars.id` is not a numeric GH issue ID, only the
+        // local --message / stdin hint shows. Anchoring the wording
+        // here means a future cosmetic refactor that changes the
+        // descriptor breaks the test before it ships.
+        let lines = resume_hint_lines("flow-run-42", None);
+        assert_eq!(
+            lines.len(),
+            1,
+            "no-issue-id layout has exactly one hint line; got: {lines:?}"
+        );
+        let line = &lines[0];
+        assert!(
+            line.contains("kuro resume flow-run-42 --message"),
+            "must reference the inline feedback command, got: {line}"
+        );
+        assert!(
+            line.contains("pipe via stdin"),
+            "no-issue-id descriptor must name stdin, got: {line}"
+        );
+    }
+
+    #[test]
+    fn resume_hint_lines_both_when_issue_id_present() {
+        // AC2: when the run is anchored to a GH issue, the banner
+        // surfaces both the bare resume command (reads issue comments
+        // via #340) AND the --message line (#360). The separator line
+        // between them is the `"OR"` sentinel.
+        let lines = resume_hint_lines("flow-run-42", Some(139));
+        assert_eq!(
+            lines.len(),
+            3,
+            "issue-id layout has three lines (command / OR / command); got: {lines:?}"
+        );
+        assert!(
+            lines[0].contains("kuro resume flow-run-42")
+                && lines[0].contains("GitHub issue #139 comments"),
+            "first line must point at the GH comments path, got: {}",
+            lines[0]
+        );
+        assert_eq!(lines[1], "OR", "second line must be the OR separator");
+        assert!(
+            lines[2].contains("kuro resume flow-run-42 --message"),
+            "third line must offer the local fallback, got: {}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn print_human_prompt_smoke() {
+        // The inline-handoff prompt header goes to stderr. We can't
+        // capture stderr cleanly without external scaffolding, so
+        // smoke-test that the call does not panic across the three
+        // shapes the runner exercises: with and without `task`, with
+        // empty and populated `allowed_targets`.
+        print_human_prompt("ask", Some("review the patch"), &["review".to_string()]);
+        print_human_prompt("ask", None, &["review".to_string(), "abort".to_string()]);
+        print_human_prompt("ask", None, &[]);
+    }
+
+    #[test]
+    fn print_flow_paused_smoke_both_layouts() {
+        // Smoke-test both pause-banner layouts so neither path can
+        // regress to a panic. The exact wording lives in
+        // `resume_hint_lines` (covered above).
+        let steps: Vec<StepResult> = Vec::new();
+        print_flow_paused(&steps, "ask", "/tmp/stack", "flow-run-42", None);
+        print_flow_paused(&steps, "ask", "/tmp/stack", "flow-run-42", Some(139));
     }
 }
