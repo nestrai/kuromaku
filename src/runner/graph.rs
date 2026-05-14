@@ -415,6 +415,14 @@ pub async fn run_graph_flow(
         // #263 and will refine this. Edge names are not included in the
         // banner; they appear in the per-step prompt and in the post-step
         // transition line so the user can see what was picked vs available.
+        // #364: surface the overlay contribution on the graph step
+        // banner. Roles without overlays produce `None` and the banner
+        // suppresses the overlays cell entirely -- output stays byte-
+        // identical for unaffected runs.
+        let overlay_summary = state
+            .role
+            .as_deref()
+            .and_then(|r| ctx.overlay_summaries.get(r).cloned());
         let step_info = StepInfo {
             id: current.clone(),
             agent: agent.name.clone(),
@@ -423,6 +431,7 @@ pub async fn run_graph_flow(
             backend: agent.backend,
             input: Vec::new(),
             state: StepState::Running,
+            overlay_summary,
         };
         ui::print_step_banner(step_num, DEFAULT_MAX_STEPS, &step_info);
 
