@@ -3682,10 +3682,16 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
     /// * human-input plumbing into prior_context (#340)
     /// * timeout enforcement (#343)
     /// * automatic resume triggers (#341 `kuro watch`)
+    #[allow(dead_code)]
     pub async fn resume_run(run_id: &str) -> Result<RunHandle> {
         // Production fetcher: shells out to `gh issue view --json comments`.
-        // The `_with` variant is the test seam (issue #340).
-        resume_run_with(run_id, crate::notify::github::gh_comments_fetcher()).await
+        // The `_with` variants are the test seam (issue #340 + #360).
+        //
+        // The binary calls `resume_run_with_input` directly to thread
+        // local-input plumbing through (#360); this convenience entry
+        // point stays on the public surface for external callers (MCP,
+        // SDK) that only need the basic resume contract.
+        resume_run_with_input(run_id, crate::notify::github::gh_comments_fetcher(), None).await
     }
 
     /// Test-seam variant of [`resume_run`] (issue #340).
@@ -3695,9 +3701,40 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
     /// integration tests inject a closure that returns canned
     /// `IssueComment`s (or a simulated network failure) so the
     /// human-input synthesis path is testable without spawning `gh`.
+    ///
+    /// Thin wrapper around [`resume_run_with_input`] for callers that
+    /// only care about the GH path (existing #340 tests). Passes
+    /// `local: None` so the local-input plumbing collapses to the
+    /// pre-existing behaviour. Kept on the public surface as a stable
+    /// back-compat seam for downstream callers that wired against the
+    /// #340 signature; the binary crate itself no longer uses it.
+    #[allow(dead_code)]
     pub async fn resume_run_with(
         run_id: &str,
         fetcher: crate::notify::github::CommentsFetcher,
+    ) -> Result<RunHandle> {
+        resume_run_with_input(run_id, fetcher, None).await
+    }
+
+    /// Test-seam variant of [`resume_run`] that additionally accepts a
+    /// local human-input source (issue #360).
+    ///
+    /// `local` carries feedback supplied via `--message`,
+    /// `--message-file`, or stdin. Precedence rules:
+    ///
+    /// 1. Local wins over GH. When both produce a body, the local body
+    ///    becomes the synthetic step's content and a `[warn]` line on
+    ///    stderr surfaces the conflict so the operator notices.
+    /// 2. GH falls through when `local` is `None`. The existing #340
+    ///    path runs verbatim.
+    /// 3. Neither path producing input AND no GH source (numeric `id` var
+    ///    parses, even if comments are empty) raises a hard error so the
+    ///    flow stops with an actionable hint instead of silently routing
+    ///    to `next[0]`.
+    pub async fn resume_run_with_input(
+        run_id: &str,
+        fetcher: crate::notify::github::CommentsFetcher,
+        local: Option<LocalHumanInput>,
     ) -> Result<RunHandle> {
         let flow_start = Instant::now();
 
@@ -3830,6 +3867,7 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
             flow_start,
             resume_ctx,
             fetcher,
+            local,
         )
         .await
     }
@@ -3898,6 +3936,89 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
         Some((record, body))
     }
 
+    /// Local human input collected at `kuro resume` invocation time
+    /// (issue #360).
+    ///
+    /// Represents a single body of feedback supplied via `--message`,
+    /// `--message-file <path>`, or stdin. Holds the resolved body alongside
+    /// a human-readable `source` label so the on-disk synthetic step and
+    /// any conflict warning can name the channel the operator used.
+    ///
+    /// Constructed exclusively by [`collect_local_human_input`] -- the
+    /// invariants (non-empty body, sensible source label) live there so
+    /// the resume pipeline can treat any `Some(LocalHumanInput)` as
+    /// already-validated.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct LocalHumanInput {
+        /// Resolved body. Already trimmed of a trailing newline if one was
+        /// present on stdin or in the file, so [`crate::notify::github::format_local_human_input`]
+        /// does not double-print and the synthetic step's body shape is
+        /// stable regardless of where it came from.
+        pub body: String,
+        /// Human-readable label for the channel: `"--message"`, `"stdin"`,
+        /// or `"--message-file <path>"`. Lands in the synthetic step's
+        /// header and in the local-vs-GH conflict warning so auditors can
+        /// tell which channel produced the body.
+        pub source: String,
+    }
+
+    /// Build the synthetic `kind: human` step record + body from a local
+    /// input source (issue #360).
+    ///
+    /// Sibling of [`synthesize_human_step`] for the case where the operator
+    /// supplied feedback through `--message`, `--message-file`, or stdin
+    /// instead of GitHub comments. Returns `Some((record, body))` for any
+    /// non-empty body so the resume pipeline can write the step and route
+    /// it as `prior_context` to the next agent.
+    ///
+    /// Empty bodies collapse to `None`, mirroring [`synthesize_human_step`]'s
+    /// "empty input is not an error" contract. `collect_local_human_input`
+    /// rejects empty input earlier, but the synthesiser stays consistent so
+    /// a future caller that constructs `LocalHumanInput` from a different
+    /// path cannot end up with a zero-byte synthetic step on disk.
+    pub(crate) fn synthesize_human_step_from_local(
+        step_num: usize,
+        paused_at_state: &str,
+        paused_at: &str,
+        local: &LocalHumanInput,
+    ) -> Option<(stack::StepRecord, String)> {
+        if local.body.is_empty() {
+            return None;
+        }
+        let body =
+            crate::notify::github::format_local_human_input(&local.body, &local.source, paused_at);
+        let output_file = stack::step_content_filename(step_num, paused_at_state, "md");
+        let record = stack::StepRecord {
+            step_id: paused_at_state.to_string(),
+            kind: "human".to_string(),
+            agent: None,
+            model_requested: None,
+            model_actual: None,
+            // Match `synthesize_human_step`: the audit row reads
+            // `kind == "human"` AND `backend == "human"` so consumers can
+            // partition on either. Leaving backend empty would lie about
+            // the row's provenance.
+            backend: "human".to_string(),
+            tokens_in: None,
+            tokens_out: None,
+            duration_ms: 0,
+            // Mirror the pause moment so audit consumers can correlate
+            // the synthetic record with the manifest's `paused_at` without
+            // re-deriving it from the run timeline. Exactly the contract
+            // `synthesize_human_step` enforces.
+            started_at: paused_at.to_string(),
+            exit_code: 0,
+            input_steps: Vec::new(),
+            output_file,
+            participants: Vec::new(),
+            turns: None,
+            messages: None,
+            terminated_by: None,
+            graph_decision: None,
+        };
+        Some((record, body))
+    }
+
     /// Carries the manifest-derived inputs the resume setup needs but the
     /// fresh-run setup does not. Fields are owned -- the setup function
     /// moves them into the spawned task and onto the `RunContext::resume`
@@ -3953,6 +4074,7 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
         flow_start: Instant,
         mut resume: ResumeContext,
         fetcher: crate::notify::github::CommentsFetcher,
+        local: Option<LocalHumanInput>,
     ) -> Result<RunHandle> {
         use crate::config::{Defaults, load_agent_file_with_seeds};
         use std::sync::Arc;
@@ -4113,29 +4235,68 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
             .filter_map(|(role, applied)| applied.summary().map(|s| (role.clone(), s)))
             .collect();
 
-        // ---- Synthesise human-input step (issue #340) ------------------
-        // If the human typed something into the issue between pause and
-        // resume, fold those comments into a synthetic `kind: human` step
-        // record on disk. The driver's `skip_pause_once` arm will route
-        // `prior_state` to this step on the first iteration so the next
-        // agent reads the human input through the same `prior_context`
-        // path every other state uses.
+        // ---- Synthesise human-input step (issues #340 + #360) ----------
+        // The driver's `skip_pause_once` arm routes `prior_state` to this
+        // step on the first iteration after resume, so the next agent
+        // reads human feedback through the same `prior_context` path
+        // every other state uses.
         //
-        // Soft-fail throughout: missing `id` var, no new comments, or a
-        // fetch error all collapse to "no synthetic step written, no
-        // prior_context for the next agent" -- which honours the
-        // acceptance criterion that empty input is not an error. Network
-        // errors land on stderr as `[warn]` lines via
-        // `fetch_new_comments_since` rather than aborting the resume.
-        let human_input_step_id: Option<String> = match synthesize_human_step(
-            resume.prior_steps.len() + 1,
-            &resume.paused_at_state,
-            &resume.paused_at,
-            &effective_vars,
-            &fetcher,
-        ) {
+        // Two sources can produce a synthetic step:
+        //   * Local: `--message`, `--message-file`, or stdin (#360),
+        //     carried in `local: Option<LocalHumanInput>`.
+        //   * GitHub: comments added to `vars.id` since pause (#340),
+        //     fetched via `fetcher` and filtered by `paused_at`.
+        //
+        // Precedence (high to low):
+        //   1. Local wins. Explicit operator intent beats ambient GH
+        //      activity. When both produce a body, emit a `[warn]` on
+        //      stderr so the conflict is visible but the resume proceeds.
+        //   2. GH falls through when `local` is None.
+        //   3. Neither path producing a body AND no GH source (no numeric
+        //      `vars.id`) raises a hard error so the flow stops with a
+        //      hint instead of silently routing to `next[0]`.
+        let step_num = resume.prior_steps.len() + 1;
+        let gh_id_is_numeric = effective_vars
+            .get("id")
+            .and_then(|s| s.parse::<u64>().ok())
+            .is_some();
+        let synth = match local {
+            Some(local_input) => {
+                // Local wins. Only consult GH to detect the conflict
+                // case and warn -- the actual body comes from `local`.
+                if gh_id_is_numeric
+                    && synthesize_human_step(
+                        step_num,
+                        &resume.paused_at_state,
+                        &resume.paused_at,
+                        &effective_vars,
+                        &fetcher,
+                    )
+                    .is_some()
+                {
+                    eprintln!(
+                        "[warn] both local input ({}) and GitHub comments are present; using local input",
+                        local_input.source,
+                    );
+                }
+                synthesize_human_step_from_local(
+                    step_num,
+                    &resume.paused_at_state,
+                    &resume.paused_at,
+                    &local_input,
+                )
+            }
+            None => synthesize_human_step(
+                step_num,
+                &resume.paused_at_state,
+                &resume.paused_at,
+                &effective_vars,
+                &fetcher,
+            ),
+        };
+
+        let human_input_step_id: Option<String> = match synth {
             Some((record, body)) => {
-                let step_num = resume.prior_steps.len() + 1;
                 stack::write_run_step(&resume.run_path, step_num, &record, &body)
                     .map_err(|e| eyre!("failed to persist human-input step: {e}"))?;
                 // Keep the manifest's `steps:` history contiguous: the
@@ -4145,7 +4306,23 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
                 resume.prior_steps.push(record);
                 Some(step_id)
             }
-            None => None,
+            None => {
+                // No body from either source. If there is also no GH
+                // source (numeric `vars.id`), the operator has no path
+                // to feed feedback into the run -- fail loud so the
+                // run does not silently take `next[0]`. The check fires
+                // regardless of whether the paused state's `next:`
+                // branches on intent; #360 only adds the input mechanism,
+                // not the routing logic.
+                if !gh_id_is_numeric {
+                    return Err(eyre!(
+                        "no human input provided for resume of run '{}' paused at '{}'\n\nhint: pass --message \"...\", pipe via stdin, or run from a flow whose vars.id is a GitHub issue number",
+                        resume.run_id,
+                        resume.paused_at_state,
+                    ));
+                }
+                None
+            }
         };
 
         // Resume banner so the operator sees we adopted an existing run
@@ -4448,6 +4625,73 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
             assert!(body.contains("@alice"));
         }
 
+        // --- synthesize_human_step_from_local (issue #360) ---
+
+        use super::{LocalHumanInput, synthesize_human_step_from_local};
+
+        #[test]
+        fn local_returns_record_for_non_empty_body() {
+            // Happy path: any non-empty local body produces a synthetic
+            // step with the same `kind: "human"` / `backend: "human"` shape
+            // the GH path emits, so downstream `prior_context` plumbing is
+            // source-agnostic.
+            let local = LocalHumanInput {
+                body: "approve".to_string(),
+                source: "--message".to_string(),
+            };
+            let out = synthesize_human_step_from_local(2, "ask", "2026-05-13T10:00:00Z", &local)
+                .expect("non-empty body must return Some");
+            let (record, body) = out;
+            assert_eq!(record.kind, "human");
+            assert_eq!(record.backend, "human");
+            assert_eq!(record.step_id, "ask");
+            assert!(record.agent.is_none());
+            assert_eq!(record.output_file, "02-ask.md");
+            assert_eq!(record.exit_code, 0);
+            assert_eq!(record.duration_ms, 0);
+            assert_eq!(record.started_at, "2026-05-13T10:00:00Z");
+            assert!(
+                body.contains(
+                    "Human input received since pause at 2026-05-13T10:00:00Z (via --message)"
+                ),
+                "body must carry the source-tagged header, got:\n{body}"
+            );
+            assert!(body.contains("approve"), "body must carry verbatim text");
+        }
+
+        #[test]
+        fn local_returns_none_for_empty_body() {
+            // Defensive: `collect_local_human_input` rejects empty bodies
+            // earlier, but the synthesiser must agree with the GH-side
+            // contract that empty input is not an error.
+            let local = LocalHumanInput {
+                body: String::new(),
+                source: "stdin".to_string(),
+            };
+            let out = synthesize_human_step_from_local(2, "ask", "2026-05-13T10:00:00Z", &local);
+            assert!(out.is_none());
+        }
+
+        #[test]
+        fn local_record_output_file_matches_step_num_filename() {
+            // The on-disk filename embeds `step_num` so the synthetic
+            // record sorts between pre-pause and post-resume artifacts.
+            // Same convention as the GH path -- pin it so downstream
+            // listing tools (`kuro show-output`) cannot drift.
+            let local = LocalHumanInput {
+                body: "looks good".to_string(),
+                source: "--message".to_string(),
+            };
+            let out = synthesize_human_step_from_local(
+                7,
+                "human-handoff",
+                "2026-05-13T10:00:00Z",
+                &local,
+            )
+            .expect("non-empty body returns Some");
+            assert_eq!(out.0.output_file, "07-human-handoff.md");
+        }
+
         #[test]
         fn record_output_file_uses_provided_step_num() {
             // The on-disk filename embeds `step_num` so the synthetic
@@ -4512,8 +4756,9 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
 // shrink the surface promised by #209.
 #[allow(unused_imports)]
 pub use flow_api::{
-    ActiveRouter, ExecuteFlowSpec, FlowResult, FlowSource, RouterAccessor, RouterAccessorError,
-    RunHandle, execute_flow, resume_run,
+    ActiveRouter, ExecuteFlowSpec, FlowResult, FlowSource, LocalHumanInput, RouterAccessor,
+    RouterAccessorError, RunHandle, execute_flow, resume_run, resume_run_with,
+    resume_run_with_input,
 };
 
 // Crate-internal re-exports so the CLI tests (and any other in-tree caller)
