@@ -25,7 +25,7 @@
 //!   regardless of priority. Useful for "what does this seed provide?".
 //! * `effective` -- first-match-wins cascade. Each name appears once,
 //!   tagged with the winning seed and the lower-priority seeds where
-//!   the same name also lives (`shadowed_by`, see field docs). This
+//!   the same name also lives (`shadows`, see field docs). This
 //!   is what the runner would actually load.
 //!
 //! ## Empty-input discipline
@@ -148,15 +148,17 @@ pub struct EffectiveCascade {
 
 /// One name in the effective cascade.
 ///
-/// `shadowed_by` is read from the **winner's** perspective: it lists
-/// the display strings of lower-priority seeds where the same name
-/// also appears (and which the winner therefore shadows). The naming
-/// is locked into the v1 JSON wire format.
+/// `shadows` is read from the **winner's** perspective: it lists the
+/// display strings of lower-priority seeds where the same name also
+/// appears and which the winner therefore shadows. Empty for names
+/// that only appear in one seed. The naming is locked into the v1
+/// JSON wire format -- consumers can rely on the field meaning
+/// "seeds the winner suppresses" for the lifetime of schema v1.
 #[derive(Debug, Clone, Serialize)]
 pub struct EffectiveItem {
     pub name: String,
     pub seed: String,
-    pub shadowed_by: Vec<String>,
+    pub shadows: Vec<String>,
 }
 
 // --- Public API ---
@@ -254,9 +256,24 @@ fn write_effective_section(
         writeln!(out, "  {label} (0): (none)")?;
         return Ok(());
     }
+    // Inline a `[shadows: ...]` suffix on items with non-empty shadow
+    // lists so the human renderer mirrors the JSON wire format. The
+    // suffix is only emitted for cross-seed conflicts -- non-conflict
+    // items stay compact (`name (from seed)`).
     let rendered: Vec<String> = items
         .iter()
-        .map(|it| format!("{} (from {})", it.name, it.seed))
+        .map(|it| {
+            if it.shadows.is_empty() {
+                format!("{} (from {})", it.name, it.seed)
+            } else {
+                format!(
+                    "{} (from {}) [shadows: {}]",
+                    it.name,
+                    it.seed,
+                    it.shadows.join(", "),
+                )
+            }
+        })
         .collect();
     writeln!(out, "  {label} ({}): {}", items.len(), rendered.join(", "))
 }
@@ -423,10 +440,17 @@ pub(crate) fn enumerate_flows_in_seed(seed_path: &Path, seed_display: &str) -> V
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
+    // Sort the directory listing before iterating: `read_dir` order is
+    // filesystem-dependent, and when a seed contains both `build.yaml`
+    // and `build.yml` the stem-dedup below otherwise picks the winner
+    // non-deterministically. Sorting by full filename gives `.yaml`
+    // precedence over `.yml` (ASCII 'a' < 'y'), and pins the choice
+    // so two runs on the same checkout always agree.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
     let mut out: Vec<FlowEntry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    for entry in entries.flatten() {
-        let p = entry.path();
+    for p in paths {
         let ext = p.extension().and_then(|s| s.to_str());
         if ext != Some("yaml") && ext != Some("yml") {
             continue;
@@ -514,19 +538,20 @@ where
         .map(|(name, seed_display)| EffectiveItem {
             name,
             seed: seed_display.to_string(),
-            shadowed_by: Vec::new(),
+            shadows: Vec::new(),
         })
         .collect();
-    // Pass 2: fill shadowed_by. For each item, walk the seeds and
+    // Pass 2: fill `shadows`. For each item, walk the seeds and
     // record any seed whose display is NOT the winner but that also
-    // declares the same name.
+    // declares the same name -- those are the entries the winner
+    // suppresses.
     for item in &mut out {
         for seed in seeds {
             if seed.display == item.seed {
                 continue;
             }
             if get_names(seed).any(|n| n == item.name.as_str()) {
-                item.shadowed_by.push(seed.display.clone());
+                item.shadows.push(seed.display.clone());
             }
         }
     }
@@ -738,7 +763,8 @@ mod tests {
     fn resolve_walks_each_seed_independently_without_dedup() {
         // Two seeds both define Neo. Per-seed listing must show Neo
         // in both seeds; effective must show Neo once (winner) with
-        // the other seed listed in `shadowed_by`.
+        // the other seed listed in `shadows` (the seeds the winner
+        // suppresses).
         let tmp = TempDir::new().unwrap();
         let cwd = tmp.path();
         let seed_a = cwd.join("a");
@@ -783,7 +809,7 @@ mod tests {
         assert!(b_names.contains(&"Neo"));
 
         // Effective: Neo wins from seed [0]; Bella from seed [1]; Neo's
-        // shadowed_by lists seed [1].
+        // `shadows` list contains seed [1] (the loser).
         let neo = ctx
             .effective
             .agents
@@ -791,7 +817,7 @@ mod tests {
             .find(|i| i.name == "Neo")
             .unwrap();
         assert_eq!(neo.seed, ctx.seeds[0].display);
-        assert_eq!(neo.shadowed_by, vec![ctx.seeds[1].display.clone()]);
+        assert_eq!(neo.shadows, vec![ctx.seeds[1].display.clone()]);
         let bella = ctx
             .effective
             .agents
@@ -799,7 +825,7 @@ mod tests {
             .find(|i| i.name == "Bella")
             .unwrap();
         assert_eq!(bella.seed, ctx.seeds[1].display);
-        assert!(bella.shadowed_by.is_empty());
+        assert!(bella.shadows.is_empty());
     }
 
     // ---- per-seed rules walker ----
@@ -956,6 +982,32 @@ mod tests {
     }
 
     #[test]
+    fn enumerate_flows_in_seed_picks_yaml_over_yml_on_stem_collision() {
+        // Two files share the same stem. `read_dir` order is filesystem
+        // dependent so without sorting the winner would flap between
+        // runs. Sorting by full filename gives `.yaml` precedence over
+        // `.yml` -- pin that contract so the inventory is reproducible.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(
+            &seed.join("flows/build.yaml"),
+            &minimal_flow("build-yaml", Some("yaml wins"), &["plan"]),
+        );
+        write(
+            &seed.join("flows/build.yml"),
+            &minimal_flow("build-yml", Some("yml loses"), &["other"]),
+        );
+        // Run multiple times to defeat any per-run randomness from
+        // read_dir iteration order on resilient filesystems.
+        for _ in 0..5 {
+            let flows = enumerate_flows_in_seed(&seed, "seed/");
+            assert_eq!(flows.len(), 1);
+            assert_eq!(flows[0].name, "build-yaml");
+            assert_eq!(flows[0].description, "yaml wins");
+        }
+    }
+
+    #[test]
     fn enumerate_flows_in_seed_collects_yaml_and_yml() {
         let tmp = TempDir::new().unwrap();
         let seed = tmp.path().join("seed");
@@ -1005,6 +1057,116 @@ mod tests {
         // Effective agents include Neo.
         let agents = v["effective"]["agents"].as_array().unwrap();
         assert!(agents.iter().any(|a| a["name"] == "Neo"));
+    }
+
+    #[test]
+    fn render_json_uses_shadows_field_for_v1_wire_format() {
+        // Pin the v1 JSON schema: the field must be spelled `shadows`
+        // (not `shadowed_by`) and read from the winner's perspective.
+        // AI clients embed this output at session start and the field
+        // semantics need to match the field name -- the previous name
+        // was inverted and would have anchored a misreading of the
+        // cascade into every downstream consumer.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let seed_a = cwd.join("a");
+        let seed_b = cwd.join("b");
+        write(
+            &seed_a.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "A", "winner"),
+        );
+        write(
+            &seed_b.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "B", "loser"),
+        );
+        write(
+            &cwd.join(".kuro/config.yaml"),
+            &format!(
+                "version: \"1\"\nseeds:\n  - path: {}\n  - path: {}\n",
+                seed_a.display(),
+                seed_b.display(),
+            ),
+        );
+        let ctx = resolve(cwd).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        render_json(&ctx, &mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        let neo = v["effective"]["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == "Neo")
+            .unwrap();
+        // The field exists under the new name and points at the loser
+        // seed -- proving "shadows" reads as "what the winner suppresses".
+        let shadows = neo["shadows"].as_array().expect("shadows is an array");
+        assert_eq!(shadows.len(), 1);
+        assert_eq!(shadows[0], seed_b.display().to_string());
+        // And the legacy name is gone -- consumers must migrate to
+        // `shadows` before any other downstream code touches v1.
+        assert!(neo.get("shadowed_by").is_none());
+    }
+
+    #[test]
+    fn render_human_appends_shadows_suffix_when_cascade_conflicts() {
+        // The human renderer must surface shadow relationships too --
+        // otherwise an operator reading the human inventory misses
+        // that a name lives in multiple seeds and a non-default seed
+        // would supply a different version. Inline `[shadows: ...]`
+        // suffix only for items with non-empty conflict lists.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let seed_a = cwd.join("a");
+        let seed_b = cwd.join("b");
+        write(
+            &seed_a.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "A", "winner"),
+        );
+        write(
+            &seed_b.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "B", "loser"),
+        );
+        write(
+            &seed_a.join("agents/Solo.yaml"),
+            &minimal_agent("Solo", "S", "no conflict"),
+        );
+        write(
+            &cwd.join(".kuro/config.yaml"),
+            &format!(
+                "version: \"1\"\nseeds:\n  - path: {}\n  - path: {}\n",
+                seed_a.display(),
+                seed_b.display(),
+            ),
+        );
+        let ctx = resolve(cwd).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        render_human(&ctx, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // Neo wins from seed_a and shadows seed_b -- suffix must show
+        // immediately after Neo's "(from ...)" segment.
+        let neo_with_suffix = format!(
+            "Neo (from {}) [shadows: {}]",
+            seed_a.display(),
+            seed_b.display(),
+        );
+        assert!(
+            s.contains(&neo_with_suffix),
+            "expected Neo's shadows suffix in render: {s}"
+        );
+        // Solo lives in one seed only -- the rendered string must contain
+        // its plain "(from ...)" form WITHOUT an immediately following
+        // `[shadows:` segment. The effective cascade is on a single
+        // comma-separated line so we cannot split by lines.
+        let solo_plain = format!("Solo (from {})", seed_a.display());
+        assert!(
+            s.contains(&solo_plain),
+            "Solo plain entry missing from render: {s}"
+        );
+        let solo_with_shadow_prefix = format!("{} [shadows:", solo_plain);
+        assert!(
+            !s.contains(&solo_with_shadow_prefix),
+            "Solo has no conflicts but got shadows suffix: {s}"
+        );
     }
 
     #[test]
