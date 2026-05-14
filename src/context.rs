@@ -43,7 +43,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tracing::warn;
 
-use crate::config::{RawAgentFile, load_flow_from_str};
+use crate::config::{Flow, RawAgentFile, load_flow_any_from_str};
 use crate::koto_config::{KotoConfig, KotoConfigError, Seed, SeedSource, Seeds};
 
 /// Maximum description length in Unicode scalars (characters, not bytes).
@@ -447,23 +447,33 @@ pub(crate) fn enumerate_flows_in_seed(seed_path: &Path, seed_display: &str) -> V
                 continue;
             }
         };
-        // Mirror the MCP discovery loop's tolerance: list flows even
-        // when a sibling `task_file:` is missing -- a broken prompt
-        // link is the runner's problem, not a reason to hide the
-        // flow from inventory.
-        let flow = match load_flow_from_str(&contents) {
-            Ok(f) => f,
+        // Use the polymorphic loader so graph flows (kuromaku's own
+        // implement-issue / validate-issues, plus rust seed's
+        // implement-issue) show up alongside linear flows. The earlier
+        // mcp/discovery.rs walker used the linear-only loader, which
+        // silently dropped graph flows from the inventory -- a real
+        // regression once kuromaku itself standardised on graph flows.
+        // String-only loader keeps the inventory listing tolerant of
+        // missing sibling `task_file:` files: a broken prompt link is
+        // the runner's problem, not a reason to hide the flow.
+        let entry = match load_flow_any_from_str(&contents) {
+            Ok(Flow::Linear(f)) => FlowEntry {
+                name: f.name,
+                description: f.prompt.unwrap_or_default(),
+                steps: f.steps.into_iter().map(|s| s.id).collect(),
+            },
+            Ok(Flow::Graph(g)) => FlowEntry {
+                name: g.name,
+                description: g.prompt.unwrap_or_default(),
+                steps: g.graph.keys().cloned().collect(),
+            },
             Err(e) => {
                 warn!(path = %p.display(), seed = %seed_display, error = %e,
                       "flow file invalid");
                 continue;
             }
         };
-        out.push(FlowEntry {
-            name: flow.name,
-            description: flow.prompt.unwrap_or_default(),
-            steps: flow.steps.into_iter().map(|s| s.id).collect(),
-        });
+        out.push(entry);
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
@@ -895,6 +905,55 @@ mod tests {
     }
 
     // ---- per-seed flows walker ----
+
+    fn minimal_graph_flow(name: &str, prompt: Option<&str>, states: &[&str]) -> String {
+        // Smallest graph flow that schema-validates: one initial state
+        // ending in `final:` so reachability and dead-end checks pass.
+        // We deliberately use `final:` for trailing states because the
+        // schema requires every state to terminate either via `next:`
+        // or `final:`.
+        assert!(!states.is_empty());
+        let mut s = format!("version: \"1\"\nname: {name}\n");
+        if let Some(p) = prompt {
+            s.push_str(&format!("prompt: {p}\n"));
+        }
+        s.push_str(&format!("initial: {}\n", states[0]));
+        s.push_str("graph:\n");
+        for (i, st) in states.iter().enumerate() {
+            s.push_str(&format!("  {st}:\n    final: \"done at {st}\"\n"));
+            // Note: a real graph would have edges between states. For
+            // this fixture we only need the listing to surface the
+            // state IDs, so making them all terminal keeps validation
+            // happy without distracting from the test intent.
+            let _ = i;
+        }
+        s
+    }
+
+    #[test]
+    fn enumerate_flows_in_seed_includes_graph_flows() {
+        // Regression for kuromaku's own seed: the previous walker used
+        // the linear-only `load_flow_from_str` and silently dropped
+        // graph-shaped flows. Pin the broader contract here so the
+        // inventory keeps showing both shapes.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(
+            &seed.join("flows/build.yaml"),
+            &minimal_flow("build", Some("linear"), &["plan"]),
+        );
+        write(
+            &seed.join("flows/implement.yaml"),
+            &minimal_graph_flow("implement", Some("graph"), &["precheck"]),
+        );
+        let flows = enumerate_flows_in_seed(&seed, "seed/");
+        let by_name: std::collections::HashMap<&str, &FlowEntry> =
+            flows.iter().map(|f| (f.name.as_str(), f)).collect();
+        assert_eq!(by_name.len(), 2, "both linear and graph flows must list");
+        assert_eq!(by_name["build"].steps, vec!["plan"]);
+        assert_eq!(by_name["implement"].description, "graph");
+        assert_eq!(by_name["implement"].steps, vec!["precheck"]);
+    }
 
     #[test]
     fn enumerate_flows_in_seed_collects_yaml_and_yml() {
