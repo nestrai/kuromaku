@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 
 use crate::config::{Backend, FlowConfig};
+#[cfg(test)]
+use crate::koto_config::RoleOverlay;
 use crate::koto_config::{KOTO_CONFIG_FILE, KotoBackend, KotoConfig, KotoRole, Seeds};
 
 #[derive(Debug, thiserror::Error)]
@@ -346,10 +348,16 @@ pub fn resolve_role(
 /// and for the `resolution-audit.txt` file written into the run directory
 /// (issue #31), so the on-disk record matches what the user saw in the
 /// terminal.
+///
+/// `overlay_summaries` (issue #364): pre-rendered overlay contribution per
+/// role (e.g. `"rules+=2, model"`). Empty / absent entries suppress the
+/// extra audit line entirely so the no-overlay case is byte-identical to
+/// the pre-#364 output.
 pub fn format_audit(
     seeds: &Seeds,
     resolved: &[ResolvedRole],
     cli_vars: &HashMap<String, String>,
+    overlay_summaries: &HashMap<String, String>,
 ) -> String {
     let mut out = String::new();
     // Seeds line first -- the user sees the search order before any role-level
@@ -389,6 +397,15 @@ pub fn format_audit(
                 r.extra_args.join(" ")
             ));
         }
+        // #364: pin the overlay contribution into the audit so the
+        // run-directory record explains why the agent's effective model
+        // / rules / extra_args differ from the seed YAML. Skipped when
+        // the role had no overlays so the audit stays terse.
+        if let Some(summary) = overlay_summaries.get(&r.name)
+            && !summary.is_empty()
+        {
+            out.push_str(&format!("           overlays: {summary}\n"));
+        }
     }
     if !cli_vars.is_empty() {
         let mut keys: Vec<&String> = cli_vars.keys().collect();
@@ -406,8 +423,13 @@ pub fn format_audit(
 /// Print the audit block to stderr before flow execution. Thin wrapper around
 /// [`format_audit`] -- both the terminal and the run-directory copy share the
 /// exact same lines.
-pub fn print_audit(seeds: &Seeds, resolved: &[ResolvedRole], cli_vars: &HashMap<String, String>) {
-    let text = format_audit(seeds, resolved, cli_vars);
+pub fn print_audit(
+    seeds: &Seeds,
+    resolved: &[ResolvedRole],
+    cli_vars: &HashMap<String, String>,
+    overlay_summaries: &HashMap<String, String>,
+) {
+    let text = format_audit(seeds, resolved, cli_vars, overlay_summaries);
     // Strip the single trailing newline so eprintln! doesn't double up.
     eprint!("{text}");
 }
@@ -518,6 +540,7 @@ mod tests {
             agent: "Sage".into(),
             model: Some("project/m".into()),
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let cli = vec![RoleOverride::Model {
             role: "dev".into(),
@@ -545,6 +568,7 @@ mod tests {
             agent: "Sage".into(),
             model: Some("ollama/llama3-70b".into()),
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let input = ki("rev", "claude/opus-4-7", Some("reasoning"));
         let r = resolve_role(&input, Some("Sage"), Some(&project), &[], None).unwrap();
@@ -594,6 +618,7 @@ mod tests {
             agent: "Sage".into(),
             model: None,
             backend: Some(KotoBackend::Cli),
+            overlays: RoleOverlay::default(),
         };
         let cli = vec![RoleOverride::Backend {
             role: "dev".into(),
@@ -619,6 +644,7 @@ mod tests {
             agent: "Sage".into(),
             model: None,
             backend: Some(KotoBackend::Api),
+            overlays: RoleOverlay::default(),
         };
         let input = ki("rev", "x/y", None);
         let r = resolve_role(
@@ -702,7 +728,12 @@ mod tests {
             seed_origin: None,
             extra_args: vec!["--dangerously-skip-permissions".to_string()],
         };
-        let audit = format_audit(&Seeds::default_local(), &[role], &HashMap::new());
+        let audit = format_audit(
+            &Seeds::default_local(),
+            &[role],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(
             audit.contains("extra_args: [--dangerously-skip-permissions]"),
             "audit did not include extra_args line, got:\n{audit}"
@@ -726,10 +757,65 @@ mod tests {
             seed_origin: None,
             extra_args: Vec::new(),
         };
-        let audit = format_audit(&Seeds::default_local(), &[role], &HashMap::new());
+        let audit = format_audit(
+            &Seeds::default_local(),
+            &[role],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
         assert!(
             !audit.contains("extra_args"),
             "audit should not mention extra_args when empty, got:\n{audit}"
+        );
+    }
+
+    /// AC5: the audit must surface overlay contributions for every
+    /// role that had them, with the rendered summary appearing on a
+    /// dedicated `overlays:` line. Suppressed for roles with no
+    /// overlay -- pinned in the omits test below to keep the audit
+    /// terse for the no-overlay case.
+    #[test]
+    fn format_audit_includes_overlays_when_provided() {
+        let role = ResolvedRole {
+            name: "writer".to_string(),
+            agent: "Babis".to_string(),
+            model: "claude/opus-4-7".to_string(),
+            backend: Backend::ClaudeCli,
+            model_source: "agent".to_string(),
+            backend_source: "agent".to_string(),
+            seed_origin: None,
+            extra_args: Vec::new(),
+        };
+        let mut overlays = HashMap::new();
+        overlays.insert("writer".to_string(), "rules+=2, model".to_string());
+        let audit = format_audit(&Seeds::default_local(), &[role], &HashMap::new(), &overlays);
+        assert!(
+            audit.contains("overlays: rules+=2, model"),
+            "audit missing overlay summary, got:\n{audit}"
+        );
+    }
+
+    #[test]
+    fn format_audit_omits_overlays_when_absent() {
+        let role = ResolvedRole {
+            name: "writer".to_string(),
+            agent: "Babis".to_string(),
+            model: "claude/opus-4-7".to_string(),
+            backend: Backend::ClaudeCli,
+            model_source: "agent".to_string(),
+            backend_source: "agent".to_string(),
+            seed_origin: None,
+            extra_args: Vec::new(),
+        };
+        let audit = format_audit(
+            &Seeds::default_local(),
+            &[role],
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        assert!(
+            !audit.contains("overlays:"),
+            "audit should not mention overlays when empty, got:\n{audit}"
         );
     }
 
@@ -756,6 +842,7 @@ mod tests {
             agent: "Project".into(),
             model: None,
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let cli = vec![RoleOverride::Agent {
             role: "dev".into(),
@@ -772,6 +859,7 @@ mod tests {
             agent: "Project".into(),
             model: None,
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let input = ki("dev", "x/y", None);
         let r = resolve_role(&input, Some("Flow"), Some(&project), &[], None).unwrap();
@@ -784,6 +872,7 @@ mod tests {
             agent: "Project".into(),
             model: None,
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let input = ki("dev", "x/y", None);
         let r = resolve_role(&input, None, Some(&project), &[], None).unwrap();
@@ -805,6 +894,7 @@ mod tests {
             agent: "Project".into(),
             model: None,
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let cli = vec![RoleOverride::Agent {
             role: "dev".into(),
@@ -820,6 +910,7 @@ mod tests {
             agent: "Project".into(),
             model: None,
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let r = resolve_role_agent("dev", Some("Flow"), Some(&project), &[]);
         assert_eq!(r.as_deref(), Some("Flow"));
@@ -831,6 +922,7 @@ mod tests {
             agent: "Project".into(),
             model: None,
             backend: None,
+            overlays: RoleOverlay::default(),
         };
         let r = resolve_role_agent("dev", None, Some(&project), &[]);
         assert_eq!(r.as_deref(), Some("Project"));

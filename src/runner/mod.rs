@@ -55,6 +55,13 @@ pub struct RunContext {
     /// `post_comment:`. Defaults to the `gh` CLI poster; tests substitute a
     /// closure to exercise the soft-fail behavior without touching gh.
     pub poster: github::Poster,
+    /// Pre-rendered overlay summaries keyed by role name (issue #364).
+    /// Filled by the runner setup after `apply_role_overlays`; consumed by
+    /// the step-banner construction sites to surface the overlay
+    /// contribution next to the model/backend cells. Empty when no role
+    /// in the flow had overlays, in which case the banner is byte-
+    /// identical to today's output.
+    pub overlay_summaries: HashMap<String, String>,
 }
 
 impl RunContext {
@@ -92,6 +99,7 @@ impl RunContext {
             skills_cache,
             template_vars,
             poster: github::gh_poster(),
+            overlay_summaries: HashMap::new(),
         }
     }
 
@@ -134,6 +142,7 @@ impl RunContext {
             skills_cache,
             template_vars,
             poster: github::gh_poster(),
+            overlay_summaries: HashMap::new(),
         }
     }
 }
@@ -1345,6 +1354,15 @@ pub(crate) async fn run_steps_with_state(
         // agent" and keeps the resolution explicit -- no surprise merges.
         let effective_extra_args: &[String] = resolve_extra_args(step, agent, effective_backend);
 
+        // #364: pull the overlay summary for this step's role from
+        // RunContext, populated by the runner setup right after
+        // `apply_role_overlays`. Direct-agent steps (no `role:`) and
+        // steps whose role had no overlays produce `None`, which
+        // `print_step_banner` suppresses entirely.
+        let overlay_summary = step
+            .role
+            .as_deref()
+            .and_then(|r| ctx.overlay_summaries.get(r).cloned());
         let step_info = StepInfo {
             id: step.id.clone(),
             agent: agent.name.clone(),
@@ -1353,6 +1371,7 @@ pub(crate) async fn run_steps_with_state(
             backend: effective_backend,
             input: step.input.clone(),
             state: StepState::Running,
+            overlay_summary,
         };
 
         ui::print_step_banner(i + 1, total, &step_info);
@@ -2225,6 +2244,238 @@ mod flow_api {
         }
     }
 
+    /// Summary of what an overlay contributed to a single role's bound
+    /// agent. Used for the run banner ("overlays: rules+=2, model") and
+    /// the audit ("[resolve] overlays: rules+=2, model"). Issue #364.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) struct OverlayApplied {
+        /// Number of overlay rules that were appended after dedup.
+        pub rule_delta: usize,
+        pub model_replaced: bool,
+        pub backend_replaced: bool,
+        /// Backend keys whose `extra_args` were replaced. Ordered by the
+        /// `Backend` enum's natural order so the summary is deterministic.
+        pub extra_args_backends: Vec<Backend>,
+    }
+
+    impl OverlayApplied {
+        /// One-line summary used in both the banner and the audit. Returns
+        /// `None` when nothing was applied -- callers suppress the line.
+        pub(crate) fn summary(&self) -> Option<String> {
+            let mut parts: Vec<String> = Vec::new();
+            if self.rule_delta > 0 {
+                parts.push(format!("rules+={}", self.rule_delta));
+            }
+            if self.model_replaced {
+                parts.push("model".to_string());
+            }
+            if self.backend_replaced {
+                parts.push("backend".to_string());
+            }
+            if !self.extra_args_backends.is_empty() {
+                let names: Vec<&str> = self
+                    .extra_args_backends
+                    .iter()
+                    .map(|b| match b {
+                        Backend::Api => "api",
+                        Backend::ClaudeCli => "claude-cli",
+                        Backend::Codex => "codex",
+                        Backend::Ollama => "ollama",
+                    })
+                    .collect();
+                parts.push(format!("extra_args[{}]", names.join(",")));
+            }
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+    }
+
+    /// Layer the project-level role overlays onto the seed agents
+    /// (issue #364).
+    ///
+    /// `roles_in_use` is the list of `(role_name, agent_id)` pairs the
+    /// caller wants overlayed -- typically every role referenced by the
+    /// current flow. For each pair we:
+    ///   1. Look up the project config's `overlays:` block for the role.
+    ///   2. If non-empty, merge it onto the seed agent in `agents` whose
+    ///      `id` matches `agent_id`. `model`/`backend` replace; `rules`
+    ///      append-then-dedup; `extra_args` replace per backend key.
+    ///   3. Record an [`OverlayApplied`] keyed by role name so the
+    ///      runner can surface the summary in the banner and audit.
+    ///
+    /// v1 constraint: if the same `agent_id` is bound to more than one
+    /// role and the per-role overlays differ, we return a validation
+    /// error. This keeps the mutate-in-place model honest -- supporting
+    /// "same agent, different overlays per role" would require a per-
+    /// binding effective agent map, which is deferred until a real use
+    /// case turns up.
+    pub(crate) fn apply_role_overlays(
+        agents: &mut [config::Agent],
+        roles_in_use: &[(String, String)],
+        koto_config: Option<&crate::koto_config::KotoConfig>,
+    ) -> std::result::Result<HashMap<String, OverlayApplied>, String> {
+        use crate::koto_config::RoleOverlay;
+
+        // No project config => no overlays to apply.
+        let Some(kc) = koto_config else {
+            return Ok(HashMap::new());
+        };
+
+        // Collect per-agent overlays first so we can catch the v1 collision
+        // case before mutating anything. Empty overlays are skipped so a
+        // role without an `overlays:` block does not collide with one that
+        // has them.
+        let mut overlays_by_agent: HashMap<String, Vec<(&str, &RoleOverlay)>> = HashMap::new();
+        for (role_name, agent_id) in roles_in_use {
+            let Some(kr) = kc.roles.get(role_name) else {
+                continue;
+            };
+            if kr.overlays.is_empty() {
+                continue;
+            }
+            overlays_by_agent
+                .entry(agent_id.clone())
+                .or_default()
+                .push((role_name.as_str(), &kr.overlays));
+        }
+        // Collision rule (#364 v1): if two roles bind the same agent_id
+        // with non-identical overlays, refuse. The exit ramp is documented
+        // in the v1 design notes -- a future "per-binding effective agent"
+        // refactor lifts the restriction without changing YAML.
+        for (agent_id, entries) in &overlays_by_agent {
+            if entries.len() < 2 {
+                continue;
+            }
+            let first_overlay = entries[0].1;
+            for (other_role, other_overlay) in entries.iter().skip(1) {
+                if other_overlay != &first_overlay {
+                    // Sort role names so the error message is deterministic
+                    // -- otherwise HashMap iteration order would leak.
+                    let mut role_names: Vec<&str> = entries.iter().map(|(r, _)| *r).collect();
+                    role_names.sort();
+                    return Err(format!(
+                        "agent '{agent_id}' is bound to roles {} with differing overlays \
+(roles: {}, conflict on '{other_role}') -- the v1 overlay model mutates the agent in place. \
+Either drop overlays on one binding or fork the agent into separate IDs.",
+                        role_names.join(", "),
+                        role_names.join(", ")
+                    ));
+                }
+            }
+        }
+
+        // Apply overlays. Each unique agent gets mutated at most once --
+        // when multiple roles bind the same agent with identical overlays,
+        // we apply the overlay once and surface the OverlayApplied summary
+        // for every role that asked for it.
+        let mut applied: HashMap<String, OverlayApplied> = HashMap::new();
+        let mut mutated: HashSet<String> = HashSet::new();
+        let agents_by_id: HashMap<String, usize> = agents
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.id.clone(), i))
+            .collect();
+
+        for (agent_id, entries) in &overlays_by_agent {
+            let Some(&idx) = agents_by_id.get(agent_id) else {
+                // Agent wasn't loaded -- typically because the flow does
+                // not reference the role. Skip silently; the overlay was
+                // never going to apply to a running step.
+                continue;
+            };
+            let overlay = entries[0].1;
+            let agent = &mut agents[idx];
+
+            let mut summary = OverlayApplied {
+                rule_delta: 0,
+                model_replaced: false,
+                backend_replaced: false,
+                extra_args_backends: Vec::new(),
+            };
+
+            if !mutated.contains(agent_id) {
+                if let Some(ref m) = overlay.model {
+                    agent.model = m.clone();
+                    summary.model_replaced = true;
+                }
+                if let Some(b) = overlay.backend {
+                    agent.backend = crate::resolver::project_backend_to_runtime(b);
+                    summary.backend_replaced = true;
+                }
+                // Per-backend replace -- mirrors AC4 "extra_args.codex
+                // replaces the seed agent's extra_args.codex list entirely
+                // (no token-level merge)".
+                if !overlay.extra_args.is_empty() {
+                    let mut backends: Vec<Backend> = overlay.extra_args.keys().copied().collect();
+                    // Deterministic order so the banner summary is stable.
+                    backends.sort_by_key(|b| match b {
+                        Backend::Api => 0,
+                        Backend::ClaudeCli => 1,
+                        Backend::Codex => 2,
+                        Backend::Ollama => 3,
+                    });
+                    summary.extra_args_backends = backends.clone();
+                    for b in backends {
+                        let val = overlay.extra_args.get(&b).cloned().unwrap_or_default();
+                        agent.extra_args.insert(b, val);
+                    }
+                }
+                // Append + dedup-by-name preserving seed order (AC2, AC7).
+                if !overlay.rules.is_empty() {
+                    let mut seen: HashSet<String> = agent.rules.iter().cloned().collect();
+                    let mut added = 0usize;
+                    for r in &overlay.rules {
+                        if seen.insert(r.clone()) {
+                            agent.rules.push(r.clone());
+                            added += 1;
+                        }
+                    }
+                    summary.rule_delta = added;
+                }
+                mutated.insert(agent_id.clone());
+            } else {
+                // Already mutated by an earlier role binding with identical
+                // overlays. Re-derive the summary so every role gets one
+                // even though the mutation happened once.
+                if overlay.model.is_some() {
+                    summary.model_replaced = true;
+                }
+                if overlay.backend.is_some() {
+                    summary.backend_replaced = true;
+                }
+                if !overlay.extra_args.is_empty() {
+                    let mut backends: Vec<Backend> = overlay.extra_args.keys().copied().collect();
+                    backends.sort_by_key(|b| match b {
+                        Backend::Api => 0,
+                        Backend::ClaudeCli => 1,
+                        Backend::Codex => 2,
+                        Backend::Ollama => 3,
+                    });
+                    summary.extra_args_backends = backends;
+                }
+                if !overlay.rules.is_empty() {
+                    // We do not know how many new rules survived dedup for
+                    // this second-round role, but the agent rule list is
+                    // already final -- so we approximate by counting
+                    // overlay rules that landed in the agent's final list
+                    // beyond what the seed had. Cheaper and more honest:
+                    // record the overlay's rule count, which is what the
+                    // user wrote. The banner is informational, not load-
+                    // bearing.
+                    summary.rule_delta = overlay.rules.len();
+                }
+            }
+            for (role_name, _) in entries {
+                applied.insert(role_name.to_string(), summary.clone());
+            }
+        }
+
+        Ok(applied)
+    }
+
     /// Build the cascade-resolved binding for every role used in the flow.
     pub(crate) fn build_resolved_roles(
         flow_config: &FlowConfig,
@@ -2744,8 +2995,23 @@ mod flow_api {
         };
 
         // ---- 6. Load agents and resolve roles --------------------------
-        let (agents, agent_origins, agent_hashes) =
+        let (mut agents, agent_origins, agent_hashes) =
             config::load_agents_for_flow_with_seeds(&seeds, &flow_config, koto_config.as_ref())?;
+
+        // #364: apply project-level role overlays right after agents load
+        // and before role resolution. This way the resolver, the rules
+        // loader, and the manifest all see the overlay-mutated values
+        // automatically -- overlays sit one layer above the agent file and
+        // one layer below the CLI/`--role` override surface.
+        let roles_in_use: Vec<(String, String)> = flow_config
+            .steps
+            .iter()
+            .filter_map(|s| s.role.clone().map(|r| (r, s.agent.clone())))
+            .collect();
+        let overlays_by_role =
+            apply_role_overlays(&mut agents, &roles_in_use, koto_config.as_ref())
+                .map_err(|msg| eyre!("{msg}"))?;
+
         let mut resolved_roles = build_resolved_roles(
             &flow_config,
             &agents,
@@ -2763,8 +3029,26 @@ mod flow_api {
 
         // ---- 7. Audit output ------------------------------------------
         let cli_vars_for_audit = spec.vars.clone();
-        let audit_text = format_audit(&seeds, &resolved_roles, &cli_vars_for_audit);
-        print_audit(&seeds, &resolved_roles, &cli_vars_for_audit);
+        // #364: render the overlay summaries into the audit alongside
+        // the existing model/backend/extra_args lines so the run record
+        // explains every layer that touched the effective agent. Empty
+        // map = no overlays, audit is byte-identical to pre-#364.
+        let overlay_summary_map: HashMap<String, String> = overlays_by_role
+            .iter()
+            .filter_map(|(role, applied)| applied.summary().map(|s| (role.clone(), s)))
+            .collect();
+        let audit_text = format_audit(
+            &seeds,
+            &resolved_roles,
+            &cli_vars_for_audit,
+            &overlay_summary_map,
+        );
+        print_audit(
+            &seeds,
+            &resolved_roles,
+            &cli_vars_for_audit,
+            &overlay_summary_map,
+        );
 
         apply_resolved_roles_to_steps(&mut flow_config, &resolved_roles);
 
@@ -2819,7 +3103,7 @@ mod flow_api {
 
         // ---- 10. RunContext + on-disk run layout ----------------------
         let stack_path = resolve_stack_path(&flow_config.stack.path);
-        let ctx = RunContext::new(
+        let mut ctx = RunContext::new(
             flow_name.clone(),
             resolved_task,
             stack_path.clone(),
@@ -2828,6 +3112,13 @@ mod flow_api {
             skills_cache,
             effective_vars.clone(),
         );
+        // #364: render once into a role-keyed summary map so the step
+        // loop can join it without re-running summary derivation per
+        // step. Empty when no role had overlays.
+        ctx.overlay_summaries = overlays_by_role
+            .iter()
+            .filter_map(|(role, applied)| applied.summary().map(|s| (role.clone(), s)))
+            .collect();
 
         stack::init_run_layout(&ctx.run_path)
             .map_err(|e| eyre!("failed to create run dir: {e}"))?;
@@ -3160,6 +3451,35 @@ mod flow_api {
             agents_by_id.insert(agent_id.clone(), agent);
         }
 
+        // #364: apply project-level role overlays to the loaded agents.
+        // The graph driver looks up agents through `agents_by_id` keyed
+        // by agent ID -- because overlays mutate in place, the driver
+        // sees the overlay values without further wiring. The role map
+        // we build here is one `(role_name, agent_id)` pair per
+        // non-terminal state that has a role binding.
+        let roles_in_use_graph: Vec<(String, String)> = state_to_agent
+            .iter()
+            .filter_map(|(state_id, agent_id)| {
+                graph
+                    .graph
+                    .get(state_id)
+                    .and_then(|s| s.role.as_deref())
+                    .map(|r| (r.to_string(), agent_id.clone()))
+            })
+            .collect();
+        // `agents_by_id` is a HashMap; we need a contiguous &mut slice for
+        // `apply_role_overlays`. Move into a Vec, mutate, then rebuild.
+        let mut agents_vec_mut: Vec<config::Agent> = agents_by_id.drain().map(|(_, a)| a).collect();
+        let overlays_by_role_graph =
+            apply_role_overlays(&mut agents_vec_mut, &roles_in_use_graph, koto_config)
+                .map_err(|msg| eyre!("{msg}"))?;
+        // Rebuild the by-id map so the rest of the setup keeps reading
+        // through the same handle.
+        let mut agents_by_id: HashMap<String, config::Agent> = HashMap::new();
+        for a in agents_vec_mut {
+            agents_by_id.insert(a.id.clone(), a);
+        }
+
         // ---- Guide / rules cache (skills are not declared on graph yet)
         let agents_vec: Vec<config::Agent> = agents_by_id.values().cloned().collect();
         let guide = super::load_guide_from_seeds(seeds).map_err(|e| eyre!("{e}"))?;
@@ -3171,7 +3491,7 @@ mod flow_api {
         // back to the implicit per-project stack root. Same algorithm the
         // linear runner uses when its `stack.path` is empty.
         let stack_path = resolve_stack_path("");
-        let ctx = RunContext::new(
+        let mut ctx = RunContext::new(
             graph.name.clone(),
             resolved_task,
             stack_path,
@@ -3180,6 +3500,10 @@ mod flow_api {
             HashMap::new(),
             effective_vars.clone(),
         );
+        ctx.overlay_summaries = overlays_by_role_graph
+            .iter()
+            .filter_map(|(role, applied)| applied.summary().map(|s| (role.clone(), s)))
+            .collect();
         stack::init_run_layout(&ctx.run_path)
             .map_err(|e| eyre!("failed to create run dir: {e}"))?;
 
@@ -3736,6 +4060,31 @@ mod flow_api {
             agents_by_id.insert(agent_id.clone(), agent);
         }
 
+        // #364: apply project-level role overlays on resume too, so a
+        // resumed run sees the same overlay-merged agents as a fresh
+        // run. If the project config was edited between pause and
+        // resume, the new overlays take effect -- same policy as the
+        // rest of the resume code path (`state_to_agent` re-resolves
+        // through the current project config).
+        let roles_in_use_graph: Vec<(String, String)> = state_to_agent
+            .iter()
+            .filter_map(|(state_id, agent_id)| {
+                graph
+                    .graph
+                    .get(state_id)
+                    .and_then(|s| s.role.as_deref())
+                    .map(|r| (r.to_string(), agent_id.clone()))
+            })
+            .collect();
+        let mut agents_vec_mut: Vec<config::Agent> = agents_by_id.drain().map(|(_, a)| a).collect();
+        let overlays_by_role_graph =
+            apply_role_overlays(&mut agents_vec_mut, &roles_in_use_graph, koto_config)
+                .map_err(|msg| eyre!("{msg}"))?;
+        let mut agents_by_id: HashMap<String, config::Agent> = HashMap::new();
+        for a in agents_vec_mut {
+            agents_by_id.insert(a.id.clone(), a);
+        }
+
         // ---- Guide / rules cache ---------------------------------------
         let agents_vec: Vec<config::Agent> = agents_by_id.values().cloned().collect();
         let guide = super::load_guide_from_seeds(seeds).map_err(|e| eyre!("{e}"))?;
@@ -3747,7 +4096,7 @@ mod flow_api {
         // created on the original run; reuse it so step files written
         // before and after the pause share one location.
         let stack_path = resolve_stack_path("");
-        let ctx = RunContext::resume(
+        let mut ctx = RunContext::resume(
             graph.name.clone(),
             resolved_task,
             stack_path,
@@ -3759,6 +4108,10 @@ mod flow_api {
             HashMap::new(),
             effective_vars.clone(),
         );
+        ctx.overlay_summaries = overlays_by_role_graph
+            .iter()
+            .filter_map(|(role, applied)| applied.summary().map(|s| (role.clone(), s)))
+            .collect();
 
         // ---- Synthesise human-input step (issue #340) ------------------
         // If the human typed something into the issue between pause and
@@ -4170,9 +4523,9 @@ pub use flow_api::{
 // reach for these directly (only the test build does) -- silence the lint.
 #[allow(unused_imports)]
 pub(crate) use flow_api::{
-    apply_resolved_roles_to_steps, apply_role_agent_overrides, build_manifest, resolve_flow_path,
-    resolve_stack_path, resolve_stack_path_for_flow_name, resolve_task, substitute_placeholders,
-    substitute_roles, substitute_vars, verify_flow_step_ids,
+    apply_resolved_roles_to_steps, apply_role_agent_overrides, apply_role_overlays, build_manifest,
+    resolve_flow_path, resolve_stack_path, resolve_stack_path_for_flow_name, resolve_task,
+    substitute_placeholders, substitute_roles, substitute_vars, verify_flow_step_ids,
 };
 
 // Test-only re-export so in-tree consumers (notably the MCP session module)
@@ -5892,5 +6245,365 @@ look around
         let result =
             substitute_roles("{{agents.Levi.model}} {{roles.architect}}", &roles, "ctx").unwrap();
         assert_eq!(result, "{{agents.Levi.model}} Levi");
+    }
+
+    // --- agent overlays (issue #364) -----------------------------------
+
+    /// Build a seed Agent for overlay tests. Each test mutates the
+    /// returned agent through `apply_role_overlays` and asserts on the
+    /// post-overlay state.
+    fn babis_seed() -> crate::config::Agent {
+        let mut extra_args = HashMap::new();
+        extra_args.insert(
+            Backend::Codex,
+            vec!["--sandbox".to_string(), "read-only".to_string()],
+        );
+        crate::config::Agent {
+            id: "Babis".to_string(),
+            name: "Babis".to_string(),
+            title: None,
+            description: None,
+            role: String::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: vec!["design-rigor".to_string(), "naming-discipline".to_string()],
+            skills: Vec::new(),
+            env: HashMap::new(),
+            extra_args,
+        }
+    }
+
+    /// Build a one-role KotoConfig with the given overlay attached.
+    fn koto_with_overlay(
+        role: &str,
+        agent: &str,
+        overlay: crate::koto_config::RoleOverlay,
+    ) -> crate::koto_config::KotoConfig {
+        use crate::koto_config::{KotoConfig, KotoRole, Seeds};
+        let mut roles = HashMap::new();
+        roles.insert(
+            role.to_string(),
+            KotoRole {
+                agent: agent.to_string(),
+                model: None,
+                backend: None,
+                overlays: overlay,
+            },
+        );
+        KotoConfig {
+            version: "1".to_string(),
+            tiers: HashMap::new(),
+            default_backend: None,
+            vars: HashMap::new(),
+            roles,
+            seeds: Seeds::default_local(),
+        }
+    }
+
+    #[test]
+    fn overlay_appends_rules_seed_first() {
+        // AC2: seed rules keep position; overlay rules come last.
+        use crate::koto_config::RoleOverlay;
+        let mut agents = vec![babis_seed()];
+        let overlay = RoleOverlay {
+            rules: vec![
+                "senior-cover-letter".to_string(),
+                "customer-anonymization".to_string(),
+            ],
+            ..RoleOverlay::default()
+        };
+        let kc = koto_with_overlay("writer", "Babis", overlay);
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap();
+
+        assert_eq!(
+            agents[0].rules,
+            vec![
+                "design-rigor".to_string(),
+                "naming-discipline".to_string(),
+                "senior-cover-letter".to_string(),
+                "customer-anonymization".to_string(),
+            ]
+        );
+        assert_eq!(applied["writer"].rule_delta, 2);
+    }
+
+    #[test]
+    fn overlay_dedup_preserves_seed_order() {
+        // AC7: duplicate rule names get deduplicated and the seed rule
+        // keeps its position. Only the new rule lands at the end.
+        use crate::koto_config::RoleOverlay;
+        let mut agents = vec![babis_seed()];
+        let overlay = RoleOverlay {
+            rules: vec![
+                "design-rigor".to_string(), // already on seed -- dedup
+                "senior-cover-letter".to_string(),
+            ],
+            ..RoleOverlay::default()
+        };
+        let kc = koto_with_overlay("writer", "Babis", overlay);
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap();
+
+        assert_eq!(
+            agents[0].rules,
+            vec![
+                "design-rigor".to_string(),
+                "naming-discipline".to_string(),
+                "senior-cover-letter".to_string(),
+            ]
+        );
+        // Only one new rule survived dedup, so rule_delta is 1.
+        assert_eq!(applied["writer"].rule_delta, 1);
+    }
+
+    #[test]
+    fn overlay_replaces_model() {
+        // AC3: overlay `model:` replaces the seed agent's model wholesale.
+        use crate::koto_config::RoleOverlay;
+        let mut agents = vec![babis_seed()];
+        let overlay = RoleOverlay {
+            model: Some("claude/opus-4-7".to_string()),
+            ..RoleOverlay::default()
+        };
+        let kc = koto_with_overlay("writer", "Babis", overlay);
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap();
+
+        assert_eq!(agents[0].model, "claude/opus-4-7");
+        assert!(applied["writer"].model_replaced);
+    }
+
+    #[test]
+    fn overlay_replaces_extra_args_per_backend() {
+        // AC4: extra_args.codex replaces the seed list entirely (no
+        // token-level merge). Other backends keep their seed values.
+        use crate::koto_config::RoleOverlay;
+        let mut agents = vec![babis_seed()];
+        let mut overlay_extra = HashMap::new();
+        overlay_extra.insert(
+            Backend::Codex,
+            vec!["--sandbox".to_string(), "workspace-write".to_string()],
+        );
+        let overlay = RoleOverlay {
+            extra_args: overlay_extra,
+            ..RoleOverlay::default()
+        };
+        let kc = koto_with_overlay("writer", "Babis", overlay);
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap();
+
+        // Codex slot replaced wholesale.
+        assert_eq!(
+            agents[0].extra_args.get(&Backend::Codex),
+            Some(&vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string()
+            ])
+        );
+        // Other backend keys untouched (there were none on the seed for
+        // claude-cli; the assertion just confirms no spurious entries).
+        assert!(!agents[0].extra_args.contains_key(&Backend::ClaudeCli));
+        assert_eq!(applied["writer"].extra_args_backends, vec![Backend::Codex]);
+    }
+
+    #[test]
+    fn overlay_no_overlay_is_byte_identical_to_baseline() {
+        // AC6: a role without overlays produces a no-op. The agent must
+        // come out the other side untouched, and the returned map carries
+        // no entry for that role.
+        let mut agents = vec![babis_seed()];
+        let baseline = agents[0].clone();
+        let kc = koto_with_overlay(
+            "writer",
+            "Babis",
+            crate::koto_config::RoleOverlay::default(),
+        );
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap();
+
+        assert_eq!(agents[0], baseline);
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn overlay_none_koto_config_is_noop() {
+        // Defensive: callers that have no project config (e.g. tests, MCP
+        // probes) get an empty map and untouched agents. No panic, no
+        // hidden mutation.
+        let mut agents = vec![babis_seed()];
+        let baseline = agents[0].clone();
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, None).unwrap();
+        assert_eq!(agents[0], baseline);
+        assert!(applied.is_empty());
+    }
+
+    #[test]
+    fn overlay_collision_two_roles_same_agent_errors() {
+        // v1 constraint: if two roles bind the same agent_id and their
+        // overlays differ, refuse. Forking the agent is the documented
+        // exit ramp; the error message points at both colliding roles.
+        use crate::config::Agent;
+        use crate::koto_config::{KotoConfig, KotoRole, RoleOverlay, Seeds};
+
+        let mut agents = vec![Agent {
+            id: "Babis".to_string(),
+            name: "Babis".to_string(),
+            title: None,
+            description: None,
+            role: String::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: Vec::new(),
+            skills: Vec::new(),
+            env: HashMap::new(),
+            extra_args: HashMap::new(),
+        }];
+        let mut roles_cfg = HashMap::new();
+        roles_cfg.insert(
+            "writer".to_string(),
+            KotoRole {
+                agent: "Babis".to_string(),
+                model: None,
+                backend: None,
+                overlays: RoleOverlay {
+                    rules: vec!["a".to_string()],
+                    ..RoleOverlay::default()
+                },
+            },
+        );
+        roles_cfg.insert(
+            "reviewer".to_string(),
+            KotoRole {
+                agent: "Babis".to_string(),
+                model: None,
+                backend: None,
+                overlays: RoleOverlay {
+                    rules: vec!["b".to_string()],
+                    ..RoleOverlay::default()
+                },
+            },
+        );
+        let kc = KotoConfig {
+            version: "1".to_string(),
+            tiers: HashMap::new(),
+            default_backend: None,
+            vars: HashMap::new(),
+            roles: roles_cfg,
+            seeds: Seeds::default_local(),
+        };
+        let roles = vec![
+            ("writer".to_string(), "Babis".to_string()),
+            ("reviewer".to_string(), "Babis".to_string()),
+        ];
+        let err = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap_err();
+        assert!(
+            err.contains("Babis") && err.contains("differing overlays"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn overlay_identical_overlays_on_same_agent_allowed() {
+        // Counter to the collision test: when two roles bind the same
+        // agent with structurally equal overlays, no conflict exists --
+        // applying once produces the right end state. This avoids
+        // breaking obvious user intent (two `*-reviewer` roles sharing a
+        // Babis seed with the same overlay block).
+        use crate::config::Agent;
+        use crate::koto_config::{KotoConfig, KotoRole, RoleOverlay, Seeds};
+
+        let mut agents = vec![Agent {
+            id: "Babis".to_string(),
+            name: "Babis".to_string(),
+            title: None,
+            description: None,
+            role: String::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            backend: Backend::ClaudeCli,
+            rules: vec!["seed-rule".to_string()],
+            skills: Vec::new(),
+            env: HashMap::new(),
+            extra_args: HashMap::new(),
+        }];
+        let overlay = RoleOverlay {
+            rules: vec!["shared-rule".to_string()],
+            ..RoleOverlay::default()
+        };
+        let mut roles_cfg = HashMap::new();
+        roles_cfg.insert(
+            "writer".to_string(),
+            KotoRole {
+                agent: "Babis".to_string(),
+                model: None,
+                backend: None,
+                overlays: overlay.clone(),
+            },
+        );
+        roles_cfg.insert(
+            "reviewer".to_string(),
+            KotoRole {
+                agent: "Babis".to_string(),
+                model: None,
+                backend: None,
+                overlays: overlay,
+            },
+        );
+        let kc = KotoConfig {
+            version: "1".to_string(),
+            tiers: HashMap::new(),
+            default_backend: None,
+            vars: HashMap::new(),
+            roles: roles_cfg,
+            seeds: Seeds::default_local(),
+        };
+        let roles = vec![
+            ("writer".to_string(), "Babis".to_string()),
+            ("reviewer".to_string(), "Babis".to_string()),
+        ];
+        let applied =
+            apply_role_overlays(&mut agents, &roles, Some(&kc)).expect("identical overlays ok");
+
+        assert_eq!(
+            agents[0].rules,
+            vec!["seed-rule".to_string(), "shared-rule".to_string()]
+        );
+        // Both roles must see the summary so the banner shows the
+        // contribution for either step.
+        assert!(applied.contains_key("writer"));
+        assert!(applied.contains_key("reviewer"));
+    }
+
+    #[test]
+    fn overlay_summary_renders_combined() {
+        // The summary string is what feeds the banner and the audit
+        // line. Pin the surface so a future refactor cannot silently
+        // change the format from underneath the user.
+        use super::flow_api::OverlayApplied;
+        let s = OverlayApplied {
+            rule_delta: 2,
+            model_replaced: true,
+            backend_replaced: false,
+            extra_args_backends: vec![Backend::Codex],
+        };
+        let summary = s.summary().unwrap();
+        assert!(summary.contains("rules+=2"));
+        assert!(summary.contains("model"));
+        assert!(summary.contains("extra_args[codex]"));
+    }
+
+    #[test]
+    fn overlay_summary_is_none_when_empty() {
+        // Symmetric to the rendered case: empty OverlayApplied collapses
+        // to None so banner and audit suppress the line entirely.
+        use super::flow_api::OverlayApplied;
+        let s = OverlayApplied {
+            rule_delta: 0,
+            model_replaced: false,
+            backend_replaced: false,
+            extra_args_backends: Vec::new(),
+        };
+        assert!(s.summary().is_none());
     }
 }

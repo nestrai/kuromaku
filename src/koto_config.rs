@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use crate::config::Backend;
 use crate::core::Version;
 
 /// Canonical project directory inside the repository. Houses agents, flows,
@@ -169,6 +170,32 @@ struct RawKotoRole {
     model: Option<String>,
     #[serde(default)]
     backend: Option<KotoBackend>,
+    /// Per-binding overlay of agent fields (issue #364). When set, the
+    /// project layers these values on top of the seed agent before any
+    /// agent run touches the role -- without forcing a fork of the agent
+    /// YAML. Validated and merged in [`KotoConfig::from_yaml_str`] /
+    /// runner setup.
+    #[serde(default)]
+    overlays: Option<RawKotoOverlay>,
+    #[serde(flatten)]
+    unknown: HashMap<String, serde_yaml::Value>,
+}
+
+/// Raw form of a role overlay block as it appears in
+/// `.kuro/config.yaml`. The four supported fields mirror the named
+/// overlay surface in issue #364 -- no general "merge any field"
+/// behaviour. Unknown keys produce a warning but do not abort parsing,
+/// matching the rest of the YAML schema.
+#[derive(Debug, Deserialize, Default)]
+struct RawKotoOverlay {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    backend: Option<KotoBackend>,
+    #[serde(default)]
+    extra_args: HashMap<String, Vec<String>>,
+    #[serde(default)]
+    rules: Vec<String>,
     #[serde(flatten)]
     unknown: HashMap<String, serde_yaml::Value>,
 }
@@ -190,6 +217,39 @@ pub struct KotoRole {
     pub agent: String,
     pub model: Option<String>,
     pub backend: Option<KotoBackend>,
+    /// Optional per-binding overlay (issue #364). Defaults to the empty
+    /// overlay -- byte-identical to "no overlays declared" for callers
+    /// that do not opt in.
+    pub overlays: RoleOverlay,
+}
+
+/// Resolved per-binding overlay. Empty (`is_empty()`) when the role
+/// declares no `overlays:` block, or declares an empty one (`overlays:
+/// {}`). The runner applies this to the seed agent right after agents
+/// load and before role resolution so the rest of the resolver sees the
+/// overlay-mutated values.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RoleOverlay {
+    pub model: Option<String>,
+    pub backend: Option<KotoBackend>,
+    /// Backend-keyed extra CLI argument lists. Mirrors `Agent::extra_args`
+    /// shape so a runner merge is a HashMap insert per backend key.
+    pub extra_args: HashMap<Backend, Vec<String>>,
+    /// Rules to append to the seed agent's rule list. Duplicates are
+    /// dedup-by-name at apply time -- seed rules keep their position.
+    pub rules: Vec<String>,
+}
+
+impl RoleOverlay {
+    /// True when the overlay contributes nothing -- no fields set and no
+    /// rules to append. Used by the runner to skip the merge work and by
+    /// the audit to suppress the "overlays:" line.
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.backend.is_none()
+            && self.extra_args.is_empty()
+            && self.rules.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -529,12 +589,17 @@ impl KotoConfig {
             if let Some(ref m) = raw_role.model {
                 validate_model_format(m)?;
             }
+            let overlays = match raw_role.overlays.as_ref() {
+                Some(raw_overlay) => resolve_overlay(role_name, raw_overlay)?,
+                None => RoleOverlay::default(),
+            };
             roles.insert(
                 role_name.clone(),
                 KotoRole {
                     agent: raw_role.agent.clone(),
                     model: raw_role.model.clone(),
                     backend: raw_role.backend,
+                    overlays,
                 },
             );
         }
@@ -591,6 +656,62 @@ fn rebase_default_seeds_for_legacy(mut cfg: KotoConfig) -> KotoConfig {
         cfg.seeds = Seeds::legacy_koto_local();
     }
     cfg
+}
+
+/// Convert a raw overlay block into a validated [`RoleOverlay`].
+///
+/// Mirrors the validation rules from `crate::config::validate_extra_args`
+/// for the `extra_args` field so the overlay surface stays consistent with
+/// the agent-file surface: unknown backend keys are rejected with the list
+/// of valid names, and the `api` backend is rejected explicitly because it
+/// has no argv to extend. Rule entries must be non-empty strings. Unknown
+/// fields warn but parsing continues -- matching the rest of the YAML
+/// schema.
+fn resolve_overlay(role_name: &str, raw: &RawKotoOverlay) -> Result<RoleOverlay, KotoConfigError> {
+    for key in raw.unknown.keys() {
+        eprintln!(
+            "warning: unknown field '{key}' in {KOTO_CONFIG_FILE} role '{role_name}' overlays"
+        );
+    }
+    if let Some(ref m) = raw.model {
+        validate_model_format(m)?;
+    }
+    // Validate rules: keep order, reject empty/whitespace entries early so
+    // the user finds the typo at parse time rather than during a flow run.
+    let mut rules = Vec::with_capacity(raw.rules.len());
+    for r in &raw.rules {
+        if r.trim().is_empty() {
+            return Err(KotoConfigError::Validation(format!(
+                "role '{role_name}' overlays.rules contains an empty entry"
+            )));
+        }
+        rules.push(r.clone());
+    }
+    // extra_args keys: parse-time validation mirrors the agent-file path so
+    // the overlay surface fails identically on typos and on `api` keys.
+    let mut extra_args: HashMap<Backend, Vec<String>> =
+        HashMap::with_capacity(raw.extra_args.len());
+    let mut keys: Vec<&String> = raw.extra_args.keys().collect();
+    keys.sort();
+    for key in keys {
+        let backend = Backend::from_yaml_name(key).ok_or_else(|| {
+            KotoConfigError::Validation(format!(
+                "unknown backend in extra_args: '{key}' (valid: claude-cli, codex, ollama) in role '{role_name}' overlays"
+            ))
+        })?;
+        if backend == Backend::Api {
+            return Err(KotoConfigError::Validation(format!(
+                "extra_args is not supported for backend 'api' in role '{role_name}' overlays -- the api backend talks to the HTTP API, not a CLI, so there is no argv to extend"
+            )));
+        }
+        extra_args.insert(backend, raw.extra_args[key].clone());
+    }
+    Ok(RoleOverlay {
+        model: raw.model.clone(),
+        backend: raw.backend,
+        extra_args,
+        rules,
+    })
 }
 
 fn validate_model_format(model: &str) -> Result<(), KotoConfigError> {
@@ -1351,5 +1472,172 @@ tiers:
         assert_eq!(cfg.seeds.seeds[0].kind_label(), "local");
         assert_eq!(cfg.seeds.seeds[1].kind_label(), "local");
         assert_eq!(cfg.seeds.seeds[2].kind_label(), "remote");
+    }
+
+    // --- overlays (issue #364) ---
+
+    #[test]
+    fn role_without_overlays_defaults_to_empty() {
+        // AC6 anchor: roles that do not declare an `overlays:` block must
+        // resolve to the empty overlay so the no-overlay path is
+        // byte-identical to today's behaviour.
+        let cfg = KotoConfig::from_yaml_str(FULL_ROLES_YAML).unwrap();
+        let dev = cfg.roles.get("developer").unwrap();
+        assert!(
+            dev.overlays.is_empty(),
+            "expected empty overlay, got: {:?}",
+            dev.overlays
+        );
+    }
+
+    #[test]
+    fn overlays_parse_all_fields() {
+        // AC1: the four supported fields round-trip through the parser into
+        // the resolved RoleOverlay.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      model: claude/opus-4-7
+      backend: api
+      rules:
+        - senior-cover-letter
+        - customer-anonymization
+      extra_args:
+        codex:
+          - --sandbox
+          - workspace-write
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        let writer = cfg.roles.get("writer").unwrap();
+        let o = &writer.overlays;
+        assert!(!o.is_empty());
+        assert_eq!(o.model.as_deref(), Some("claude/opus-4-7"));
+        assert_eq!(o.backend, Some(KotoBackend::Api));
+        assert_eq!(
+            o.rules,
+            vec![
+                "senior-cover-letter".to_string(),
+                "customer-anonymization".to_string()
+            ]
+        );
+        assert_eq!(
+            o.extra_args
+                .get(&Backend::Codex)
+                .cloned()
+                .unwrap_or_default(),
+            vec!["--sandbox".to_string(), "workspace-write".to_string()]
+        );
+    }
+
+    #[test]
+    fn overlays_empty_block_is_no_op() {
+        // Declaring `overlays: {}` accepts cleanly and behaves identically
+        // to omitting the block -- useful when scaffolding tools want to
+        // pre-write the key.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays: {}
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        let writer = cfg.roles.get("writer").unwrap();
+        assert!(writer.overlays.is_empty());
+    }
+
+    #[test]
+    fn overlays_unknown_field_warns_but_parses() {
+        // Mirror role_unknown_field_warns_but_succeeds: typos in the
+        // overlay block emit a stderr warning, parse succeeds.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      model: claude/opus-4-7
+      something_new: oops
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.roles.get("writer").unwrap().overlays.model.as_deref(),
+            Some("claude/opus-4-7")
+        );
+    }
+
+    #[test]
+    fn overlays_bad_model_format_errors() {
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      model: missing-slash
+"#;
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("model must be"), "got: {err}");
+    }
+
+    #[test]
+    fn overlays_extra_args_unknown_backend_errors() {
+        // Reuses the same validation message shape as the agent file so
+        // the user gets a consistent error regardless of where they wrote
+        // the typo.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      extra_args:
+        not-a-backend:
+          - --flag
+"#;
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown backend in extra_args"), "got: {msg}");
+        assert!(msg.contains("not-a-backend"), "got: {msg}");
+    }
+
+    #[test]
+    fn overlays_extra_args_api_key_errors() {
+        // Same v1 reject as agent-file `extra_args`: api has no argv to
+        // extend, so accepting the key would silently drop the tokens.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      extra_args:
+        api:
+          - --flag
+"#;
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("not supported for backend 'api'"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn overlays_empty_rule_entry_errors() {
+        let yaml = "
+version: \"1\"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      rules:
+        - good-rule
+        - \"\"
+";
+        let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
+        assert!(err.to_string().contains("empty entry"), "got: {err}");
     }
 }
