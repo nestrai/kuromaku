@@ -165,11 +165,7 @@ pub struct EffectiveItem {
 /// degradation rules.
 pub fn resolve(cwd: &Path) -> Result<ResolvedContext, ContextError> {
     let seeds = discover_seeds(cwd)?;
-    let contributions: Vec<SeedContribution> = seeds
-        .seeds
-        .iter()
-        .map(seed_contribution)
-        .collect();
+    let contributions: Vec<SeedContribution> = seeds.seeds.iter().map(seed_contribution).collect();
     let effective = build_effective(&contributions);
     Ok(ResolvedContext {
         version: CONTEXT_SCHEMA_VERSION,
@@ -233,7 +229,10 @@ pub fn render_human(ctx: &ResolvedContext, out: &mut dyn Write) -> io::Result<()
     write_effective_section(out, "rules ", &ctx.effective.rules)?;
     write_effective_section(out, "flows ", &ctx.effective.flows)?;
     writeln!(out)?;
-    writeln!(out, "Hint: re-run with --format json for machine-readable output.")?;
+    writeln!(
+        out,
+        "Hint: re-run with --format json for machine-readable output."
+    )?;
     Ok(())
 }
 
@@ -649,10 +648,7 @@ pub(crate) fn derive_description(role: &str) -> String {
 /// 5. Collapse whitespace, truncate to [`MAX_DESCRIPTION_CHARS`].
 fn rule_description(contents: &str) -> String {
     let body = strip_frontmatter(contents);
-    let first = body
-        .lines()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("");
+    let first = body.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let stripped = first.trim_start();
     let text = stripped.trim_start_matches('#').trim_start();
     let line = single_line(text);
@@ -693,7 +689,10 @@ mod tests {
     fn write_project_with_seed(cwd: &Path, seed_path: &Path) {
         write(
             &cwd.join(".kuro/config.yaml"),
-            &format!("version: \"1\"\nseeds:\n  - path: {}\n", seed_path.display()),
+            &format!(
+                "version: \"1\"\nseeds:\n  - path: {}\n",
+                seed_path.display()
+            ),
         );
     }
 
@@ -712,7 +711,10 @@ mod tests {
         let seed = &ctx.seeds[0];
         assert_eq!(seed.display, ".kuro/");
         assert_eq!(seed.kind, "local");
-        assert!(!seed.exists, "default .kuro/ in empty tempdir does not exist");
+        assert!(
+            !seed.exists,
+            "default .kuro/ in empty tempdir does not exist"
+        );
         assert!(seed.agents.is_empty());
         assert!(seed.rules.is_empty());
         assert!(seed.flows.is_empty());
@@ -731,9 +733,18 @@ mod tests {
         let cwd = tmp.path();
         let seed_a = cwd.join("a");
         let seed_b = cwd.join("b");
-        write(&seed_a.join("agents/Neo.yaml"), &minimal_agent("Neo", "A", "from a"));
-        write(&seed_b.join("agents/Neo.yaml"), &minimal_agent("Neo", "B", "from b"));
-        write(&seed_b.join("agents/Bella.yaml"), &minimal_agent("Bella", "Reviewer", "review"));
+        write(
+            &seed_a.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "A", "from a"),
+        );
+        write(
+            &seed_b.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "B", "from b"),
+        );
+        write(
+            &seed_b.join("agents/Bella.yaml"),
+            &minimal_agent("Bella", "Reviewer", "review"),
+        );
         write(
             &cwd.join(".kuro/config.yaml"),
             &format!(
@@ -745,8 +756,19 @@ mod tests {
 
         let ctx = resolve(cwd).unwrap();
         assert_eq!(ctx.seeds.len(), 2);
-        assert_eq!(ctx.seeds[0].agents.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["Neo"]);
-        let b_names: Vec<&str> = ctx.seeds[1].agents.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(
+            ctx.seeds[0]
+                .agents
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Neo"]
+        );
+        let b_names: Vec<&str> = ctx.seeds[1]
+            .agents
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
         assert!(b_names.contains(&"Bella"));
         assert!(b_names.contains(&"Neo"));
 
@@ -779,9 +801,18 @@ mod tests {
         // single-line description following the derivation rules.
         let tmp = TempDir::new().unwrap();
         let seed = tmp.path().join("seed");
-        write(&seed.join("rules/with-frontmatter.md"), "---\ntags: foo\n---\n\nReal text.\n");
-        write(&seed.join("rules/with-heading.md"), "# Heading text\n\nBody continues.\n");
-        write(&seed.join("rules/plain.md"), "Plain first line\nSecond line ignored.\n");
+        write(
+            &seed.join("rules/with-frontmatter.md"),
+            "---\ntags: foo\n---\n\nReal text.\n",
+        );
+        write(
+            &seed.join("rules/with-heading.md"),
+            "# Heading text\n\nBody continues.\n",
+        );
+        write(
+            &seed.join("rules/plain.md"),
+            "Plain first line\nSecond line ignored.\n",
+        );
         let rules = enumerate_rules_in_seed(&seed, "seed/");
         assert_eq!(rules.len(), 3);
         let by_name: std::collections::HashMap<&str, &RuleEntry> =
@@ -853,7 +884,10 @@ mod tests {
     fn enumerate_agents_in_seed_skips_invalid_yaml() {
         let tmp = TempDir::new().unwrap();
         let seed = tmp.path().join("seed");
-        write(&seed.join("agents/Neo.yaml"), &minimal_agent("Neo", "P", "p"));
+        write(
+            &seed.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "P", "p"),
+        );
         write(&seed.join("agents/broken.yaml"), "::not yaml::");
         let agents = enumerate_agents_in_seed(&seed, "seed/");
         assert_eq!(agents.len(), 1);
@@ -890,7 +924,10 @@ mod tests {
     fn render_json_round_trips_through_serde() {
         let tmp = TempDir::new().unwrap();
         let seed = tmp.path().join("seed");
-        write(&seed.join("agents/Neo.yaml"), &minimal_agent("Neo", "T", "role"));
+        write(
+            &seed.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "T", "role"),
+        );
         write_project_with_seed(tmp.path(), &seed);
         let ctx = resolve(tmp.path()).unwrap();
         let mut buf: Vec<u8> = Vec::new();
@@ -901,7 +938,11 @@ mod tests {
         // the config and the explicit `seed` path. Verify the explicit
         // one is listed and exposes Neo.
         let seeds = v["seeds"].as_array().unwrap();
-        assert!(seeds.iter().any(|s| s["display"] == seed.display().to_string()));
+        assert!(
+            seeds
+                .iter()
+                .any(|s| s["display"] == seed.display().to_string())
+        );
         // Effective agents include Neo.
         let agents = v["effective"]["agents"].as_array().unwrap();
         assert!(agents.iter().any(|a| a["name"] == "Neo"));
@@ -912,7 +953,10 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let seed_a = tmp.path().join("a");
         let seed_b = tmp.path().join("b");
-        write(&seed_a.join("agents/Neo.yaml"), &minimal_agent("Neo", "T", "role"));
+        write(
+            &seed_a.join("agents/Neo.yaml"),
+            &minimal_agent("Neo", "T", "role"),
+        );
         write(&seed_b.join("rules/style.md"), "Style guide first line.\n");
         write(
             &seed_b.join("flows/build.yaml"),

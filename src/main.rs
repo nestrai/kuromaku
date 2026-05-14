@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use color_eyre::Result;
 use color_eyre::eyre::eyre;
 
@@ -158,6 +158,29 @@ enum Command {
         #[arg(long = "include-project-context")]
         include_project_context: bool,
     },
+    /// Print the resolved seed cascade for the current project (#366).
+    ///
+    /// Walks the seeds declared in `.kuro/config.yaml` (or the implicit
+    /// `.kuro/` default) and lists what each one contributes: agents,
+    /// rules, flows and a verbatim `SEED.md` when present. Also shows
+    /// the first-match-wins "effective" view so an AI assistant can
+    /// see at a glance which agent/rule/flow the runner would actually
+    /// load when there's overlap between seeds.
+    ///
+    /// Default output is human-readable. Pass `--format json` for the
+    /// stable v1 machine-readable shape -- AI clients embed it in their
+    /// working memory at session start so they stop duplicating agents
+    /// that already exist in the cascade.
+    ///
+    /// Missing `.kuro/`, missing seed paths and missing seed subdirs
+    /// degrade silently to empty sections. Use `kuro validate` for
+    /// semantic checks; this command is inventory, not validation.
+    Context {
+        /// Output format. `human` (default) renders a readable table;
+        /// `json` emits the stable v1 wire format for AI clients.
+        #[arg(long, value_enum, default_value_t = ContextFormat::Human)]
+        format: ContextFormat,
+    },
     /// Validate a flow's structure (schema + graph reachability/dead-ends).
     ///
     /// Exits non-zero on hard errors (e.g. dead-end states); exits zero
@@ -196,6 +219,17 @@ enum Command {
         #[command(subcommand)]
         action: StackAction,
     },
+}
+
+/// Output format for `kuro context` (#366).
+///
+/// Default is human-readable. The JSON renderer emits the stable
+/// `version: "1"` shape so AI clients can rely on the layout from
+/// release to release.
+#[derive(Copy, Clone, Debug, ValueEnum, PartialEq, Eq)]
+enum ContextFormat {
+    Human,
+    Json,
 }
 
 /// Subcommands under `kuro stack`. Kept separate from [`Command`] so the
@@ -253,6 +287,7 @@ async fn main() -> Result<()> {
             agent,
             include_project_context,
         } => chat::run_chat(&agent, include_project_context).await?,
+        Command::Context { format } => cmd_context(format)?,
         Command::Validate { flow } => run_validate(&flow)?,
         Command::Pull => run_pull()?,
         Command::Down => {
@@ -272,6 +307,39 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Implementation of `kuro context` (#366).
+///
+/// Resolves the cascade from the current working directory and dispatches
+/// to the human or JSON renderer. The library does the work; this wrapper
+/// only translates the format flag and the I/O destination.
+///
+/// Errors are surfaced via [`color_eyre`]; the only failure path today is
+/// a malformed `.kuro/config.yaml`. Missing seeds and missing subdirs
+/// degrade silently (see [`context::resolve`]).
+fn cmd_context(format: ContextFormat) -> Result<()> {
+    let cwd = std::env::current_dir().map_err(|e| eyre!("cwd: {e}"))?;
+    let ctx = context::resolve(&cwd).map_err(|e| eyre!("{e}"))?;
+    // Render to a buffer first, then write to stdout in one shot.
+    // Lets us absorb the BrokenPipe a downstream `| head` produces
+    // without surfacing a panicky error report -- pipes to pagers
+    // are the expected interactive use case.
+    let mut buf: Vec<u8> = Vec::new();
+    match format {
+        ContextFormat::Human => context::render_human(&ctx, &mut buf)
+            .map_err(|e| eyre!("failed to render context: {e}"))?,
+        ContextFormat::Json => context::render_json(&ctx, &mut buf)
+            .map_err(|e| eyre!("failed to render context as JSON: {e}"))?,
+    }
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match out.write_all(&buf) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => Err(eyre!("failed to write context to stdout: {e}")),
+    }
 }
 
 /// Implementation of `kuro stack purge <project>`.
@@ -1040,6 +1108,33 @@ mod tests {
             err.to_string().contains("failed to read --message-file"),
             "expected file-read error message, got: {err}"
         );
+    }
+
+    // --- `kuro context` CLI parsing (issue #366) ---
+
+    #[test]
+    fn context_subcommand_parses_canonically() {
+        // `kuro context` alone parses to Command::Context with the
+        // default human format. Pins the wire-level CLI shape so a
+        // future refactor that renames the variant gets caught.
+        let cli = Cli::try_parse_from(["kuro", "context"]).expect("CLI parse failed");
+        let Command::Context { format } = cli.command else {
+            panic!("expected Command::Context, got something else");
+        };
+        assert_eq!(format, ContextFormat::Human);
+    }
+
+    #[test]
+    fn context_subcommand_accepts_format_json() {
+        // `--format json` flips the discriminant. AI clients embed
+        // this exact invocation in their session-start instructions,
+        // so a regression here breaks downstream prompts.
+        let cli =
+            Cli::try_parse_from(["kuro", "context", "--format", "json"]).expect("CLI parse failed");
+        let Command::Context { format } = cli.command else {
+            panic!("expected Command::Context, got something else");
+        };
+        assert_eq!(format, ContextFormat::Json);
     }
 
     #[test]
