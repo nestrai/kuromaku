@@ -8,6 +8,7 @@ use color_eyre::eyre::eyre;
 mod chat;
 mod config;
 mod config_md;
+mod context;
 mod core;
 mod dag;
 #[allow(dead_code)]

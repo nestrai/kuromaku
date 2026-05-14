@@ -28,69 +28,28 @@
 //!   the role field, single line, frontmatter stripped" for agents and
 //!   "the prompt field" for flows. Implemented in [`derive_description`].
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tracing::warn;
 
-use crate::config::{
-    Backend, Defaults, RawAgentFile, load_agent_file_with_seeds, load_flow_from_str,
+use crate::config::{Backend, Defaults, load_agent_file_with_seeds};
+use crate::context::{
+    self, AgentEntry, FlowEntry, enumerate_agents_in_seed, enumerate_flows_in_seed,
 };
-use crate::koto_config::{KOTO_DIR, KotoConfig, Seed, SeedSource, Seeds};
+use crate::koto_config::{KOTO_DIR, KotoConfig, Seeds};
 use crate::runner::load_guide_from_seeds;
 use crate::skills::resolve_skill;
 
 use super::error::{McpError, McpErrorCode};
 use super::tools::Tool;
 
-/// Maximum description length in Unicode scalars (characters, not bytes).
-/// Pinned by the team review; longer roles are truncated.
-const MAX_DESCRIPTION_CHARS: usize = 200;
-
 // --- Seed / config helpers ---
 
 fn discover_seeds(cwd: &Path) -> Result<Seeds, McpError> {
-    let seeds = match KotoConfig::load_optional(cwd) {
-        Ok(Some(cfg)) => cfg.seeds,
-        Ok(None) => Seeds::default_local(),
-        Err(e) => return Err(internal(format!("project config invalid: {}", e.message()))),
-    };
-    Ok(rebase_seeds_for_cwd(seeds, cwd))
-}
-
-/// Rebase any relative `Local` seed paths against `cwd`. Absolute paths and
-/// remote seeds pass through unchanged.
-///
-/// Why: [`Seeds::default_local`] returns a relative `.kuro` `PathBuf`, and a
-/// user-written project config can also carry relative `path:` entries.
-/// Without rebasing, downstream filesystem walks (`agents_dir.is_dir()`,
-/// `read_dir`) resolve those relative paths against the **process** CWD,
-/// not against the explicit `cwd` argument the MCP discovery tools receive.
-/// That is the bug behind issue #293: `do_list_agents(tmp.path())` would
-/// otherwise leak into the kuromaku repo's own `.kuro/agents/` directory
-/// when the tempdir has no `.kuro/` of its own.
-///
-/// We deliberately do not call [`std::path::Path::canonicalize`] here:
-/// canonicalize errors on missing paths, which would break the legitimate
-/// "no `.kuro/` yet" case. Path joining is infallible.
-fn rebase_seeds_for_cwd(seeds: Seeds, cwd: &Path) -> Seeds {
-    let rebased = seeds
-        .seeds
-        .into_iter()
-        .map(|seed| match seed.source {
-            SeedSource::Local { display, path } if path.is_relative() => Seed {
-                source: SeedSource::Local {
-                    display,
-                    path: cwd.join(path),
-                },
-            },
-            other => Seed { source: other },
-        })
-        .collect();
-    Seeds { seeds: rebased }
+    context::discover_seeds(cwd)
+        .map_err(|e| internal(format!("project config invalid: {}", e.message())))
 }
 
 fn project_config(cwd: &Path) -> Option<KotoConfig> {
@@ -104,224 +63,43 @@ fn internal(reason: impl Into<String>) -> McpError {
     )
 }
 
-// --- Description derivation ---
+// --- Agent / flow enumeration ---
+//
+// Both helpers walk the seed list and apply first-match-wins to keep the
+// MCP `list_agents` / `list_flows` shape stable. The per-seed walkers
+// live in [`crate::context`] (lifted in #366); this module composes them
+// with deduplication.
 
-/// Strip a leading `---\n...\n---\n` YAML frontmatter block. Returns the
-/// remainder. If the input does not start with `---\n`, returns the input
-/// unchanged. Safety net for agents whose `role:` field contains its own
-/// markdown frontmatter -- not the YAML doc level fence.
-fn strip_frontmatter(s: &str) -> &str {
-    if let Some(rest) = s.strip_prefix("---\n") {
-        if let Some(end) = rest.find("\n---\n") {
-            return &rest[end + 5..];
-        }
-        // Trailing fence at EOF without a newline after.
-        if let Some(end) = rest.find("\n---") {
-            let after = end + 4;
-            if after >= rest.len() {
-                return "";
+fn enumerate_agents_for_cascade(seeds: &Seeds) -> Vec<AgentEntry> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<AgentEntry> = Vec::new();
+    for seed in &seeds.seeds {
+        let display = seed.display();
+        let Some(path) = seed.local_path() else {
+            continue;
+        };
+        for a in enumerate_agents_in_seed(path, &display) {
+            if seen.insert(a.name.clone()) {
+                out.push(a);
             }
-            return &rest[after..];
         }
     }
-    s
-}
-
-/// Collapse runs of whitespace (including newlines) into single ASCII
-/// spaces, trim leading/trailing space.
-fn single_line(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_space = true; // suppresses leading whitespace
-    for c in s.chars() {
-        if c.is_whitespace() {
-            if !prev_space {
-                out.push(' ');
-                prev_space = true;
-            }
-        } else {
-            out.push(c);
-            prev_space = false;
-        }
-    }
-    if out.ends_with(' ') {
-        out.pop();
-    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
-/// First [`MAX_DESCRIPTION_CHARS`] Unicode chars of the normalised role.
-/// Truncation respects char boundaries (no mid-codepoint cuts).
-pub(crate) fn derive_description(role: &str) -> String {
-    let stripped = strip_frontmatter(role);
-    let line = single_line(stripped);
-    line.chars().take(MAX_DESCRIPTION_CHARS).collect()
-}
-
-// --- Agent enumeration ---
-
-/// One agent file discovered through the seed cascade. The first occurrence
-/// of a given `id` wins; lower-priority seeds are silently shadowed,
-/// matching `Seeds::find`.
-struct DiscoveredAgent {
-    id: String,
-    raw: RawAgentFile,
-}
-
-fn enumerate_agents(seeds: &Seeds) -> Vec<DiscoveredAgent> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<DiscoveredAgent> = Vec::new();
+fn enumerate_flows_for_cascade(seeds: &Seeds) -> Vec<FlowEntry> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<FlowEntry> = Vec::new();
     for seed in &seeds.seeds {
-        let SeedSource::Local {
-            path,
-            display: seed_display,
-        } = &seed.source
-        else {
-            // Remote seeds are parsed but not fetched in v1. Surface a debug
-            // breadcrumb so the user can tell why a remote-only seed appears
-            // to contribute nothing -- not an error: discovery degrades to
-            // local-only.
-            warn!(seed = %seed.display(), "remote seed skipped during agent enumeration");
+        let display = seed.display();
+        let Some(path) = seed.local_path() else {
             continue;
         };
-        let agents_dir = path.join("agents");
-        if !agents_dir.is_dir() {
-            continue;
-        }
-        walk_agents(&agents_dir, &agents_dir, seed_display, &mut seen, &mut out);
-    }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
-    out
-}
-
-fn walk_agents(
-    root: &Path,
-    dir: &Path,
-    seed_display: &str,
-    seen: &mut HashSet<String>,
-    out: &mut Vec<DiscoveredAgent>,
-) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(e) => {
-            warn!(dir = %dir.display(), error = %e, "agents dir unreadable");
-            return;
-        }
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_agents(root, &path, seed_display, seen, out);
-            continue;
-        }
-        if path.extension().and_then(|s| s.to_str()) != Some("yaml") {
-            continue;
-        }
-        let Ok(rel) = path.strip_prefix(root) else {
-            continue;
-        };
-        // Build the agent ID by joining segments with `/` regardless of OS.
-        // Matches `agent_rel_path` in config.rs (split on `/`, push parts).
-        let id = rel_path_to_id(&rel.with_extension(""));
-        if id.is_empty() || !seen.insert(id.clone()) {
-            continue;
-        }
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(path = %path.display(), seed = %seed_display, error = %e,
-                      "agent file unreadable");
-                continue;
+        for f in enumerate_flows_in_seed(path, &display) {
+            if seen.insert(f.name.clone()) {
+                out.push(f);
             }
-        };
-        let raw: RawAgentFile = match serde_yaml::from_str(&contents) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(path = %path.display(), seed = %seed_display, error = %e,
-                      "agent file invalid yaml");
-                continue;
-            }
-        };
-        out.push(DiscoveredAgent { id, raw });
-    }
-}
-
-fn rel_path_to_id(p: &Path) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    for c in p.components() {
-        match c {
-            std::path::Component::Normal(s) => parts.push(s.to_string_lossy().into_owned()),
-            _ => continue,
-        }
-    }
-    parts.join("/")
-}
-
-// --- Flow enumeration ---
-
-struct DiscoveredFlow {
-    name: String,
-    description: String,
-    steps: Vec<String>,
-}
-
-fn enumerate_flows(seeds: &Seeds) -> Vec<DiscoveredFlow> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<DiscoveredFlow> = Vec::new();
-    for seed in &seeds.seeds {
-        let SeedSource::Local {
-            path,
-            display: seed_display,
-        } = &seed.source
-        else {
-            warn!(seed = %seed.display(), "remote seed skipped during flow enumeration");
-            continue;
-        };
-        let flows_dir = path.join("flows");
-        let entries = match std::fs::read_dir(&flows_dir) {
-            Ok(e) => e,
-            Err(_) => continue, // missing flows/ is normal for some seeds
-        };
-        for entry in entries.flatten() {
-            let p = entry.path();
-            let ext = p.extension().and_then(|s| s.to_str());
-            if ext != Some("yaml") && ext != Some("yml") {
-                continue;
-            }
-            let bare = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_string();
-            if bare.is_empty() || !seen.insert(bare.clone()) {
-                continue;
-            }
-            let contents = match std::fs::read_to_string(&p) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(path = %p.display(), seed = %seed_display, error = %e,
-                          "flow file unreadable");
-                    continue;
-                }
-            };
-            // #258 deliberately stays on the string-only loader: this
-            // discovery loop only reads `name` / `description` / step
-            // IDs to build the seed listing. It must keep listing flows
-            // even when a sibling `task_file:` is missing -- a broken
-            // prompt link is the runner's problem, not a reason to
-            // hide the flow from `kuro` and the MCP `list_flows` tool.
-            let flow = match load_flow_from_str(&contents) {
-                Ok(f) => f,
-                Err(e) => {
-                    warn!(path = %p.display(), seed = %seed_display, error = %e,
-                          "flow file invalid");
-                    continue;
-                }
-            };
-            out.push(DiscoveredFlow {
-                name: flow.name,
-                description: flow.prompt.unwrap_or_default(),
-                steps: flow.steps.into_iter().map(|s| s.id).collect(),
-            });
         }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -354,14 +132,14 @@ impl Tool for ListAgents {
 
 fn do_list_agents(cwd: &Path) -> Result<Value, McpError> {
     let seeds = discover_seeds(cwd)?;
-    let agents = enumerate_agents(&seeds);
+    let agents = enumerate_agents_for_cascade(&seeds);
     let entries: Vec<Value> = agents
         .into_iter()
         .map(|a| {
             json!({
-                "name": a.id,
-                "title": a.raw.title,
-                "description": derive_description(&a.raw.role),
+                "name": a.name,
+                "title": a.title,
+                "description": a.description,
             })
         })
         .collect();
@@ -393,7 +171,7 @@ impl Tool for ListFlows {
 
 fn do_list_flows(cwd: &Path) -> Result<Value, McpError> {
     let seeds = discover_seeds(cwd)?;
-    let flows = enumerate_flows(&seeds);
+    let flows = enumerate_flows_for_cascade(&seeds);
     let entries: Vec<Value> = flows
         .into_iter()
         .map(|f| {
@@ -581,53 +359,15 @@ fn do_load_agent(cwd: &Path, name: &str, include_guide: bool) -> Result<Value, M
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::koto_config::{Seed, SeedSource};
     use std::fs;
     use tempfile::TempDir;
 
-    // ---- description derivation ----
-
-    #[test]
-    fn description_collapses_whitespace_and_truncates() {
-        let role = "First line.\n\nSecond  line   with   gaps.\n";
-        assert_eq!(
-            derive_description(role),
-            "First line. Second line with gaps."
-        );
-    }
-
-    #[test]
-    fn description_strips_leading_frontmatter() {
-        let role = "---\ntitle: Neo\n---\nThe actual role text.";
-        assert_eq!(derive_description(role), "The actual role text.");
-    }
-
-    #[test]
-    fn description_truncates_at_200_chars() {
-        let role = "x".repeat(500);
-        let d = derive_description(&role);
-        assert_eq!(d.chars().count(), 200);
-    }
-
-    #[test]
-    fn description_truncation_respects_unicode_boundaries() {
-        // 199 ASCII + a 4-byte char that should still fit at char 200.
-        let mut role = "a".repeat(199);
-        role.push('🦀'); // 4 bytes, 1 char
-        role.push_str(" trailing tail that must not appear");
-        let d = derive_description(&role);
-        assert_eq!(d.chars().count(), 200);
-        assert!(d.ends_with('🦀'));
-        assert!(!d.contains("trailing"));
-    }
-
-    #[test]
-    fn description_handles_only_frontmatter() {
-        let role = "---\nfoo: bar\n---\n";
-        // Stripped to empty, single_line returns empty.
-        assert_eq!(derive_description(role), "");
-    }
-
-    // ---- enumerate_agents ----
+    // Walker-level coverage (per-seed agent/flow/rule enumeration, the
+    // description derivation helpers, frontmatter and unicode handling)
+    // lives in `crate::context::tests` after the #366 refactor. The
+    // tests below cover the MCP-specific composition: first-match-wins
+    // dedup across seeds, the JSON tool responses, and `load_agent`.
 
     fn write(p: &Path, body: &str) {
         if let Some(parent) = p.parent() {
@@ -640,12 +380,24 @@ mod tests {
         format!("name: {name}\ntitle: {title}\nrole: |\n  {role}\n")
     }
 
+    fn minimal_flow_yaml(name: &str, prompt: Option<&str>, steps: &[&str]) -> String {
+        let mut s = format!("version: \"1\"\nname: {name}\n");
+        if let Some(p) = prompt {
+            s.push_str(&format!("prompt: {p}\n"));
+        }
+        s.push_str("flow:\n");
+        for step in steps {
+            s.push_str(&format!("  {step}:\n    agent: Dummy\n    task: t\n"));
+        }
+        s
+    }
+
+    // ---- cascade-level enumerators (first-match-wins) ----
+
     #[test]
-    fn enumerate_agents_walks_seed_cascade_with_first_match_wins() {
+    fn enumerate_agents_for_cascade_keeps_first_match() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        // Two seeds: a/ (high priority) and b/ (low). Both define Neo; only
-        // a/'s should appear. b/Bella appears unshadowed.
         write(
             &root.join("a/agents/Neo.yaml"),
             &minimal_agent_yaml("Neo", "From A", "from a"),
@@ -660,13 +412,13 @@ mod tests {
         );
         let seeds = Seeds {
             seeds: vec![
-                crate::koto_config::Seed {
+                Seed {
                     source: SeedSource::Local {
                         display: "a/".to_string(),
                         path: root.join("a"),
                     },
                 },
-                crate::koto_config::Seed {
+                Seed {
                     source: SeedSource::Local {
                         display: "b/".to_string(),
                         path: root.join("b"),
@@ -674,103 +426,16 @@ mod tests {
                 },
             ],
         };
-        let agents = enumerate_agents(&seeds);
-        let by_id: std::collections::HashMap<&str, &DiscoveredAgent> =
-            agents.iter().map(|a| (a.id.as_str(), a)).collect();
-        assert_eq!(by_id.len(), 2);
-        assert_eq!(by_id["Neo"].raw.title.as_deref(), Some("From A"));
-        assert_eq!(by_id["Bella"].raw.title.as_deref(), Some("Reviewer"));
+        let agents = enumerate_agents_for_cascade(&seeds);
+        let by_name: std::collections::HashMap<&str, &AgentEntry> =
+            agents.iter().map(|a| (a.name.as_str(), a)).collect();
+        assert_eq!(by_name.len(), 2);
+        assert_eq!(by_name["Neo"].title.as_deref(), Some("From A"));
+        assert_eq!(by_name["Bella"].title.as_deref(), Some("Reviewer"));
     }
 
     #[test]
-    fn enumerate_agents_supports_nested_ids() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(
-            &root.join("seed/agents/coding/rust/Sage.yaml"),
-            &minimal_agent_yaml("Sage", "Rust Sage", "rust matters"),
-        );
-        let seeds = Seeds {
-            seeds: vec![crate::koto_config::Seed {
-                source: SeedSource::Local {
-                    display: "seed/".to_string(),
-                    path: root.join("seed"),
-                },
-            }],
-        };
-        let agents = enumerate_agents(&seeds);
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].id, "coding/rust/Sage");
-    }
-
-    #[test]
-    fn enumerate_agents_skips_invalid_yaml_without_failing() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(
-            &root.join("seed/agents/Neo.yaml"),
-            &minimal_agent_yaml("Neo", "Prompt", "prompts"),
-        );
-        write(&root.join("seed/agents/broken.yaml"), "::not yaml::");
-        let seeds = Seeds {
-            seeds: vec![crate::koto_config::Seed {
-                source: SeedSource::Local {
-                    display: "seed/".to_string(),
-                    path: root.join("seed"),
-                },
-            }],
-        };
-        let agents = enumerate_agents(&seeds);
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].id, "Neo");
-    }
-
-    // ---- enumerate_flows ----
-
-    fn minimal_flow_yaml(name: &str, prompt: Option<&str>, steps: &[&str]) -> String {
-        let mut s = format!("version: \"1\"\nname: {name}\n");
-        if let Some(p) = prompt {
-            s.push_str(&format!("prompt: {p}\n"));
-        }
-        s.push_str("flow:\n");
-        for step in steps {
-            s.push_str(&format!("  {step}:\n    agent: Dummy\n    task: t\n"));
-        }
-        s
-    }
-
-    #[test]
-    fn enumerate_flows_collects_yaml_and_yml_with_step_ids_and_prompt() {
-        let tmp = TempDir::new().unwrap();
-        let root = tmp.path();
-        write(
-            &root.join("seed/flows/build.yaml"),
-            &minimal_flow_yaml("build", Some("Build the thing"), &["plan", "code"]),
-        );
-        write(
-            &root.join("seed/flows/test.yml"),
-            &minimal_flow_yaml("test", None, &["run"]),
-        );
-        let seeds = Seeds {
-            seeds: vec![crate::koto_config::Seed {
-                source: SeedSource::Local {
-                    display: "seed/".to_string(),
-                    path: root.join("seed"),
-                },
-            }],
-        };
-        let flows = enumerate_flows(&seeds);
-        assert_eq!(flows.len(), 2);
-        let by_name: std::collections::HashMap<&str, &DiscoveredFlow> =
-            flows.iter().map(|f| (f.name.as_str(), f)).collect();
-        assert_eq!(by_name["build"].description, "Build the thing");
-        assert_eq!(by_name["build"].steps, vec!["plan", "code"]);
-        assert_eq!(by_name["test"].description, ""); // missing prompt
-        assert_eq!(by_name["test"].steps, vec!["run"]);
-    }
-
-    #[test]
-    fn enumerate_flows_first_match_wins_across_seeds() {
+    fn enumerate_flows_for_cascade_keeps_first_match() {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
         write(
@@ -783,13 +448,13 @@ mod tests {
         );
         let seeds = Seeds {
             seeds: vec![
-                crate::koto_config::Seed {
+                Seed {
                     source: SeedSource::Local {
                         display: "hi/".to_string(),
                         path: root.join("hi"),
                     },
                 },
-                crate::koto_config::Seed {
+                Seed {
                     source: SeedSource::Local {
                         display: "lo/".to_string(),
                         path: root.join("lo"),
@@ -797,7 +462,7 @@ mod tests {
                 },
             ],
         };
-        let flows = enumerate_flows(&seeds);
+        let flows = enumerate_flows_for_cascade(&seeds);
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].description, "HI");
     }
@@ -848,74 +513,10 @@ mod tests {
         assert_eq!(v["agents"].as_array().unwrap().len(), 0);
     }
 
-    // ---- discover_seeds / rebase_seeds_for_cwd (issue #293) ----
-
-    #[test]
-    fn discover_seeds_rebases_relative_default_against_cwd() {
-        // No project config in `cwd`: `discover_seeds` falls back to
-        // `Seeds::default_local()` which carries a relative `.kuro` path.
-        // The rebase must produce `cwd.join(".kuro")` so downstream
-        // filesystem walks operate on the explicit cwd, not the process CWD.
-        let tmp = TempDir::new().unwrap();
-        let seeds = discover_seeds(tmp.path()).unwrap();
-        assert_eq!(seeds.seeds.len(), 1);
-        match &seeds.seeds[0].source {
-            SeedSource::Local { path, .. } => {
-                assert_eq!(path, &tmp.path().join(".kuro"));
-                assert!(path.is_absolute(), "rebased seed must be absolute");
-            }
-            other => panic!("expected local seed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rebase_seeds_for_cwd_leaves_absolute_paths_untouched() {
-        // Regression guard: an absolute seed path (e.g. one written by the
-        // user as `path: /abs/path` and validated by `Seeds::from_raw_entries`
-        // with `expand_tilde`) must NOT be re-prefixed with `cwd`. Defends
-        // against an accidental double-join.
-        let tmp = TempDir::new().unwrap();
-        let abs = tmp.path().join("seed-abs");
-        let seeds = Seeds {
-            seeds: vec![Seed {
-                source: SeedSource::Local {
-                    display: abs.display().to_string(),
-                    path: abs.clone(),
-                },
-            }],
-        };
-        // `cwd` is a different directory entirely.
-        let other = TempDir::new().unwrap();
-        let rebased = rebase_seeds_for_cwd(seeds, other.path());
-        match &rebased.seeds[0].source {
-            SeedSource::Local { path, .. } => {
-                assert_eq!(path, &abs, "absolute path must pass through unchanged");
-            }
-            other => panic!("expected local seed, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn rebase_seeds_for_cwd_passes_remote_seeds_through() {
-        // Remote seeds carry no path; they must round-trip identically.
-        let seeds = Seeds {
-            seeds: vec![Seed {
-                source: SeedSource::Remote {
-                    repo: "github.com/foo/bar".to_string(),
-                    ref_: Some("main".to_string()),
-                },
-            }],
-        };
-        let tmp = TempDir::new().unwrap();
-        let rebased = rebase_seeds_for_cwd(seeds, tmp.path());
-        match &rebased.seeds[0].source {
-            SeedSource::Remote { repo, ref_ } => {
-                assert_eq!(repo, "github.com/foo/bar");
-                assert_eq!(ref_.as_deref(), Some("main"));
-            }
-            other => panic!("expected remote seed, got {other:?}"),
-        }
-    }
+    // Cwd-rebase regression coverage (#293) lives in
+    // `crate::context::tests::discover_seeds_rebases_relative_default_against_cwd`
+    // and the rebase tests next to it; the MCP wrapper above is a
+    // straight pass-through with error-type conversion.
 
     #[test]
     fn do_list_agents_empty_with_relative_seed_in_project_config() {
