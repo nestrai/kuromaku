@@ -516,7 +516,7 @@ Do the thing.
 
     #[test]
     fn parse_full_implement_issue() {
-        let md = include_str!("../seeds/rust/flows/implement-issue.md");
+        let md = include_str!("../seeds/github/flows/implement-issue.md");
         let flow = load_graph_flow_from_md(md).unwrap();
 
         assert_eq!(flow.name, "implement-issue");

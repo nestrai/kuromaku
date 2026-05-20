@@ -1,10 +1,9 @@
 # kuromaku seed
 
-This seed lives inside the kuromaku repo itself and overlays the
-generic `nestrai/seeds/rust/` cascade with kuromaku-specific
-artefacts. AI assistants working in the kuromaku repo see this seed
-as the highest-priority source -- run `kuro context` for the full
-picture.
+This seed lives inside the kuromaku repo itself and sits at the top
+of the cascade over `nestrai/seeds/{rust,github,common}/`. AI
+assistants working in the kuromaku repo see this seed as the
+highest-priority source -- run `kuro context` for the full inventory.
 
 ## What it contributes
 
@@ -20,6 +19,8 @@ picture.
   used by the `precheck` state of `implement-issue`. The rule lists
   the labels and content checks that mark a GitHub issue as ready
   to start; flows fail the precheck if those criteria are not met.
+  Overrides the generic `issue-quality` rule from `common/` with
+  kuromaku-specific label conventions and verification checks.
 
 ### Flows
 
@@ -27,20 +28,29 @@ picture.
   `precheck -> design -> implement -> review -> verify -> pr`. The
   verify state runs `just lint && just test`; failure loops back to
   implement with captured output. Local override of the generic
-  `implement-issue` from `seeds/rust/` so kuromaku can iterate on
-  its own pipeline without bumping the shared seed.
+  `implement-issue` from `github/` so kuromaku can iterate on its
+  own pipeline without bumping the shared seed.
 - **validate-issues** (graph) -- batch-validates open issues against
   the `issue-quality` rule and reports which ones miss criteria.
 
 ## What it does NOT provide
 
 - Generic developer / reviewer / architect / facilitator personas
-  (`Noah`, `Bella`, `Levi`, `Mika`, ...) -- those come from the
-  `nestrai/seeds/rust/` seed at lower priority.
-- Generic rules (`code-review`, `clean-code`, `extensibility`, ...) --
-  same story.
-- Plan / review / rework flows (`plan-feature`, `review-pr`,
-  `rework-pr`) -- inherited from the rust seed.
+  (`Noah`, `Bella`, `Levi`, `Mika`, ...) -- those come from
+  `nestrai/seeds/rust/` at lower priority.
+- Cross-cutting rules (`code-review`, `clean-code`, `extensibility`,
+  `git-workflow`, ...) -- those come from `nestrai/seeds/common/`.
+- Provider flows (`plan-feature`, `review-pr`, `rework-pr`) --
+  inherited from `nestrai/seeds/github/`.
+
+## Cascade summary
+
+Priority from highest to lowest:
+
+1. `.kuro/` (this seed) -- kuromaku-specific override.
+2. `~/code/nestrai/seeds/rust/` -- stack: Rust personas, rust-developer rule.
+3. `~/code/nestrai/seeds/github/` -- provider: GitHub flows.
+4. `~/code/nestrai/seeds/common/` -- cross-cutting: Zero, engineering and AI rules.
 
 ## Entry points
 

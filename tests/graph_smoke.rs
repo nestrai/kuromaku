@@ -1,6 +1,6 @@
 //! Smoke test for issue #241: end-to-end run of the shipped graph flow.
 //!
-//! Drives `seeds/rust/flows/implement-issue.yaml` against an Ollama
+//! Drives `seeds/github/flows/implement-issue.yaml` against an Ollama
 //! shim that returns canned `{transition, reason}` JSON for each state.
 //! The point is not to verify code-quality of any agent output -- only
 //! that the runtime walks the graph from `initial:` to a state with
@@ -32,7 +32,8 @@ use std::process::Command;
 /// even if the seed gets moved -- the assertion below names the file we
 /// looked for.
 fn seed_flow_path() -> PathBuf {
-    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("seeds/rust/flows/implement-issue.yaml");
+    let p =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("seeds/github/flows/implement-issue.yaml");
     assert!(
         p.is_file(),
         "expected seed flow at {} -- has it moved?",

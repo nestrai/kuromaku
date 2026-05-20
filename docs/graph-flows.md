@@ -360,7 +360,7 @@ Out of scope (do not rely on these working):
 
 ## See also
 
-- `seeds/rust/flows/implement-issue.yaml` -- the canonical example
+- `seeds/github/flows/implement-issue.yaml` -- the canonical example
   shipped with the binary.
 - `docs/decisions/0006-event-state-machines/` -- the decision record
   motivating graph flows.
