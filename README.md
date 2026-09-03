@@ -119,19 +119,36 @@ kuro stack purge <project> --yes     # skip the prompt (scripted use)
 
 This is the GDPR Art. 17 mechanism for kuromaku: when you receive an erasure request for a data subject whose data is contained in a project's stack, `kuro stack purge` removes that project's directory atomically. Erasure is hard-delete; the deletion itself is not recorded by kuromaku (see `docs/decisions/0007-stack-purge.md` for the rationale and how to add a controller-side audit trail if your obligations require one).
 
-## Build
+## Install
+
+Prebuilt binaries for Linux and macOS (x86_64 and aarch64) are attached to
+every [release](https://github.com/nestrai/kuromaku/releases):
 
 ```bash
-# With Nix
-nix develop
-just build
-
-# With Cargo
-cargo build --release
+# Grab the latest release for your platform, e.g. Linux x86_64:
+curl -fsSL https://github.com/nestrai/kuromaku/releases/latest/download/kuro-x86_64-linux.tar.gz \
+  | tar -xz && sudo install -m 755 kuro /usr/local/bin/kuro
 ```
 
-This produces the `kuro` binary.
+With Nix, the flake exposes the binary directly:
+
+```bash
+nix profile install github:nestrai/kuromaku
+# or, without installing:
+nix run github:nestrai/kuromaku -- --help
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/nestrai/kuromaku && cd kuromaku
+cargo build --release   # or: nix develop -c just release
+```
 
 ## Status
 
-Early development. The core flow engine works: sequential step execution, context injection between steps, template variables, persistent stack output. See the [issues](https://github.com/nestrai/kuromaku/issues) for the roadmap.
+Under active development. The graph flow engine works: state-machine flows with
+per-state agents, parallel-by-default stages, human-in-the-loop pause/resume,
+context injection between states, template variables, and a persistent,
+auditable stack per run. See the [issues](https://github.com/nestrai/kuromaku/issues)
+for the roadmap.

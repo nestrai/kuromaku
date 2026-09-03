@@ -1,6 +1,6 @@
 [package]
 name = "kuromaku"
-version = "2026.4.0"
+version = "2026.9.0"
 edition = "2024"
 description = "Reproducible AI agent teams with persistent shared state"
 license = "MIT"

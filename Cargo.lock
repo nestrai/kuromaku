@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "kuromaku"
-version = "2026.4.0"
+version = "2026.9.0"
 dependencies = [
  "assert_cmd",
  "async-trait",
