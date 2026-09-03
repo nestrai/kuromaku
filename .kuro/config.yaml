@@ -2,7 +2,9 @@ version: "1"
 
 seeds:
   - path: .kuro/
-  - path: ~/code/nestrai/seeds/rust/
+  - path: ~/code/nestrai/seeds/coding/rust/
+  - path: ~/code/nestrai/seeds/github/
+  - path: ~/code/nestrai/seeds/coding/common/
 
 tiers:
   reasoning: claude/opus-4-7
