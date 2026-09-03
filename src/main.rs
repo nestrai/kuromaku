@@ -13,6 +13,7 @@ mod core;
 mod dag;
 #[allow(dead_code)]
 mod executor;
+mod init;
 mod koto_config;
 #[allow(dead_code)]
 mod llm;
@@ -90,6 +91,20 @@ struct RunArgs {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Scaffold a working .kuro/ in the current directory (#385).
+    ///
+    /// Non-interactive: detects the project language from marker files and
+    /// the backend CLI from PATH, then writes a starter config, two agents
+    /// (Developer, Reviewer), a conventions rule stub and a hello flow.
+    /// Refuses to touch a directory that already has `.kuro/` (or the
+    /// legacy `.koto/`/`koto.yaml`).
+    Init {
+        /// Accepted for forward compatibility with the interactive wizard
+        /// (follow-up issue) so scripts written against it keep working.
+        /// Currently a no-op -- init never prompts.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Run a flow
     Run(RunArgs),
     /// Resume a paused graph run (issue #338).
@@ -266,6 +281,10 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
+        // `yes` is a forward-compatibility no-op (see the arg doc); the
+        // underscore keeps the destructuring exhaustive so a future field
+        // does not get silently ignored here.
+        Command::Init { yes: _ } => init::run(Path::new("."))?,
         Command::Run(args) => run_flow(&args).await?,
         Command::Resume {
             run_id,
