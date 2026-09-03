@@ -2414,7 +2414,10 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
                     summary.model_replaced = true;
                 }
                 if let Some(b) = overlay.backend {
-                    agent.backend = crate::resolver::project_backend_to_runtime(b);
+                    // RoleOverlay.backend is already the runtime Backend
+                    // (issue #369) -- assign directly, no policy-to-runtime
+                    // mapping needed.
+                    agent.backend = b;
                     summary.backend_replaced = true;
                 }
                 // Per-backend replace -- mirrors AC4 "extra_args.codex
@@ -6792,6 +6795,50 @@ look around
 
         assert_eq!(agents[0].model, "claude/opus-4-7");
         assert!(applied["writer"].model_replaced);
+    }
+
+    #[test]
+    fn overlay_replaces_backend_with_runtime_variant() {
+        // Issue #369 AC1: overlay `backend:` carries the runtime Backend
+        // and replaces the seed agent's backend directly -- no
+        // policy-to-runtime mapping in between. Codex is deliberately a
+        // variant the old KotoBackend-typed overlay could not express.
+        use crate::koto_config::RoleOverlay;
+        let mut agents = vec![babis_seed()];
+        let overlay = RoleOverlay {
+            backend: Some(Backend::Codex),
+            ..RoleOverlay::default()
+        };
+        let kc = koto_with_overlay("writer", "Babis", overlay);
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap();
+
+        assert_eq!(agents[0].backend, Backend::Codex);
+        assert!(applied["writer"].backend_replaced);
+    }
+
+    #[test]
+    fn overlay_cli_alias_yaml_resolves_to_claude_cli_at_runtime() {
+        // Issue #369 AC3 runtime-equivalence pin: a config written as
+        // `backend: cli` (the only spelling the pre-fix overlay accepted
+        // for the CLI path) must come out of parse + apply with the same
+        // resolved agent backend as before the fix: ClaudeCli.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      backend: cli
+"#;
+        let kc = crate::koto_config::KotoConfig::from_yaml_str(yaml).unwrap();
+        let mut agents = vec![babis_seed()];
+        agents[0].backend = Backend::Ollama; // seed differs so the replace is observable
+        let roles = vec![("writer".to_string(), "Babis".to_string())];
+        let applied = apply_role_overlays(&mut agents, &roles, Some(&kc)).unwrap();
+
+        assert_eq!(agents[0].backend, Backend::ClaudeCli);
+        assert!(applied["writer"].backend_replaced);
     }
 
     #[test]

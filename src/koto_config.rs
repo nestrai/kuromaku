@@ -190,8 +190,14 @@ struct RawKotoRole {
 struct RawKotoOverlay {
     #[serde(default)]
     model: Option<String>,
+    /// Raw string, resolved to [`crate::config::Backend`] in
+    /// [`resolve_overlay`] -- the overlay patches the agent-file `backend`
+    /// field, so it must accept the agent-file vocabulary (`claude-cli`,
+    /// `codex`, `ollama`, `api`), not the project-policy [`KotoBackend`]
+    /// pair (issue #369). Stringly-typed here for the same reason as
+    /// `extra_args` keys: resolution produces a role-scoped error message.
     #[serde(default)]
-    backend: Option<KotoBackend>,
+    backend: Option<String>,
     #[serde(default)]
     extra_args: HashMap<String, Vec<String>>,
     #[serde(default)]
@@ -228,10 +234,20 @@ pub struct KotoRole {
 /// {}`). The runner applies this to the seed agent right after agents
 /// load and before role resolution so the rest of the resolver sees the
 /// overlay-mutated values.
+///
+/// Invariant (issue #369): every overlay field carries the type of the
+/// agent-file field it patches -- `backend` is the runtime
+/// [`crate::config::Backend`], `model` is a free string like
+/// `Agent::model`. When adding a new overlay field, mirror the target
+/// field's type and validation, do not re-declare a stricter schema here.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct RoleOverlay {
+    /// Free-form model string, same schema as the agent-file `model:`
+    /// literal -- no `<provider>/<model-id>` format requirement (that
+    /// contract belongs to tiers only).
     pub model: Option<String>,
-    pub backend: Option<KotoBackend>,
+    /// Runtime backend, same type as `Agent::backend`.
+    pub backend: Option<Backend>,
     /// Backend-keyed extra CLI argument lists. Mirrors `Agent::extra_args`
     /// shape so a runner merge is a HashMap insert per backend key.
     pub extra_args: HashMap<Backend, Vec<String>>,
@@ -664,18 +680,38 @@ fn rebase_default_seeds_for_legacy(mut cfg: KotoConfig) -> KotoConfig {
 /// for the `extra_args` field so the overlay surface stays consistent with
 /// the agent-file surface: unknown backend keys are rejected with the list
 /// of valid names, and the `api` backend is rejected explicitly because it
-/// has no argv to extend. Rule entries must be non-empty strings. Unknown
-/// fields warn but parsing continues -- matching the rest of the YAML
-/// schema.
+/// has no argv to extend. The `backend` field resolves through the same
+/// runtime vocabulary as the agent-file `backend:` field (issue #369),
+/// plus the `cli` alias for backwards compatibility with pre-#369
+/// overlays. Rule entries must be non-empty strings. Unknown fields warn
+/// but parsing continues -- matching the rest of the YAML schema.
 fn resolve_overlay(role_name: &str, raw: &RawKotoOverlay) -> Result<RoleOverlay, KotoConfigError> {
     for key in raw.unknown.keys() {
         eprintln!(
             "warning: unknown field '{key}' in {KOTO_CONFIG_FILE} role '{role_name}' overlays"
         );
     }
-    if let Some(ref m) = raw.model {
-        validate_model_format(m)?;
-    }
+    // `model` is intentionally NOT validated against the tier
+    // `<provider>/<model-id>` format (issue #369): the overlay patches the
+    // agent-file `model:` field, which accepts free strings like
+    // `claude-opus-4-7`. Enforcing the tier contract here rejected values
+    // the target schema accepts.
+    //
+    // `backend` resolves against the runtime Backend vocabulary -- the same
+    // set the agent-file `backend:` field accepts -- plus the historical
+    // `cli` alias for `claude-cli`, so overlays written before #369 keep
+    // resolving to the same runtime backend. The alias is local to the
+    // overlay path on purpose: agent files, steps, and defaults keep their
+    // schemas unchanged.
+    let backend = match raw.backend.as_deref() {
+        None => None,
+        Some("cli") => Some(Backend::ClaudeCli),
+        Some(s) => Some(Backend::from_yaml_name(s).ok_or_else(|| {
+            KotoConfigError::Validation(format!(
+                "unknown backend '{s}' in role '{role_name}' overlays (valid: api, claude-cli, codex, ollama; 'cli' is accepted as an alias for claude-cli)"
+            ))
+        })?),
+    };
     // Validate rules: keep order, reject empty/whitespace entries early so
     // the user finds the typo at parse time rather than during a flow run.
     let mut rules = Vec::with_capacity(raw.rules.len());
@@ -708,7 +744,7 @@ fn resolve_overlay(role_name: &str, raw: &RawKotoOverlay) -> Result<RoleOverlay,
     }
     Ok(RoleOverlay {
         model: raw.model.clone(),
-        backend: raw.backend,
+        backend,
         extra_args,
         rules,
     })
@@ -1515,7 +1551,7 @@ roles:
         let o = &writer.overlays;
         assert!(!o.is_empty());
         assert_eq!(o.model.as_deref(), Some("claude/opus-4-7"));
-        assert_eq!(o.backend, Some(KotoBackend::Api));
+        assert_eq!(o.backend, Some(Backend::Api));
         assert_eq!(
             o.rules,
             vec![
@@ -1570,17 +1606,105 @@ roles:
     }
 
     #[test]
-    fn overlays_bad_model_format_errors() {
+    fn overlays_backend_accepts_agent_file_vocabulary() {
+        // Issue #369 AC1/AC2/AC4: the overlay `backend:` field accepts the
+        // same variant set as agent files and resolves to the matching
+        // runtime Backend.
+        for (yaml_value, expected) in [
+            ("claude-cli", Backend::ClaudeCli),
+            ("codex", Backend::Codex),
+            ("ollama", Backend::Ollama),
+            ("api", Backend::Api),
+        ] {
+            let yaml = format!(
+                "version: \"1\"\nroles:\n  writer:\n    agent: Babis\n    overlays:\n      backend: {yaml_value}\n"
+            );
+            let cfg = KotoConfig::from_yaml_str(&yaml)
+                .unwrap_or_else(|e| panic!("backend '{yaml_value}' failed to parse: {e}"));
+            assert_eq!(
+                cfg.roles.get("writer").unwrap().overlays.backend,
+                Some(expected),
+                "backend '{yaml_value}'"
+            );
+        }
+    }
+
+    #[test]
+    fn overlays_backend_cli_alias_resolves_to_claude_cli() {
+        // Issue #369 AC3 regression pin: `backend: cli` worked before the
+        // fix (via the KotoBackend policy type, mapped Cli -> ClaudeCli at
+        // runtime). It must keep resolving to the same runtime backend.
         let yaml = r#"
 version: "1"
 roles:
   writer:
     agent: Babis
     overlays:
-      model: missing-slash
+      backend: cli
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.roles.get("writer").unwrap().overlays.backend,
+            Some(Backend::ClaudeCli)
+        );
+    }
+
+    #[test]
+    fn overlays_backend_unknown_errors_with_valid_set() {
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      backend: gpt-cli
 "#;
         let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
-        assert!(err.to_string().contains("model must be"), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("unknown backend 'gpt-cli'"), "got: {msg}");
+        assert!(msg.contains("role 'writer'"), "got: {msg}");
+        assert!(msg.contains("api, claude-cli, codex, ollama"), "got: {msg}");
+    }
+
+    #[test]
+    fn overlays_model_accepts_simple_form() {
+        // Issue #369 (maintainer comment) AC1: the overlay `model:` field
+        // patches the agent-file `model:` literal, which is a free string
+        // -- simple forms like `claude-opus-4-7` must parse. The tier
+        // `<provider>/<model-id>` contract does not apply to overlays.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      model: claude-opus-4-7
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.roles.get("writer").unwrap().overlays.model.as_deref(),
+            Some("claude-opus-4-7")
+        );
+    }
+
+    #[test]
+    fn overlays_model_accepts_provider_prefixed_form() {
+        // Issue #369 (maintainer comment) AC2: the provider-prefixed form
+        // passes through unchanged as well -- both forms reach the agent
+        // identically to an agent-file `model:` literal.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    overlays:
+      model: anthropic/claude-opus-4-7
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.roles.get("writer").unwrap().overlays.model.as_deref(),
+            Some("anthropic/claude-opus-4-7")
+        );
     }
 
     #[test]
