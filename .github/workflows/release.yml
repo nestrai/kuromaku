@@ -1,0 +1,57 @@
+# Release runs inside the flake devShell for the same local==CI parity as
+# ci.yml (see docs/decisions/0008-ci-uses-flake-devshell.md). Pushing a
+# v* tag builds kuro for the four supported platforms and attaches the
+# tarballs to a GitHub release.
+
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  dist:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            target: aarch64-linux
+          - runner: macos-13
+            target: x86_64-darwin
+          - runner: macos-latest
+            target: aarch64-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - run: nix develop --command just dist ${{ matrix.target }}
+      - run: gh release upload "$GITHUB_REF_NAME" "dist/kuro-${{ matrix.target }}.tar.gz"
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  publish-release:
+    needs: dist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: gh release edit "$GITHUB_REF_NAME" --draft=false
+        env:
+          GH_TOKEN: ${{ github.token }}

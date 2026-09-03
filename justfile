@@ -7,6 +7,12 @@ build:
 release:
     cargo build --release
 
+# Build a release tarball for one target platform (called by release.yml,
+# runs on a native runner per platform -- no cross-compilation).
+dist target: release
+    mkdir -p dist
+    tar -czf dist/kuro-{{target}}.tar.gz -C target/release kuro
+
 run *args:
     cargo run -- {{args}}
 
