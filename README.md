@@ -63,13 +63,45 @@ kuro run review-pr id=67
 
 **Agents** are YAML files in `.kuro/agents/`. Each agent has a name, title, role (system prompt), and references to shared rules. Agents can use different models and backends.
 
-**Flows** are YAML files in `.kuro/flows/`. A flow defines steps as a map -- keys are step names, values configure which agent runs and what context they receive from prior steps.
+**Flows** are YAML files in `.kuro/flows/`. A flow defines steps as a map -- keys are step names, values configure which agent runs and what context they receive from prior steps. Beyond linear sequences, a flow can be a full state machine (`graph:`) where an agent's verdict routes to different states, rework loops revisit earlier states, and shell states gate progress on real commands like `just lint && just test` -- see [docs/graph-flows.md](docs/graph-flows.md).
 
 **Rules** are Markdown files in `.kuro/rules/`. Multiple agents can reference the same rules. Rules are composed into the system prompt at runtime: Guide > Rules > Skills > Role.
 
-**Stack** is where outputs land. Each step writes its result to `~/.kuro/stacks/<project>/`. Results from earlier steps are injected as context into later steps.
+**Stack** is where outputs land. Each step writes its result to `~/.koto/stacks/<project>/`. Results from earlier steps are injected as context into later steps.
 
 **Template variables** allow flows to define reusable prompts with `{{key}}` placeholders, filled via `key=value` CLI arguments.
+
+## Human-in-the-loop
+
+A graph state with `human: true` hands control to a person instead of an agent:
+
+```yaml
+review:
+  agent: Bella
+  next:
+    - merge: "Changes look good."
+    - clarify: "Reviewer needs a human decision."
+
+clarify:
+  human: true
+  next:
+    - implement: "Human requested changes."
+    - merge: "Human approved as-is."
+```
+
+On an interactive terminal, `kuro run` prompts you inline when the flow reaches
+the human state. In an unattended run, the flow pauses cleanly and records the
+handoff; you continue it later with:
+
+```bash
+kuro resume <run-id> --message "approved, but rename the flag first"
+# or pipe the response: echo "go" | kuro resume <run-id>
+# or from a file:       kuro resume <run-id> --message-file review-notes.md
+```
+
+Your response is injected as context into the next state, so the agents see
+exactly what the human decided and why. Because every run is a persistent
+stack on disk, a paused flow survives reboots -- resume it tomorrow.
 
 ## How it compares
 
@@ -84,6 +116,7 @@ kuromaku takes a fundamentally different approach from Python-based agent framew
 | LLM backend per agent | Claude CLI, Ollama, API -- mix freely | Via LiteLLM (per agent) | Via LangChain (per node) | Per agent |
 | Execution targets | Local, SSH, Kubernetes | Local only | Local only | Local only |
 | State persistence | Structured stack on disk | In-memory, session-scoped | External checkpointers | Message history |
+| Human-in-the-loop | `human: true` states -- inline on TTY, pause + `kuro resume --message` unattended | `human_input` flag (blocking prompt) | `interrupt()` + checkpointer, in code | `UserProxyAgent` |
 | Reproducibility | `git diff` on YAML | Depends on code discipline | Depends on code discipline | Depends on code discipline |
 | Setup | Single binary | `pip install` + Python env | `pip install` + Python env | `pip install` + Python env |
 

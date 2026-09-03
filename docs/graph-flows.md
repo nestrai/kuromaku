@@ -93,8 +93,9 @@ done:
   final: "Happy-path exit."
 ```
 
-**Human state** -- has `human: true` (schema-accepted, not yet
-runtime-supported):
+**Human state** -- has `human: true`. The run pauses cleanly at the
+state (or prompts inline on a TTY) and continues via `kuro resume`
+with the human response injected as context:
 
 ```yaml
 operator:
