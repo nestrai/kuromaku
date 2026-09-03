@@ -7,7 +7,7 @@ seeds:
   - path: ~/code/nestrai/seeds/coding/common/
 
 tiers:
-  reasoning: claude/opus-4-7
+  reasoning: claude/fable-5
   general: claude/sonnet-4-6
   quick: claude/haiku-4-5
 
