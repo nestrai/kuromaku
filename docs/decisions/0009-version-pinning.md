@@ -1,6 +1,6 @@
 # ADR-0009: Artifact audit by content hash, seed pinning deferred to git
 
-**Status:** proposed
+**Status:** accepted
 **Date:** 2026-05-26
 **Issue:** [#227](https://github.com/nestrai/kuromaku/issues/227)
 **Related:** [#225](https://github.com/nestrai/kuromaku/issues/225) (regulatory readiness epic), [#161](https://github.com/nestrai/kuromaku/issues/161) (audit architecture), [#164](https://github.com/nestrai/kuromaku/issues/164) (stack/run model), [#166](https://github.com/nestrai/kuromaku/issues/166) (audit-trail enforce mode), [#167](https://github.com/nestrai/kuromaku/issues/167) (manifest immutability), [#37](https://github.com/nestrai/kuromaku/issues/37) (hosted koto / v2 ecosystem)
@@ -154,11 +154,13 @@ was cut to the cheap, load-bearing half (content-hash audit) with remote
 pinning deferred. The semver-solver rejection and content-hash-for-audit
 choice survived the review unchanged.
 
-## Open questions for sign-off
+## Sign-off
 
-- Confirm the v1/deferred split: is shipping audit-by-hash now, and
-  deferring the resolver, the right call against the publish goal?
-- Should the interim "submodule or pinned `path:`" pattern be promoted in
-  the README / reference card as the supported way to pin seeds?
-- Naming for the deferred lock file, when it lands: `kuro.lock` at repo
-  root vs `.kuro/lock.yaml`.
+Accepted 2026-09-03. Answers to the open questions:
+
+- v1/deferred split confirmed: audit-by-hash ships now, the git resolver
+  stays deferred to the v2 ecosystem ADR.
+- The interim "submodule or pinned `path:`" pattern will be documented in
+  the README as the supported way to pin seeds (tracked as a follow-up
+  issue).
+- Lock file naming is decided in the deferred resolver ADR, not here.
