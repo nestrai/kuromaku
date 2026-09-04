@@ -2932,14 +2932,12 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
         }
 
         // ---- 3. Load flow with project + legacy role bindings ----------
+        // #389: `role_agent_map()` is the shared binding source -- the
+        // `kuro context` inventory feeds the exact same map into flow
+        // parsing, so a flow that loads here also shows up there.
         let project_roles: HashMap<String, String> = koto_config
             .as_ref()
-            .map(|c| {
-                c.roles
-                    .iter()
-                    .map(|(k, v)| (k.clone(), v.agent.clone()))
-                    .collect()
-            })
+            .map(|c| c.role_agent_map())
             .unwrap_or_default();
         // #258: path-aware variant so per-step `task_file:` and the
         // top-level `prompt_file:` resolve against the flow's

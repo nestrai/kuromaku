@@ -449,6 +449,23 @@ pub fn load_flow_from_str_with_project(
 /// graph schema lands.
 #[allow(dead_code)]
 pub fn load_flow_any_from_str(contents: &str) -> Result<Flow, ConfigError> {
+    load_flow_any_from_str_with_project(contents, &HashMap::new())
+}
+
+/// Variant of [`load_flow_any_from_str`] that threads project-level role
+/// bindings into the linear arm (#389).
+///
+/// The inventory (`kuro context`, MCP `list_flows`) parses flows through
+/// this entry with the same `role -> agent` map the runner uses
+/// ([`crate::koto_config::KotoConfig::role_agent_map`]), so a linear flow
+/// whose `role:` is bound only in `.kuro/config.yaml` loads instead of
+/// erroring with "references undefined role". Graph flows are unaffected:
+/// their role binding is deferred to the runner, so the graph arm takes
+/// no roles.
+pub fn load_flow_any_from_str_with_project(
+    contents: &str,
+    project_roles: &HashMap<String, String>,
+) -> Result<Flow, ConfigError> {
     let probe: FlowShapeProbe = serde_yaml::from_str(contents)?;
     match (probe.flow.is_some(), probe.graph.is_some()) {
         (true, true) => Err(ConfigError::Validation(
@@ -458,9 +475,84 @@ pub fn load_flow_any_from_str(contents: &str) -> Result<Flow, ConfigError> {
         (false, false) => Err(ConfigError::Validation(
             "flow file must declare either 'flow:' (linear) or 'graph:' (state graph)".to_string(),
         )),
-        (true, false) => Ok(Flow::Linear(load_flow_from_str(contents)?)),
+        (true, false) => Ok(Flow::Linear(load_flow_from_str_with_project(
+            contents,
+            &HashMap::new(),
+            project_roles,
+        )?)),
         (false, true) => Ok(Flow::Graph(load_graph_flow_from_str(contents)?)),
     }
+}
+
+/// Raw-parse view of a linear flow for inventory purposes (#389).
+///
+/// Used by the `kuro context` flow walker on the failure path of the
+/// strict loader to distinguish "this flow only fails because a role is
+/// unbound" from "this flow is genuinely malformed". Precedent:
+/// [`parse_role_names`], which also raw-parses without validating.
+pub(crate) struct LinearFlowInventory {
+    pub name: String,
+    pub prompt: Option<String>,
+    /// Step IDs in declaration order.
+    pub steps: Vec<String>,
+    /// Role names referenced by steps that resolve through neither the
+    /// flow-local `roles:` block nor the project-level bindings. Sorted,
+    /// deduplicated. Empty means every role reference has a binding on
+    /// disk (a CLI `--role` override at run time is not considered).
+    pub unresolved_roles: Vec<String>,
+}
+
+/// Raw-parse a linear flow YAML and report which step roles cannot be
+/// resolved from flow-local or project configuration (#389).
+///
+/// Errors only when the YAML itself does not parse as a linear flow --
+/// semantic problems (missing task, conflicting fields, ...) are NOT
+/// checked here. Callers pair this with the strict loader: strict load
+/// failed, raw parse succeeds, `unresolved_roles` non-empty => the flow
+/// is structurally fine but role-starved.
+pub(crate) fn parse_linear_flow_inventory(
+    contents: &str,
+    project_roles: &HashMap<String, String>,
+) -> Result<LinearFlowInventory, ConfigError> {
+    let raw: RawFlowConfig = serde_yaml::from_str(contents)?;
+    let mut unresolved: Vec<String> = raw
+        .flow
+        .values()
+        .filter_map(|s| s.role.as_deref())
+        .filter(|r| !raw.roles.contains_key(*r) && !project_roles.contains_key(*r))
+        .map(str::to_string)
+        .collect();
+    unresolved.sort();
+    unresolved.dedup();
+    Ok(LinearFlowInventory {
+        name: raw.name,
+        prompt: raw.prompt,
+        steps: raw.flow.keys().cloned().collect(),
+        unresolved_roles: unresolved,
+    })
+}
+
+/// Role names used by a graph flow's agent states that have no
+/// project-level binding (#389). Sorted, deduplicated.
+///
+/// Graph flows have no flow-local `roles:` map -- their binding sources
+/// at runtime are the project config and CLI `--role` overrides. The
+/// inventory cannot see CLI flags, so "unresolved" here means "not
+/// resolvable from on-disk configuration".
+pub(crate) fn graph_unresolved_roles(
+    graph: &GraphFlow,
+    project_roles: &HashMap<String, String>,
+) -> Vec<String> {
+    let mut unresolved: Vec<String> = graph
+        .graph
+        .values()
+        .filter_map(|s| s.role.as_deref())
+        .filter(|r| !project_roles.contains_key(*r))
+        .map(str::to_string)
+        .collect();
+    unresolved.sort();
+    unresolved.dedup();
+    unresolved
 }
 
 /// Load a graph-shaped flow YAML.

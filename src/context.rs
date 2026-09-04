@@ -36,14 +36,17 @@
 //! covers semantic checks. Only a malformed `.kuro/config.yaml`
 //! surfaces an error (via [`KotoConfigError`]).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tracing::warn;
 
-use crate::config::{Flow, RawAgentFile, load_flow_any_from_str};
+use crate::config::{
+    Flow, RawAgentFile, graph_unresolved_roles, load_flow_any_from_str_with_project,
+    parse_linear_flow_inventory,
+};
 use crate::koto_config::{KotoConfig, KotoConfigError, Seed, SeedSource, Seeds};
 
 /// Maximum description length in Unicode scalars (characters, not bytes).
@@ -136,6 +139,16 @@ pub struct FlowEntry {
     pub name: String,
     pub description: String,
     pub steps: Vec<String>,
+    /// Role names this flow references that resolve through neither a
+    /// flow-local `roles:` block nor the project-level bindings in
+    /// `.kuro/config.yaml` (#389). Empty (and absent from the JSON wire
+    /// format -- additive to schema v1) for flows that are runnable from
+    /// on-disk configuration alone. Non-empty marks the flow as "listed
+    /// but not runnable without extra binding" -- e.g. a CLI `--role`
+    /// override at run time. The entry stays in the inventory because a
+    /// role-broken local flow still shadows a same-named seed flow.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unresolved_roles: Vec<String>,
 }
 
 /// First-match-wins view of the cascade.
@@ -166,8 +179,24 @@ pub struct EffectiveItem {
 /// Resolve the cascade visible from `cwd`. See module docs for the
 /// degradation rules.
 pub fn resolve(cwd: &Path) -> Result<ResolvedContext, ContextError> {
-    let seeds = discover_seeds(cwd)?;
-    let contributions: Vec<SeedContribution> = seeds.seeds.iter().map(seed_contribution).collect();
+    // Load the project config once and derive BOTH the seed list and the
+    // project-level role bindings from it (#389). The roles feed into
+    // flow enumeration so a flow whose `role:` is bound only in
+    // `.kuro/config.yaml` lists exactly like it runs.
+    let koto_config = KotoConfig::load_optional(cwd)?;
+    let project_roles = koto_config
+        .as_ref()
+        .map(|c| c.role_agent_map())
+        .unwrap_or_default();
+    let seeds = koto_config
+        .map(|c| c.seeds)
+        .unwrap_or_else(Seeds::default_local);
+    let seeds = rebase_seeds_for_cwd(seeds, cwd);
+    let contributions: Vec<SeedContribution> = seeds
+        .seeds
+        .iter()
+        .map(|s| seed_contribution(s, &project_roles))
+        .collect();
     let effective = build_effective(&contributions);
     Ok(ResolvedContext {
         version: CONTEXT_SCHEMA_VERSION,
@@ -219,17 +248,43 @@ pub fn render_human(ctx: &ResolvedContext, out: &mut dyn Write) -> io::Result<()
             "       rules:  {}",
             list_or_none(seed.rules.iter().map(|r| r.name.as_str()))
         )?;
+        // Flows carry an inline `(unresolved role: ...)` suffix when
+        // their roles resolve through neither the flow nor the project
+        // config (#389) -- listed, but not runnable as configured.
+        let flow_names: Vec<String> = seed
+            .flows
+            .iter()
+            .map(|f| format!("{}{}", f.name, unresolved_roles_suffix(&f.unresolved_roles)))
+            .collect();
         writeln!(
             out,
             "       flows:  {}",
-            list_or_none(seed.flows.iter().map(|f| f.name.as_str()))
+            list_or_none(flow_names.iter().map(String::as_str))
         )?;
     }
     writeln!(out)?;
     writeln!(out, "Effective cascade (what agents see this session):")?;
-    write_effective_section(out, "agents", &ctx.effective.agents)?;
-    write_effective_section(out, "rules ", &ctx.effective.rules)?;
-    write_effective_section(out, "flows ", &ctx.effective.flows)?;
+    let no_suffixes = HashMap::new();
+    write_effective_section(out, "agents", &ctx.effective.agents, &no_suffixes)?;
+    write_effective_section(out, "rules ", &ctx.effective.rules, &no_suffixes)?;
+    // Mirror the per-seed `(unresolved role: ...)` suffix on the winning
+    // flow entries so both views of the inventory tell the same story.
+    let flow_suffixes: HashMap<(&str, &str), String> = ctx
+        .seeds
+        .iter()
+        .flat_map(|s| {
+            s.flows
+                .iter()
+                .filter(|f| !f.unresolved_roles.is_empty())
+                .map(|f| {
+                    (
+                        (s.display.as_str(), f.name.as_str()),
+                        unresolved_roles_suffix(&f.unresolved_roles),
+                    )
+                })
+        })
+        .collect();
+    write_effective_section(out, "flows ", &ctx.effective.flows, &flow_suffixes)?;
     writeln!(out)?;
     writeln!(
         out,
@@ -247,10 +302,21 @@ fn list_or_none<'a, I: Iterator<Item = &'a str>>(names: I) -> String {
     }
 }
 
+/// Human-render suffix for a flow with unresolved roles (#389). Empty
+/// string when every role is bound.
+fn unresolved_roles_suffix(roles: &[String]) -> String {
+    if roles.is_empty() {
+        String::new()
+    } else {
+        format!(" (unresolved role: {})", roles.join(", "))
+    }
+}
+
 fn write_effective_section(
     out: &mut dyn Write,
     label: &str,
     items: &[EffectiveItem],
+    suffixes: &HashMap<(&str, &str), String>,
 ) -> io::Result<()> {
     if items.is_empty() {
         writeln!(out, "  {label} (0): (none)")?;
@@ -259,15 +325,21 @@ fn write_effective_section(
     // Inline a `[shadows: ...]` suffix on items with non-empty shadow
     // lists so the human renderer mirrors the JSON wire format. The
     // suffix is only emitted for cross-seed conflicts -- non-conflict
-    // items stay compact (`name (from seed)`).
+    // items stay compact (`name (from seed)`). `suffixes` (keyed by
+    // winning seed display + item name) appends extra per-item context;
+    // today only flows use it, for the unresolved-roles marker (#389).
     let rendered: Vec<String> = items
         .iter()
         .map(|it| {
+            let extra = suffixes
+                .get(&(it.seed.as_str(), it.name.as_str()))
+                .map(String::as_str)
+                .unwrap_or_default();
             if it.shadows.is_empty() {
-                format!("{} (from {})", it.name, it.seed)
+                format!("{} (from {}){extra}", it.name, it.seed)
             } else {
                 format!(
-                    "{} (from {}) [shadows: {}]",
+                    "{} (from {}) [shadows: {}]{extra}",
                     it.name,
                     it.seed,
                     it.shadows.join(", "),
@@ -316,7 +388,7 @@ pub(crate) fn rebase_seeds_for_cwd(seeds: Seeds, cwd: &Path) -> Seeds {
 
 // --- Per-seed walkers ---
 
-fn seed_contribution(seed: &Seed) -> SeedContribution {
+fn seed_contribution(seed: &Seed, project_roles: &HashMap<String, String>) -> SeedContribution {
     match &seed.source {
         SeedSource::Local { display, path } => {
             let exists = path.is_dir();
@@ -332,7 +404,7 @@ fn seed_contribution(seed: &Seed) -> SeedContribution {
                 Vec::new()
             };
             let flows = if exists {
-                enumerate_flows_in_seed(path, display)
+                enumerate_flows_in_seed(path, display, project_roles)
             } else {
                 Vec::new()
             };
@@ -434,27 +506,43 @@ pub(crate) fn enumerate_rules_in_seed(seed_path: &Path, seed_display: &str) -> V
 }
 
 /// Walk one seed's `flows/` directory and return entries in name order.
-pub(crate) fn enumerate_flows_in_seed(seed_path: &Path, seed_display: &str) -> Vec<FlowEntry> {
+///
+/// `project_roles` is the project-level `role -> agent` map (#389,
+/// [`crate::koto_config::KotoConfig::role_agent_map`]). Linear flows are
+/// parsed with these bindings -- the same map the runner passes -- so a
+/// flow whose `role:` resolves only through `.kuro/config.yaml` lists
+/// instead of being warn-dropped as invalid.
+pub(crate) fn enumerate_flows_in_seed(
+    seed_path: &Path,
+    seed_display: &str,
+    project_roles: &HashMap<String, String>,
+) -> Vec<FlowEntry> {
     let flows_dir = seed_path.join("flows");
     let entries = match std::fs::read_dir(&flows_dir) {
         Ok(e) => e,
         Err(_) => return Vec::new(),
     };
     // Sort the directory listing before iterating: `read_dir` order is
-    // filesystem-dependent, and when a seed contains both `build.yaml`
-    // and `build.yml` the stem-dedup below otherwise picks the winner
-    // non-deterministically. Sorting by full filename gives `.yaml`
-    // precedence over `.yml` (ASCII 'a' < 'y'), and pins the choice
-    // so two runs on the same checkout always agree.
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-    paths.sort();
+    // filesystem-dependent, and when a seed contains e.g. both
+    // `build.yaml` and `build.md` the stem-dedup below otherwise picks
+    // the winner non-deterministically. Precedence is pinned to
+    // yaml > yml > md via an explicit extension rank -- a plain filename
+    // sort would put `.md` FIRST ('m' < 'y') and contradict the runtime,
+    // where `resolve_flow_path` tries `<name>.yaml` before `<name>.md`.
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| flow_extension_rank(p).is_some())
+        .collect();
+    paths.sort_by_key(|p| {
+        (
+            p.file_stem().map(|s| s.to_os_string()),
+            flow_extension_rank(p),
+        )
+    });
     let mut out: Vec<FlowEntry> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for p in paths {
-        let ext = p.extension().and_then(|s| s.to_str());
-        if ext != Some("yaml") && ext != Some("yml") {
-            continue;
-        }
         let bare = p
             .file_stem()
             .and_then(|s| s.to_str())
@@ -471,36 +559,98 @@ pub(crate) fn enumerate_flows_in_seed(seed_path: &Path, seed_display: &str) -> V
                 continue;
             }
         };
-        // Use the polymorphic loader so graph flows (kuromaku's own
-        // implement-issue / validate-issues, plus rust seed's
-        // implement-issue) show up alongside linear flows. The earlier
-        // mcp/discovery.rs walker used the linear-only loader, which
-        // silently dropped graph flows from the inventory -- a real
-        // regression once kuromaku itself standardised on graph flows.
-        // String-only loader keeps the inventory listing tolerant of
-        // missing sibling `task_file:` files: a broken prompt link is
-        // the runner's problem, not a reason to hide the flow.
-        let entry = match load_flow_any_from_str(&contents) {
-            Ok(Flow::Linear(f)) => FlowEntry {
-                name: f.name,
-                description: f.prompt.unwrap_or_default(),
-                steps: f.steps.into_iter().map(|s| s.id).collect(),
-            },
-            Ok(Flow::Graph(g)) => FlowEntry {
-                name: g.name,
-                description: g.prompt.unwrap_or_default(),
-                steps: g.graph.keys().cloned().collect(),
-            },
-            Err(e) => {
-                warn!(path = %p.display(), seed = %seed_display, error = %e,
-                      "flow file invalid");
-                continue;
-            }
-        };
-        out.push(entry);
+        if let Some(entry) = flow_entry_from_contents(&contents, &p, seed_display, project_roles) {
+            out.push(entry);
+        }
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
+}
+
+/// Dedup / precedence rank for flow file extensions: yaml > yml > md.
+/// `None` for everything else (not a flow file).
+fn flow_extension_rank(p: &Path) -> Option<u8> {
+    match p.extension().and_then(|s| s.to_str()) {
+        Some("yaml") => Some(0),
+        Some("yml") => Some(1),
+        Some("md") => Some(2),
+        _ => None,
+    }
+}
+
+/// Parse one flow file's contents into a [`FlowEntry`], or `None` (with
+/// a warning) when the file is genuinely malformed.
+///
+/// Uses the polymorphic loader so graph flows show up alongside linear
+/// flows, and the string-only loader keeps the inventory tolerant of
+/// missing sibling `task_file:` files: a broken prompt link is the
+/// runner's problem, not a reason to hide the flow.
+///
+/// Failure handling (#389): when the strict load fails, a raw re-parse
+/// classifies the failure. A linear flow that parses structurally but
+/// references roles bound by neither the flow nor the project lists WITH
+/// `unresolved_roles` populated -- it still shadows same-named seed flows
+/// at runtime, so hiding it would misrepresent the cascade. Anything
+/// else (malformed YAML/Markdown, semantic errors other than role
+/// resolution) warns and skips, exactly the pre-#389 strictness -- a
+/// malformed file can never be mistaken for a role miss because the raw
+/// parse itself fails on it.
+fn flow_entry_from_contents(
+    contents: &str,
+    path: &Path,
+    seed_display: &str,
+    project_roles: &HashMap<String, String>,
+) -> Option<FlowEntry> {
+    // Markdown flows are always graph-shaped -- no YAML probe.
+    if path.extension().and_then(|s| s.to_str()) == Some("md") {
+        return match crate::config_md::load_graph_flow_from_md(contents) {
+            Ok(g) => Some(graph_flow_entry(g, project_roles)),
+            Err(e) => {
+                warn!(path = %path.display(), seed = %seed_display, error = %e,
+                      "flow file invalid");
+                None
+            }
+        };
+    }
+    match load_flow_any_from_str_with_project(contents, project_roles) {
+        Ok(Flow::Linear(f)) => Some(FlowEntry {
+            name: f.name,
+            description: f.prompt.unwrap_or_default(),
+            steps: f.steps.into_iter().map(|s| s.id).collect(),
+            unresolved_roles: Vec::new(),
+        }),
+        Ok(Flow::Graph(g)) => Some(graph_flow_entry(g, project_roles)),
+        Err(e) => {
+            // Failure-path classification: does the flow raw-parse as a
+            // linear flow with unbound roles? Then it is inventory-worthy.
+            match parse_linear_flow_inventory(contents, project_roles) {
+                Ok(inv) if !inv.unresolved_roles.is_empty() => Some(FlowEntry {
+                    name: inv.name,
+                    description: inv.prompt.unwrap_or_default(),
+                    steps: inv.steps,
+                    unresolved_roles: inv.unresolved_roles,
+                }),
+                _ => {
+                    warn!(path = %path.display(), seed = %seed_display, error = %e,
+                          "flow file invalid");
+                    None
+                }
+            }
+        }
+    }
+}
+
+fn graph_flow_entry(
+    g: crate::config::GraphFlow,
+    project_roles: &HashMap<String, String>,
+) -> FlowEntry {
+    let unresolved_roles = graph_unresolved_roles(&g, project_roles);
+    FlowEntry {
+        name: g.name,
+        description: g.prompt.unwrap_or_default(),
+        steps: g.graph.keys().cloned().collect(),
+        unresolved_roles,
+    }
 }
 
 // --- Effective cascade (first-match-wins) ---
@@ -731,6 +881,38 @@ mod tests {
         );
     }
 
+    /// Project config with one seed AND a project-level role binding --
+    /// the #389 fixture shape.
+    fn write_project_with_seed_and_role(cwd: &Path, seed_path: &Path, role: &str, agent: &str) {
+        write(
+            &cwd.join(".kuro/config.yaml"),
+            &format!(
+                "version: \"1\"\nseeds:\n  - path: {}\nroles:\n  {role}:\n    agent: {agent}\n",
+                seed_path.display()
+            ),
+        );
+    }
+
+    /// Linear flow whose step binds via `role:` with NO flow-local
+    /// `roles:` block -- resolvable only through project roles.
+    fn role_only_flow(name: &str, role: &str) -> String {
+        format!(
+            "version: \"1\"\nname: {name}\nprompt: p\nflow:\n  work:\n    role: {role}\n    task: t\n"
+        )
+    }
+
+    /// Markdown graph flow with a single agent state using `role`.
+    fn role_only_md_flow(name: &str, role: &str) -> String {
+        format!(
+            "---\nformat: kuromaku-flow/v1\n---\n\n# {name}\n\n---\n\n## work\n*role: {role}*\n\nDo the thing.\n\n-> done: finished\n-> work: retry\n\n---\n\n## done\n*final: complete*\n"
+        )
+    }
+
+    /// Pre-#389 call shape: seed contribution without project roles.
+    fn seed_contribution_no_roles(seed: &Seed) -> SeedContribution {
+        seed_contribution(seed, &HashMap::new())
+    }
+
     // ---- resolve: degradation rules ----
 
     #[test]
@@ -876,7 +1058,7 @@ mod tests {
         // Need an agents/ dir (or any dir) so `exists` is true and the
         // walk runs.
         fs::create_dir_all(seed.join("agents")).unwrap();
-        let contribution = seed_contribution(&Seed {
+        let contribution = seed_contribution_no_roles(&Seed {
             source: SeedSource::Local {
                 display: "seed/".to_string(),
                 path: seed.clone(),
@@ -890,7 +1072,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let seed = tmp.path().join("seed");
         fs::create_dir_all(seed.join("agents")).unwrap();
-        let contribution = seed_contribution(&Seed {
+        let contribution = seed_contribution_no_roles(&Seed {
             source: SeedSource::Local {
                 display: "seed/".to_string(),
                 path: seed,
@@ -972,7 +1154,7 @@ mod tests {
             &seed.join("flows/implement.yaml"),
             &minimal_graph_flow("implement", Some("graph"), &["precheck"]),
         );
-        let flows = enumerate_flows_in_seed(&seed, "seed/");
+        let flows = enumerate_flows_in_seed(&seed, "seed/", &HashMap::new());
         let by_name: std::collections::HashMap<&str, &FlowEntry> =
             flows.iter().map(|f| (f.name.as_str(), f)).collect();
         assert_eq!(by_name.len(), 2, "both linear and graph flows must list");
@@ -1000,7 +1182,7 @@ mod tests {
         // Run multiple times to defeat any per-run randomness from
         // read_dir iteration order on resilient filesystems.
         for _ in 0..5 {
-            let flows = enumerate_flows_in_seed(&seed, "seed/");
+            let flows = enumerate_flows_in_seed(&seed, "seed/", &HashMap::new());
             assert_eq!(flows.len(), 1);
             assert_eq!(flows[0].name, "build-yaml");
             assert_eq!(flows[0].description, "yaml wins");
@@ -1019,7 +1201,7 @@ mod tests {
             &seed.join("flows/test.yml"),
             &minimal_flow("test", None, &["run"]),
         );
-        let flows = enumerate_flows_in_seed(&seed, "seed/");
+        let flows = enumerate_flows_in_seed(&seed, "seed/", &HashMap::new());
         assert_eq!(flows.len(), 2);
         let by_name: std::collections::HashMap<&str, &FlowEntry> =
             flows.iter().map(|f| (f.name.as_str(), f)).collect();
@@ -1027,6 +1209,264 @@ mod tests {
         assert_eq!(by_name["build"].steps, vec!["plan", "code"]);
         assert_eq!(by_name["test"].description, "");
         assert_eq!(by_name["test"].steps, vec!["run"]);
+    }
+
+    // ---- project-level role bindings in flow enumeration (#389) ----
+
+    fn dev_roles() -> HashMap<String, String> {
+        [("developer".to_string(), "Noah".to_string())].into()
+    }
+
+    #[test]
+    fn enumerate_flows_in_seed_resolves_role_via_project_config() {
+        // AC1 core regression: a linear flow whose `role:` binds only
+        // through the project config must list, with no unresolved
+        // marker. Before #389 the walker parsed with an empty roles map
+        // and warn-dropped the flow as invalid.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(
+            &seed.join("flows/ship.yaml"),
+            &role_only_flow("ship", "developer"),
+        );
+        let flows = enumerate_flows_in_seed(&seed, "seed/", &dev_roles());
+        assert_eq!(flows.len(), 1, "project-bound role must not drop the flow");
+        assert_eq!(flows[0].name, "ship");
+        assert_eq!(flows[0].steps, vec!["work"]);
+        assert!(flows[0].unresolved_roles.is_empty());
+    }
+
+    #[test]
+    fn enumerate_flows_in_seed_lists_markdown_flow_with_project_role() {
+        // AC3: markdown flows were not enumerated at all before #389
+        // (extension filter accepted only yaml/yml). The runtime resolves
+        // `<name>.md`, so the inventory must too.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(
+            &seed.join("flows/ship.md"),
+            &role_only_md_flow("ship", "developer"),
+        );
+        let flows = enumerate_flows_in_seed(&seed, "seed/", &dev_roles());
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].name, "ship");
+        assert_eq!(flows[0].steps, vec!["work", "done"]);
+        assert!(flows[0].unresolved_roles.is_empty());
+    }
+
+    #[test]
+    fn enumerate_flows_in_seed_flow_local_role_needs_no_project_binding() {
+        // AC4 (flow side of the precedence): a flow-local `roles:`
+        // default keeps working with zero project roles, and a project
+        // binding for the same role does not break the flow either --
+        // flow-level wins at runtime, both load here.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(
+            &seed.join("flows/local.yaml"),
+            "version: \"1\"\nname: local\nprompt: p\nroles:\n  developer:\n    default: FlowDev\nflow:\n  work:\n    role: developer\n    task: t\n",
+        );
+        for roles in [HashMap::new(), dev_roles()] {
+            let flows = enumerate_flows_in_seed(&seed, "seed/", &roles);
+            assert_eq!(flows.len(), 1, "roles: {roles:?}");
+            assert!(flows[0].unresolved_roles.is_empty());
+        }
+    }
+
+    #[test]
+    fn enumerate_flows_in_seed_marks_unresolved_roles_all_shapes() {
+        // AC5: a genuinely unresolved role must not hide the flow --
+        // it stays listed (it still shadows same-named seed flows) with
+        // `unresolved_roles` populated. Covers all three on-disk shapes.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(
+            &seed.join("flows/linear.yaml"),
+            &role_only_flow("linear", "ghost"),
+        );
+        write(
+            &seed.join("flows/graph.yaml"),
+            "version: \"1\"\nname: graph\ninitial: work\ngraph:\n  work:\n    role: ghost\n    task: t\n    next:\n      - done: finished\n      - work: retry\n  done:\n    final: \"complete\"\n",
+        );
+        write(
+            &seed.join("flows/mark.md"),
+            &role_only_md_flow("mark", "ghost"),
+        );
+        let flows = enumerate_flows_in_seed(&seed, "seed/", &dev_roles());
+        assert_eq!(flows.len(), 3, "unresolved roles must not drop flows");
+        for f in &flows {
+            assert_eq!(
+                f.unresolved_roles,
+                vec!["ghost".to_string()],
+                "flow {}",
+                f.name
+            );
+        }
+    }
+
+    #[test]
+    fn enumerate_flows_in_seed_skips_malformed_files_not_role_misses() {
+        // AC6: malformed YAML / Markdown still warns and skips -- it
+        // must never be classified as a role miss. A healthy flow next
+        // to the broken ones keeps listing.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(&seed.join("flows/broken.yaml"), "::not yaml::");
+        write(&seed.join("flows/broken-md.md"), "# no frontmatter\n");
+        // Structurally fine but semantically broken beyond roles
+        // (references an unknown step) -- pre-#389 strictness applies.
+        write(
+            &seed.join("flows/badstep.yaml"),
+            "version: \"1\"\nname: badstep\nprompt: p\nflow:\n  work:\n    role: developer\n    task: t\n    needs: [nonexistent]\n",
+        );
+        write(
+            &seed.join("flows/good.yaml"),
+            &role_only_flow("good", "developer"),
+        );
+        let flows = enumerate_flows_in_seed(&seed, "seed/", &dev_roles());
+        assert_eq!(
+            flows.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            vec!["good"]
+        );
+    }
+
+    #[test]
+    fn enumerate_flows_in_seed_stem_precedence_yaml_over_yml_over_md() {
+        // Dedup precedence pinned yaml > yml > md, matching the runtime
+        // (`resolve_flow_path` tries .yaml before .md). A naive filename
+        // sort would put .md first ('m' < 'y') -- regression guard.
+        let tmp = TempDir::new().unwrap();
+        let seed = tmp.path().join("seed");
+        write(
+            &seed.join("flows/build.yaml"),
+            &minimal_flow("build-yaml", Some("yaml wins"), &["plan"]),
+        );
+        write(
+            &seed.join("flows/build.md"),
+            &role_only_md_flow("build-md", "developer"),
+        );
+        write(
+            &seed.join("flows/test.yml"),
+            &minimal_flow("test-yml", Some("yml wins"), &["run"]),
+        );
+        write(
+            &seed.join("flows/test.md"),
+            &role_only_md_flow("test-md", "developer"),
+        );
+        let flows = enumerate_flows_in_seed(&seed, "seed/", &dev_roles());
+        let names: Vec<&str> = flows.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, vec!["build-yaml", "test-yml"]);
+    }
+
+    #[test]
+    fn resolve_lists_project_role_only_flow_in_both_views() {
+        // End-to-end AC1: `resolve` derives the project roles from the
+        // same config that declares the seeds, so a role-only flow shows
+        // in the per-seed listing AND the effective cascade.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let seed = cwd.join("seed");
+        write(
+            &seed.join("flows/ship.yaml"),
+            &role_only_flow("ship", "developer"),
+        );
+        write_project_with_seed_and_role(cwd, &seed, "developer", "Noah");
+        let ctx = resolve(cwd).unwrap();
+        let contribution = ctx
+            .seeds
+            .iter()
+            .find(|s| s.display == seed.display().to_string())
+            .expect("seed listed");
+        assert_eq!(contribution.flows.len(), 1);
+        assert_eq!(contribution.flows[0].name, "ship");
+        assert!(
+            ctx.effective.flows.iter().any(|f| f.name == "ship"),
+            "flow must appear in the effective cascade"
+        );
+    }
+
+    #[test]
+    fn render_json_omits_unresolved_roles_when_empty_and_lists_when_set() {
+        // AC2 + wire-format guard: healthy flows serialize WITHOUT the
+        // `unresolved_roles` key (additive to schema v1); role-starved
+        // flows carry it.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let seed = cwd.join("seed");
+        write(
+            &seed.join("flows/ship.yaml"),
+            &role_only_flow("ship", "developer"),
+        );
+        write(
+            &seed.join("flows/stuck.yaml"),
+            &role_only_flow("stuck", "ghost"),
+        );
+        write_project_with_seed_and_role(cwd, &seed, "developer", "Noah");
+        let ctx = resolve(cwd).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        render_json(&ctx, &mut buf).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+        assert_eq!(v["version"], "1");
+        let seed_entry = v["seeds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["display"] == seed.display().to_string())
+            .unwrap();
+        let flows = seed_entry["flows"].as_array().unwrap();
+        let ship = flows.iter().find(|f| f["name"] == "ship").unwrap();
+        assert!(
+            ship.get("unresolved_roles").is_none(),
+            "healthy flow must not carry the key: {ship}"
+        );
+        let stuck = flows.iter().find(|f| f["name"] == "stuck").unwrap();
+        assert_eq!(stuck["unresolved_roles"], serde_json::json!(["ghost"]));
+        // Both flows stay in the effective cascade.
+        let effective: Vec<&str> = v["effective"]["flows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(effective, vec!["ship", "stuck"]);
+    }
+
+    #[test]
+    fn render_human_marks_unresolved_roles_in_both_sections() {
+        // AC5 human side: the suffix appears in the per-seed listing and
+        // on the winning entry in the effective cascade, and healthy
+        // flows stay unmarked.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        let seed = cwd.join("seed");
+        write(
+            &seed.join("flows/ship.yaml"),
+            &role_only_flow("ship", "developer"),
+        );
+        write(
+            &seed.join("flows/stuck.yaml"),
+            &role_only_flow("stuck", "ghost"),
+        );
+        write_project_with_seed_and_role(cwd, &seed, "developer", "Noah");
+        let ctx = resolve(cwd).unwrap();
+        let mut buf: Vec<u8> = Vec::new();
+        render_human(&ctx, &mut buf).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(
+            s.contains("stuck (unresolved role: ghost)"),
+            "per-seed suffix missing: {s}"
+        );
+        assert!(
+            s.contains(&format!(
+                "stuck (from {}) (unresolved role: ghost)",
+                seed.display()
+            )),
+            "effective-cascade suffix missing: {s}"
+        );
+        assert!(
+            !s.contains("ship (unresolved"),
+            "healthy flow must not be marked: {s}"
+        );
     }
 
     // ---- rendering ----
@@ -1226,7 +1666,7 @@ mod tests {
                 ref_: Some("main".to_string()),
             },
         };
-        let contribution = seed_contribution(&seed);
+        let contribution = seed_contribution_no_roles(&seed);
         assert_eq!(contribution.kind, "remote");
         assert!(contribution.path.is_none());
         assert!(!contribution.exists);
