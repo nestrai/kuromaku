@@ -586,6 +586,40 @@ mod tests {
     }
 
     #[test]
+    fn model_from_role_simple_form_preserved_byte_for_byte() {
+        // Issue #383 AC 4/8: role-level model overrides are free strings like
+        // the agent-file `model:` literal. A simple-form value (no `/`) must
+        // reach ResolvedRole.model exactly as configured -- no splitting, no
+        // rewriting -- with source "role override".
+        let project = KotoRole {
+            agent: "Babis".into(),
+            model: Some("claude-opus-4-7".into()),
+            backend: None,
+            overlays: RoleOverlay::default(),
+        };
+        let input = ki("writer", "claude-sonnet-4-5", None);
+        let r = resolve_role(&input, Some("Babis"), Some(&project), &[], None).unwrap();
+        assert_eq!(r.model, "claude-opus-4-7");
+        assert_eq!(r.model_source, "role override");
+    }
+
+    #[test]
+    fn model_from_role_provider_prefixed_preserved_byte_for_byte() {
+        // Issue #383 AC 3/4/9: a `/`-containing role model is a literal
+        // backend identifier, not a tier reference -- preserved untouched.
+        let project = KotoRole {
+            agent: "Babis".into(),
+            model: Some("anthropic/claude-opus-4-7".into()),
+            backend: None,
+            overlays: RoleOverlay::default(),
+        };
+        let input = ki("writer", "claude-sonnet-4-5", None);
+        let r = resolve_role(&input, Some("Babis"), Some(&project), &[], None).unwrap();
+        assert_eq!(r.model, "anthropic/claude-opus-4-7");
+        assert_eq!(r.model_source, "role override");
+    }
+
+    #[test]
     fn model_from_tier_when_no_role_override() {
         // Tier is reflected via agent_tier label; agent_model is what tier
         // resolution already produced.
