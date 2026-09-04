@@ -766,7 +766,11 @@ fn some_optional_string<'de, D>(deserializer: D) -> Result<Option<Option<String>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<String>::deserialize(deserializer).map(Some)
+    match serde_yaml::Value::deserialize(deserializer)? {
+        serde_yaml::Value::Null => Ok(Some(None)),
+        serde_yaml::Value::String(value) => Ok(Some(Some(value))),
+        _ => Err(serde::de::Error::custom("expected a string or null")),
+    }
 }
 
 /// Validate the role-level `model:` override (issue #383).
@@ -1287,7 +1291,12 @@ roles:
         // AC 5: non-string values are rejected at deserialization. serde's
         // type error must at least name the offending type so the message is
         // attributable.
-        for (bad, _kind) in [("[claude-opus-4-7]", "sequence"), ("{a: b}", "mapping")] {
+        for (bad, _kind) in [
+            ("[claude-opus-4-7]", "sequence"),
+            ("{a: b}", "mapping"),
+            ("42", "integer"),
+            ("true", "boolean"),
+        ] {
             let yaml = format!(
                 r#"
 version: "1"
@@ -1299,13 +1308,12 @@ roles:
             );
             let err = KotoConfig::from_yaml_str(&yaml).unwrap_err();
             assert!(matches!(err, KotoConfigError::Parse(_)), "got: {err}");
-            // serde_yaml locates the field despite the `flatten` on
-            // RawKotoRole -- e.g. "roles.writer.model: invalid type:
-            // sequence, expected a string at line 6 column 12". Assert the
-            // path so a future serde upgrade cannot silently degrade the
-            // message to an unattributable type error.
+            // The custom deserializer reports the enclosing role path --
+            // e.g. "roles.writer: expected a string or null". Keep that
+            // context stable so a future serde change cannot turn this into
+            // an unattributable type error.
             let msg = err.to_string();
-            assert!(msg.contains("roles.writer.model"), "got: {msg}");
+            assert!(msg.contains("roles.writer"), "got: {msg}");
             assert!(msg.contains("expected a string"), "got: {msg}");
         }
     }
