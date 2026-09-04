@@ -63,6 +63,103 @@ Each run writes a persistent, auditable **stack** to
 `~/.koto/stacks/<project>/` -- prompts, responses, and a manifest pinning
 what ran. Earlier step results are injected as context into later steps.
 
+## Sharing seeds across repositories
+
+A **seed** is a directory of agents, rules and flows that a project layers
+into its cascade via `seeds:` in `.kuro/config.yaml` (earlier entries win).
+Remote seed resolution (`repo:` / `ref:`) is parsed but deliberately
+deferred -- see
+[docs/decisions/0009-version-pinning.md](docs/decisions/0009-version-pinning.md).
+Until it ships, the supported way to consume a shared seed library is a
+repository-relative checkout that git pins to an exact commit.
+
+### Recommended: commit-pinned Git submodule
+
+Add the seed library as a submodule inside the consuming repository:
+
+```bash
+git submodule add https://github.com/your-org/kuromaku-seeds vendor/kuromaku-seeds
+```
+
+That produces this layout:
+
+```text
+project/
+  .kuro/
+    config.yaml
+  vendor/
+    kuromaku-seeds/   # Git submodule pinned by the parent repository
+```
+
+and the cascade references it with paths relative to the project root:
+
+```yaml
+version: "1"
+seeds:
+  - path: .kuro/
+  - path: vendor/kuromaku-seeds/coding/rust/
+  - path: vendor/kuromaku-seeds/github/
+  - path: vendor/kuromaku-seeds/coding/common/
+```
+
+The parent repository's gitlink records the exact seed commit, so every
+clone of the project resolves the identical cascade -- no maintainer-local
+paths, nothing outside the repository.
+
+### Cloning and recovery
+
+```bash
+git clone --recurse-submodules https://github.com/your-org/project
+# in an existing clone where vendor/kuromaku-seeds/ is empty:
+git submodule update --init --recursive
+```
+
+If the submodule is not initialized, kuro fails loudly at config load:
+
+```text
+seed path "vendor/kuromaku-seeds/coding/rust/" does not exist
+```
+
+That error is the signal to run the recovery command above -- nothing
+resolves against a half-present cascade.
+
+### Updating the pin
+
+```bash
+git -C vendor/kuromaku-seeds fetch
+git -C vendor/kuromaku-seeds checkout <commit-sha>   # or: git submodule update --remote vendor/kuromaku-seeds
+git add vendor/kuromaku-seeds
+git commit -m "chore(seeds): bump kuromaku-seeds pin"
+```
+
+The commit changes only the recorded submodule SHA, so a normal PR diff
+shows exactly which seed version the project moves to. Seed updates are
+reviewed like any other change.
+
+### Alternative: pinned plain checkout
+
+If submodules do not fit your workflow, a plain clone at the same
+repository-relative location works with the identical cascade, as long as
+it is checked out at an **immutable commit hash**:
+
+```bash
+git clone https://github.com/your-org/kuromaku-seeds vendor/kuromaku-seeds
+git -C vendor/kuromaku-seeds checkout <commit-sha>
+```
+
+Record that hash somewhere reviewable (a lock note, a setup script). A tag
+is acceptable only if you verified and recorded the commit it points to:
+tags are mutable references, so a bare tag name does **not** give the same
+guarantee as a commit hash.
+
+### Why not a branch
+
+A branch checkout tracks a moving target -- two clones made at different
+times resolve different cascades, which breaks reproducibility. Pin a
+commit. The rationale (and why a remote resolver is deferred rather than
+built now) lives in
+[docs/decisions/0009-version-pinning.md](docs/decisions/0009-version-pinning.md).
+
 ## Human-in-the-loop
 
 A graph state with `human: true` hands control to a person:
