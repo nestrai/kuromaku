@@ -45,8 +45,11 @@ Preferred: split a pane in the current window so the run sits next to the ongoin
 
 ```
 pane=$(tmux split-window -h -c <repo-root> -P -F '#{pane_id}')
+tmux select-pane -t "$pane" -T 'issue-<N>'
 tmux send-keys -t "$pane" './target/debug/kuro run <flow> --var id=<N>' Enter
 ```
+
+Always title the pane after the issue being worked on (`issue-<N>`, or the flow name if there is no issue) so the developer sees at a glance what each pane is doing.
 
 Alternative: a single dedicated window named `kuro` in the current session. Create it once with `tmux new-window -d -n kuro -c <repo-root>`, reuse it for later runs via `tmux send-keys -t kuro ...`.
 
