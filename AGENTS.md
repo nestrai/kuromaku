@@ -105,7 +105,7 @@ You do not need to modify seeds to work on kuromaku itself.
 
 ## Stack
 
-Run outputs are written to `~/.kuro/stacks/<project>/<run-id>/`. You rarely need to inspect these directly.
+Run outputs are written to `~/.koto/stacks/<project>/<run-id>/`. The `.koto/` home root is intentional legacy (pinned, see #176) even though the config directory is `.kuro/`. You rarely need to inspect these directly.
 
 ## Boundaries
 
