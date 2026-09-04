@@ -166,8 +166,12 @@ struct RawSeed {
 #[derive(Debug, Deserialize)]
 struct RawKotoRole {
     agent: String,
-    #[serde(default)]
-    model: Option<String>,
+    /// Double-`Option` to tell an absent `model:` key (no override, valid)
+    /// apart from an explicit `model: ~` (a dangling key, rejected with a
+    /// role-scoped error in [`resolve_role_model`]). Absent -> `None`,
+    /// `model: ~` -> `Some(None)`, `model: x` -> `Some(Some(x))`.
+    #[serde(default, deserialize_with = "some_optional_string")]
+    model: Option<Option<String>>,
     #[serde(default)]
     backend: Option<KotoBackend>,
     /// Per-binding overlay of agent fields (issue #364). When set, the
@@ -221,6 +225,12 @@ struct RawKotoDefaults {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KotoRole {
     pub agent: String,
+    /// Free-form model string, same schema as the agent-file `model:`
+    /// literal (issue #383) -- no `<provider>/<model-id>` format
+    /// requirement, that contract belongs to tiers only. Same invariant as
+    /// [`RoleOverlay`] (issue #369): the override carries the type and
+    /// validation of the agent-file field it patches. `None` means "no
+    /// override, inherit the agent's model".
     pub model: Option<String>,
     pub backend: Option<KotoBackend>,
     /// Optional per-binding overlay (issue #364). Defaults to the empty
@@ -602,9 +612,7 @@ impl KotoConfig {
                     "role '{role_name}' has empty agent"
                 )));
             }
-            if let Some(ref m) = raw_role.model {
-                validate_model_format(m)?;
-            }
+            let model = resolve_role_model(role_name, raw_role.model.as_ref())?;
             let overlays = match raw_role.overlays.as_ref() {
                 Some(raw_overlay) => resolve_overlay(role_name, raw_overlay)?,
                 None => RoleOverlay::default(),
@@ -613,7 +621,7 @@ impl KotoConfig {
                 role_name.clone(),
                 KotoRole {
                     agent: raw_role.agent.clone(),
-                    model: raw_role.model.clone(),
+                    model,
                     backend: raw_role.backend,
                     overlays,
                 },
@@ -748,6 +756,41 @@ fn resolve_overlay(role_name: &str, raw: &RawKotoOverlay) -> Result<RoleOverlay,
         extra_args,
         rules,
     })
+}
+
+/// Deserialize helper for [`RawKotoRole::model`]: wraps any *present* value
+/// (including an explicit `null`) in `Some`, so `#[serde(default)]` alone
+/// covers the absent-key case. This is what lets validation distinguish
+/// "no `model:` key" (valid, no override) from "`model: ~`" (rejected).
+fn some_optional_string<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+/// Validate the role-level `model:` override (issue #383).
+///
+/// The field patches the agent-file `model:` literal, which is a free
+/// string -- the tier `<provider>/<model-id>` contract does NOT apply here
+/// (same invariant as overlays, issue #369). Only well-formedness is
+/// checked: when the key is present it must carry a non-empty string,
+/// which passes through untouched. An absent key resolves to `None`
+/// ("inherit the agent's model").
+fn resolve_role_model(
+    role_name: &str,
+    raw: Option<&Option<String>>,
+) -> Result<Option<String>, KotoConfigError> {
+    match raw {
+        None => Ok(None),
+        Some(None) => Err(KotoConfigError::Validation(format!(
+            "role '{role_name}' has null model -- omit the key to inherit the agent's model"
+        ))),
+        Some(Some(m)) if m.trim().is_empty() => Err(KotoConfigError::Validation(format!(
+            "role '{role_name}' has empty model -- omit the key to inherit the agent's model"
+        ))),
+        Some(Some(m)) => Ok(Some(m.clone())),
+    }
 }
 
 fn validate_model_format(model: &str) -> Result<(), KotoConfigError> {
@@ -1131,17 +1174,156 @@ roles:
         assert!(matches!(err, KotoConfigError::Parse(_)));
     }
 
+    // --- Role-level model: free string, same schema as agent files (#383) ---
+
     #[test]
-    fn role_invalid_model_format_errors() {
+    fn role_model_accepts_simple_form() {
+        // AC 1/4: the role `model:` field patches the agent-file `model:`
+        // literal, a free string. The tier `<provider>/<model-id>` contract
+        // does not apply. Preserved exactly, no rewriting.
         let yaml = r#"
 version: "1"
 roles:
-  developer:
-    agent: Sage
-    model: missing-slash
+  writer:
+    agent: Babis
+    model: claude-opus-4-7
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.roles.get("writer").unwrap().model.as_deref(),
+            Some("claude-opus-4-7")
+        );
+    }
+
+    #[test]
+    fn role_model_accepts_default_keyword() {
+        // AC 2: `default` is a plain string to the parser, not a tier
+        // reference -- this is what #394 needs.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    model: default
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.roles.get("writer").unwrap().model.as_deref(),
+            Some("default")
+        );
+    }
+
+    #[test]
+    fn role_model_accepts_provider_prefixed() {
+        // AC 3/9: a `/`-containing model string is NOT a tier reference and
+        // must survive byte-for-byte -- existing configs keep working.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    model: anthropic/claude-opus-4-7
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.roles.get("writer").unwrap().model.as_deref(),
+            Some("anthropic/claude-opus-4-7")
+        );
+    }
+
+    #[test]
+    fn role_model_absent_is_none() {
+        // Backward-compat guard for the AC-5 reading: an absent `model:` key
+        // is a valid "no override", not an error.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert!(cfg.roles.get("writer").unwrap().model.is_none());
+    }
+
+    #[test]
+    fn role_model_null_errors() {
+        // AC 5: a dangling `model:` key (explicit null) is a config mistake,
+        // reported with the role name -- unlike an absent key.
+        let yaml = r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    model: ~
 "#;
         let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
-        assert!(err.to_string().contains("model must be"), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("role 'writer' has null model"), "got: {msg}");
+        assert!(msg.contains("omit the key"), "got: {msg}");
+    }
+
+    #[test]
+    fn role_model_empty_errors() {
+        // AC 5: empty and whitespace-only strings are rejected with a
+        // role-scoped message.
+        for empty in [r#""""#, r#""   ""#] {
+            let yaml = format!(
+                r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    model: {empty}
+"#
+            );
+            let err = KotoConfig::from_yaml_str(&yaml).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("role 'writer' has empty model"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn role_model_non_string_errors() {
+        // AC 5: non-string values are rejected at deserialization. serde's
+        // type error must at least name the offending type so the message is
+        // attributable.
+        for (bad, _kind) in [("[claude-opus-4-7]", "sequence"), ("{a: b}", "mapping")] {
+            let yaml = format!(
+                r#"
+version: "1"
+roles:
+  writer:
+    agent: Babis
+    model: {bad}
+"#
+            );
+            let err = KotoConfig::from_yaml_str(&yaml).unwrap_err();
+            assert!(matches!(err, KotoConfigError::Parse(_)), "got: {err}");
+            // serde_yaml locates the field despite the `flatten` on
+            // RawKotoRole -- e.g. "roles.writer.model: invalid type:
+            // sequence, expected a string at line 6 column 12". Assert the
+            // path so a future serde upgrade cannot silently degrade the
+            // message to an unattributable type error.
+            let msg = err.to_string();
+            assert!(msg.contains("roles.writer.model"), "got: {msg}");
+            assert!(msg.contains("expected a string"), "got: {msg}");
+        }
+    }
+
+    #[test]
+    fn tier_provider_model_still_valid() {
+        // AC 6: the positive tier case -- `<provider>/<model-id>` entries
+        // under `tiers:` keep parsing (only reject tests existed before).
+        let yaml = r#"
+version: "1"
+tiers:
+  reasoning: claude/fable-5
+"#;
+        let cfg = KotoConfig::from_yaml_str(yaml).unwrap();
+        assert_eq!(
+            cfg.tiers.get("reasoning").map(String::as_str),
+            Some("claude/fable-5")
+        );
     }
 
     #[test]
@@ -1159,22 +1341,24 @@ roles:
 
     #[test]
     fn role_validation_is_deterministic() {
-        // Two roles with bad model formats. Validation iterates sorted, so the
-        // alphabetically-first invalid role's model must be reported every run.
+        // Two roles with invalid (empty) models. Validation iterates sorted,
+        // so the alphabetically-first invalid role must be reported every
+        // run. (Pre-#383 this used tier-format violations; role models are
+        // free strings now, so empty strings are the invalid case.)
         let yaml = r#"
 version: "1"
 roles:
   zeta:
     agent: Z
-    model: bad-zeta
+    model: ""
   alpha:
     agent: A
-    model: bad-alpha
+    model: ""
 "#;
         for _ in 0..20 {
             let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
             assert!(
-                err.to_string().contains("\"bad-alpha\""),
+                err.to_string().contains("role 'alpha'"),
                 "expected first-by-name role in error, got: {err}"
             );
         }
