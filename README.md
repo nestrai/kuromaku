@@ -45,14 +45,18 @@ agent prompts. Everything lives as files in your repo:
 ```
 .kuro/
   agents/
-    Levi.yaml          # software architect
-    Noah.yaml          # senior developer
+    Developer.yaml     # implements the tasks flows hand to it
+    Reviewer.yaml      # reviews the developer's changes
   flows/
-    review-pr.yaml     # architect -> reviewer -> consensus
+    hello.yaml         # starter flow: kuro run hello
   rules/
-    rust-developer.md  # shared knowledge, injected into prompts
-  Guide.md             # repo-wide context for all agents
+    project-conventions.md  # shared knowledge, injected into prompts
+  config.yaml          # role bindings, defaults, seed cascade
 ```
+
+This is exactly what `kuro init` scaffolds; from there you add agents (an
+architect, a facilitator, ...), wire multi-step flows and layer in shared
+seed libraries.
 
 Flows are linear sequences or full state machines (`graph:`): an agent's
 verdict routes to different states, rework loops revisit earlier states, and
@@ -60,8 +64,9 @@ shell states gate progress on real commands like `just lint && just test`.
 See [docs/graph-flows.md](docs/graph-flows.md).
 
 Each run writes a persistent, auditable **stack** to
-`~/.koto/stacks/<project>/` -- prompts, responses, and a manifest pinning
-what ran. Earlier step results are injected as context into later steps.
+`~/.kuro/stacks/<project>/<run-id>/` -- prompts, responses, and a manifest
+pinning what ran. Earlier step results are injected as context into later
+steps.
 
 ## Sharing seeds across repositories
 
@@ -71,7 +76,10 @@ Remote seed resolution (`repo:` / `ref:`) is parsed but deliberately
 deferred -- see
 [docs/decisions/0009-version-pinning.md](docs/decisions/0009-version-pinning.md).
 Until it ships, the supported way to consume a shared seed library is a
-repository-relative checkout that git pins to an exact commit.
+repository-relative checkout that git pins to an exact commit. The
+reference seed library maintained alongside kuromaku lives at
+[github.com/nestrai/seeds](https://github.com/nestrai/seeds); the
+`your-org/kuromaku-seeds` examples below apply to it unchanged.
 
 ### Recommended: commit-pinned Git submodule
 
@@ -198,10 +206,26 @@ kuro resume <run-id> --message "approved, but rename the flag first"
 ## Privacy
 
 Everything stays on your machine: run artifacts live under
-`~/.koto/stacks/<project>/<run-id>/`, plain files you can inspect. Erase a
+`~/.kuro/stacks/<project>/<run-id>/`, plain files you can inspect. Erase a
 project's data with `kuro stack purge <project>` (`--dry-run` to preview) --
 see [docs/decisions/0007-stack-purge.md](docs/decisions/0007-stack-purge.md)
 for the erasure semantics.
+
+## Legacy paths
+
+kuromaku was briefly named koto; two legacy layouts remain supported so
+existing setups keep working, and both are deliberate rather than
+accidental:
+
+- **Project config**: `.kuro/config.yaml` is canonical. A `.koto/config.yaml`
+  directory or a repo-root `koto.yaml` still loads with a deprecation
+  warning (`mv .koto .kuro` migrates in place).
+- **Run history**: new runs write under `~/.kuro/stacks/`. Runs recorded
+  before the rename stay readable at `~/.koto/stacks/` -- stack-touching
+  commands print a one-line notice while that directory holds data, and
+  `kuro stack purge` reaches projects under either root. Migrate manually
+  with `mv ~/.koto/stacks/* ~/.kuro/stacks/` whenever you like; kuromaku
+  never moves your data on its own.
 
 ## Status
 
