@@ -104,7 +104,9 @@ seeds:
 
 The parent repository's gitlink records the exact seed commit, so every
 clone of the project resolves the identical cascade -- no maintainer-local
-paths, nothing outside the repository.
+paths, nothing outside the repository. kuro resolves from the invocation
+directory (it does not search parent directories); run it from the project
+root for reproducibility.
 
 ### Cloning and recovery
 

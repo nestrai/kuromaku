@@ -141,6 +141,45 @@ fn documented_cascade_resolves() {
     }
 }
 
+/// Pins the resolution gap the README's invocation-directory sentence
+/// documents: `kuro context` resolves from the current directory with no
+/// ancestor walk, so running from a subdirectory of the documented
+/// layout does not fail loudly -- it silently falls back to the implicit
+/// `.kuro/` default seed (missing there) and an empty effective cascade.
+/// If an ancestor walk ever ships, this test and the README sentence
+/// must change together.
+#[test]
+fn cascade_resolves_from_subdir_as_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    write_documented_layout(dir.path());
+    let subdir = dir.path().join("subdir");
+    std::fs::create_dir_all(&subdir).unwrap();
+
+    let assert = context_json(&subdir).assert().success();
+    let stdout = String::from_utf8_lossy(&assert.get_output().stdout).to_string();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+
+    // No config in the subdir and no ancestor walk: only the implicit
+    // default seed remains, and it does not exist there.
+    let seeds = json["seeds"].as_array().expect("seeds array");
+    assert_eq!(
+        seeds.len(),
+        1,
+        "subdir invocation must fall back to the single implicit seed"
+    );
+    assert_eq!(seeds[0]["display"], ".kuro/");
+    assert_eq!(seeds[0]["exists"], false);
+
+    // The documented seeds one level up are invisible: nothing resolves.
+    for kind in ["agents", "rules", "flows"] {
+        assert_eq!(
+            json["effective"][kind].as_array().unwrap().len(),
+            0,
+            "effective {kind} must be empty when invoked from a subdirectory"
+        );
+    }
+}
+
 /// The failure mode the README's "Cloning and recovery" paragraph
 /// documents: with the submodule uninitialized (no `vendor/`), config
 /// load fails loudly and names the offending path.
