@@ -88,7 +88,13 @@ fn enumerate_agents_for_cascade(seeds: &Seeds) -> Vec<AgentEntry> {
     out
 }
 
-fn enumerate_flows_for_cascade(seeds: &Seeds) -> Vec<FlowEntry> {
+/// `project_roles` is the project-level `role -> agent` map (#389) --
+/// the shared flow walker needs it so linear flows whose roles bind only
+/// through `.kuro/config.yaml` are listed instead of dropped.
+fn enumerate_flows_for_cascade(
+    seeds: &Seeds,
+    project_roles: &std::collections::HashMap<String, String>,
+) -> Vec<FlowEntry> {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut out: Vec<FlowEntry> = Vec::new();
     for seed in &seeds.seeds {
@@ -96,7 +102,7 @@ fn enumerate_flows_for_cascade(seeds: &Seeds) -> Vec<FlowEntry> {
         let Some(path) = seed.local_path() else {
             continue;
         };
-        for f in enumerate_flows_in_seed(path, &display) {
+        for f in enumerate_flows_in_seed(path, &display, project_roles) {
             if seen.insert(f.name.clone()) {
                 out.push(f);
             }
@@ -171,15 +177,26 @@ impl Tool for ListFlows {
 
 fn do_list_flows(cwd: &Path) -> Result<Value, McpError> {
     let seeds = discover_seeds(cwd)?;
-    let flows = enumerate_flows_for_cascade(&seeds);
+    // #389: same binding source as the runner and `kuro context` --
+    // flows resolving roles only via the project config must list here.
+    let project_roles = project_config(cwd)
+        .map(|c| c.role_agent_map())
+        .unwrap_or_default();
+    let flows = enumerate_flows_for_cascade(&seeds, &project_roles);
     let entries: Vec<Value> = flows
         .into_iter()
         .map(|f| {
-            json!({
+            let mut entry = json!({
                 "name": f.name,
                 "description": f.description,
                 "steps": f.steps,
-            })
+            });
+            // Additive field, mirrors the `kuro context` JSON wire
+            // format: absent for flows runnable from on-disk config.
+            if !f.unresolved_roles.is_empty() {
+                entry["unresolved_roles"] = json!(f.unresolved_roles);
+            }
+            entry
         })
         .collect();
     Ok(json!({"flows": entries}))
@@ -462,9 +479,43 @@ mod tests {
                 },
             ],
         };
-        let flows = enumerate_flows_for_cascade(&seeds);
+        let flows = enumerate_flows_for_cascade(&seeds, &std::collections::HashMap::new());
         assert_eq!(flows.len(), 1);
         assert_eq!(flows[0].description, "HI");
+    }
+
+    #[test]
+    fn do_list_flows_includes_project_role_only_flow() {
+        // #389: `list_flows` shares the flow walker with `kuro context`
+        // and had the identical bug -- a flow binding its role only via
+        // `.kuro/config.yaml` was dropped. Pin the fix end-to-end and
+        // the additive `unresolved_roles` wire field.
+        let tmp = TempDir::new().unwrap();
+        let cwd = tmp.path();
+        write(
+            &cwd.join(".kuro/config.yaml"),
+            &format!(
+                "version: \"1\"\nseeds:\n  - path: {}\nroles:\n  developer:\n    agent: Noah\n",
+                cwd.join(".kuro").display()
+            ),
+        );
+        write(
+            &cwd.join(".kuro/flows/ship.yaml"),
+            "version: \"1\"\nname: ship\nprompt: p\nflow:\n  work:\n    role: developer\n    task: t\n",
+        );
+        write(
+            &cwd.join(".kuro/flows/stuck.yaml"),
+            "version: \"1\"\nname: stuck\nprompt: p\nflow:\n  work:\n    role: ghost\n    task: t\n",
+        );
+        let v = do_list_flows(cwd).unwrap();
+        let flows = v["flows"].as_array().unwrap();
+        let ship = flows.iter().find(|f| f["name"] == "ship").unwrap();
+        assert!(
+            ship.get("unresolved_roles").is_none(),
+            "healthy flow must not carry the key: {ship}"
+        );
+        let stuck = flows.iter().find(|f| f["name"] == "stuck").unwrap();
+        assert_eq!(stuck["unresolved_roles"], json!(["ghost"]));
     }
 
     // ---- do_list_agents (end-to-end on tempdir) ----

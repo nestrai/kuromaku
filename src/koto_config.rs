@@ -647,6 +647,20 @@ impl KotoConfig {
         })
     }
 
+    /// Project-level role bindings as a plain `role -> agent` map.
+    ///
+    /// This is the single binding source both the runner (flow loading)
+    /// and the inventory (`kuro context`, MCP `list_flows`) feed into
+    /// flow parsing (#389). Keeping the extraction here -- instead of
+    /// inlining the map construction at each call site -- guarantees the
+    /// two consumers can never disagree on what "the project roles" are.
+    pub fn role_agent_map(&self) -> HashMap<String, String> {
+        self.roles
+            .iter()
+            .map(|(name, role)| (name.clone(), role.agent.clone()))
+            .collect()
+    }
+
     /// Resolve a tier name to its `<provider>/<model-id>` string.
     ///
     /// The error variant lists available tiers sorted alphabetically so the
@@ -1136,6 +1150,18 @@ roles:
     model: ollama/llama3-70b
     backend: api
 "#;
+
+    #[test]
+    fn role_agent_map_extracts_role_to_agent_pairs() {
+        // #389: the runner and the inventory both consume this map as
+        // the project-level role binding source. Pin the extraction so
+        // the two callers cannot drift.
+        let cfg = KotoConfig::from_yaml_str(FULL_ROLES_YAML).unwrap();
+        let map = cfg.role_agent_map();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["developer"], "coding/rust/Sage");
+        assert_eq!(map["reviewer"], "review/Bella");
+    }
 
     #[test]
     fn roles_parse() {
