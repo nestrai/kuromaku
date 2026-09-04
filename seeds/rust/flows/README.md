@@ -1,17 +1,18 @@
 # In-tree example flows
 
 This directory ships example flow files alongside the kuromaku binary.
-They demonstrate the supported flow shapes; the canonical Rust-team
-flows used day-to-day live in the external seeds repo at
-`~/code/nestrai/seeds/rust/flows/`.
+They demonstrate the supported flow shapes. Together with the agents in
+`seeds/rust/agents/` they form the in-repo `seeds/rust/` bucket of the
+tracked cascade (see `.kuro/config.yaml`), so a fresh clone resolves
+without any external seed checkout.
 
 ## Flows in this directory
 
-- `implement-issue.yaml` -- graph flow (`states:` / edges). Drives the
-  same issue-to-PR loop as the linear `implement-issue.yaml` in the
-  external seeds repo, but lets the reviewer route back to `design` or
+- `implement-issue.yaml` -- graph flow (`states:` / edges). Drives an
+  issue-to-PR loop where the reviewer routes back to `design` or
   `implement` depending on what they actually found instead of a single
-  PASS/FAIL gate.
+  PASS/FAIL gate. The kuromaku repo itself overrides this flow with the
+  higher-priority copy in `.kuro/flows/`.
 
 ## Linear vs graph
 

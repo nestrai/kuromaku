@@ -1,10 +1,14 @@
 version: "1"
 
+# Seed cascade -- earlier entries win. All paths are repository-relative so
+# a fresh clone resolves without any maintainer-local directories (#398).
+# The richer private persona library can be layered back in locally via
+# additional seed entries or `--role` overrides; the tracked cascade must
+# stay self-contained.
 seeds:
   - path: .kuro/
-  - path: ~/code/nestrai/seeds/coding/rust/
-  - path: ~/code/nestrai/seeds/github/
-  - path: ~/code/nestrai/seeds/coding/common/
+  - path: seeds/rust/
+  - path: seeds/common/
 
 tiers:
   reasoning: claude/fable-5
