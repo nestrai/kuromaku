@@ -74,7 +74,11 @@ fn tracked_seed_cascade_resolves_without_maintainer_paths() {
     let seeds = json["seeds"].as_array().expect("seeds array");
     assert!(!seeds.is_empty(), "cascade must declare at least one seed");
     for seed in seeds {
-        assert_eq!(seed["kind"], "local", "seed {} must be local", seed["display"]);
+        assert_eq!(
+            seed["kind"], "local",
+            "seed {} must be local",
+            seed["display"]
+        );
         assert_eq!(
             seed["exists"], true,
             "seed {} must resolve inside the clone",

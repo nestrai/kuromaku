@@ -234,7 +234,7 @@ fn mcp_unknown_tool_returns_stable_catalog_code() {
 fn mcp_run_flow_executes_shell_step_and_show_output_reads_it() {
     let project = tempfile::tempdir().expect("project tempdir");
     // Redirect HOME so the runner's default stack path
-    // (`<HOME>/.koto/stacks/<project>/`) lands inside the tempdir. This
+    // (`<HOME>/.kuro/stacks/<project>/`) lands inside the tempdir. This
     // keeps `run_flow` and `show_output` aligned on the same stack root
     // without either side knowing it -- which is exactly the behaviour
     // we want to verify (no path-knowledge leakage into the MCP layer).

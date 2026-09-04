@@ -288,7 +288,7 @@ graph:
     let tmp = tempfile::tempdir().unwrap();
     let flow = write_flow(tmp.path(), "final-only.yaml", FINAL_ONLY_GRAPH);
     // Isolate the run state so we don't pollute the developer's
-    // ~/.koto/stacks/ with throwaway test runs.
+    // ~/.kuro/stacks/ with throwaway test runs.
     let home = tempfile::tempdir().unwrap();
 
     let out = Command::new(kuro_bin())

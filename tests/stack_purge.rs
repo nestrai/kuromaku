@@ -22,12 +22,12 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 
-/// Build a fake project stack root under `<home>/.koto/stacks/<project>/`
+/// Build a fake project stack root under `<home>/.kuro/stacks/<project>/`
 /// containing one run with one step file. Returns the absolute project
 /// directory so tests can assert on its presence/absence after the
 /// purge call.
 fn fake_project_under(home: &Path, project: &str) -> PathBuf {
-    let project_dir = home.join(".koto").join("stacks").join(project);
+    let project_dir = home.join(".kuro").join("stacks").join(project);
     let steps_dir = project_dir.join("dev-20260501-100000").join("steps");
     std::fs::create_dir_all(&steps_dir).expect("create steps dir");
     std::fs::write(steps_dir.join("01-design.md"), "BODY").expect("write step content");
@@ -80,7 +80,7 @@ fn yes_deletes_project_data() {
         "project dir must be gone after --yes purge"
     );
     // Sibling projects are untouched -- the parent stacks dir stays.
-    assert!(home.path().join(".koto/stacks").is_dir());
+    assert!(home.path().join(".kuro/stacks").is_dir());
 }
 
 #[test]
@@ -152,5 +152,91 @@ fn rejects_invalid_project_names() {
     assert!(
         stderr.contains("invalid project name"),
         "expected validation error in stderr, got: {stderr}"
+    );
+}
+
+/// Build a fake project under the *legacy* pre-#398 stack root
+/// (`<home>/.koto/stacks/<project>/`). Used by the fallback tests below.
+fn fake_legacy_project_under(home: &Path, project: &str) -> PathBuf {
+    let project_dir = home.join(".koto").join("stacks").join(project);
+    let steps_dir = project_dir.join("dev-20260501-100000").join("steps");
+    std::fs::create_dir_all(&steps_dir).expect("create legacy steps dir");
+    std::fs::write(steps_dir.join("01-design.md"), "BODY").expect("write legacy step content");
+    project_dir
+}
+
+#[test]
+fn purge_falls_back_to_legacy_root_when_project_only_there() {
+    // Erasure (#398 / GDPR Art. 17) must reach pre-rename data: a project
+    // that only exists under `~/.koto/stacks/` is still purgeable, with a
+    // notice naming the legacy root.
+    let home = tempfile::tempdir().unwrap();
+    let legacy_dir = fake_legacy_project_under(home.path(), "ikno");
+
+    let assert = Command::cargo_bin("kuro")
+        .unwrap()
+        .args(["stack", "purge", "ikno", "--yes"])
+        .env("HOME", home.path())
+        .env_remove("RUST_LOG")
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("legacy stack root"),
+        "fallback must announce the legacy root, got: {stderr}"
+    );
+    assert!(!legacy_dir.exists(), "legacy project dir must be gone");
+}
+
+#[test]
+fn purge_prefers_canonical_root_over_legacy() {
+    // Same project name under both roots: only the canonical copy is
+    // deleted -- the legacy copy is old data the user did not target.
+    let home = tempfile::tempdir().unwrap();
+    let canonical_dir = fake_project_under(home.path(), "ikno");
+    let legacy_dir = fake_legacy_project_under(home.path(), "ikno");
+
+    Command::cargo_bin("kuro")
+        .unwrap()
+        .args(["stack", "purge", "ikno", "--yes"])
+        .env("HOME", home.path())
+        .env_remove("RUST_LOG")
+        .assert()
+        .success();
+
+    assert!(
+        !canonical_dir.exists(),
+        "canonical project dir must be gone"
+    );
+    assert!(legacy_dir.exists(), "legacy copy must stay untouched");
+}
+
+#[test]
+fn legacy_notice_printed_when_old_stacks_exist() {
+    // Stack-touching commands surface the one-line legacy notice while
+    // `~/.koto/stacks/` still holds data (#398, explanation over silent
+    // migration). Pinned on purge because it is the cheapest
+    // stack-touching command to drive in a test.
+    let home = tempfile::tempdir().unwrap();
+    fake_project_under(home.path(), "ikno");
+    fake_legacy_project_under(home.path(), "old-project");
+
+    let assert = Command::cargo_bin("kuro")
+        .unwrap()
+        .args(["stack", "purge", "ikno", "--dry-run"])
+        .env("HOME", home.path())
+        .env_remove("RUST_LOG")
+        .assert()
+        .success();
+
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.contains("legacy stack data found"),
+        "expected legacy notice, got: {stderr}"
+    );
+    assert!(
+        stderr.contains(".kuro/stacks"),
+        "notice must name the canonical root, got: {stderr}"
     );
 }

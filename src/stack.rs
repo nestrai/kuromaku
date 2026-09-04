@@ -474,7 +474,7 @@ pub struct RunOutputs {
 
 /// Read a run directory by id, optionally filtering to a single step.
 ///
-/// `stack_path` is the project's stack root (`~/.koto/stacks/<project>/`).
+/// `stack_path` is the project's stack root (`~/.kuro/stacks/<project>/`).
 /// The function joins `run_id` and walks the steps subdirectory. It never
 /// surfaces the run's filesystem path to callers -- that is the team review
 /// rule for #198.
@@ -610,16 +610,54 @@ pub fn write_resolution_audit(run_path: &Path, text: &str) -> Result<(), StackEr
 // tool, scripted use) inherit the same safety net. The CLI layer is
 // intentionally not the only line of defence.
 
-/// Default stack root: `~/.koto/stacks/`. The `.koto/` home root is pinned by
-/// the comment trail in #176 -- a rename here orphans every existing user's
-/// run history. Falls back to `./stacks` when `dirs::home_dir()` cannot
-/// resolve a home (CI containers without `HOME`), mirroring the same fallback
+/// Canonical stack root: `~/.kuro/stacks/`. Renamed from the legacy
+/// `~/.koto/stacks/` in #398 (supersedes the #176 pin -- pre-release is
+/// the cheapest moment this rename will ever have). Existing run history
+/// under [`legacy_stack_root`] stays readable in place; stack-touching
+/// commands surface [`legacy_stacks_notice`] instead of moving user data.
+/// Falls back to `./stacks` when `dirs::home_dir()` cannot resolve a home
+/// (CI containers without `HOME`), mirroring the same fallback
 /// `runner::resolve_stack_path` already used.
 pub fn stack_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
+        .join(".kuro")
+        .join("stacks")
+}
+
+/// Legacy stack root: `~/.koto/stacks/`, the pre-#398 location. Never
+/// written by new runs; kept so purge (and future readers like `kuro
+/// show`) can still reach old run history without a forced migration.
+pub fn legacy_stack_root() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
         .join(".koto")
         .join("stacks")
+}
+
+/// One-time-per-invocation notice for users with pre-#398 run history.
+/// Returns `Some` when the legacy root exists and is non-empty. The data
+/// is deliberately NOT auto-migrated -- moving user data without asking
+/// violates the project's data-safety rules; the notice tells the user
+/// how to migrate manually instead.
+pub fn legacy_stacks_notice() -> Option<String> {
+    legacy_notice_for(&legacy_stack_root(), &stack_root())
+}
+
+/// Testable core of [`legacy_stacks_notice`]: paths injected so tests do
+/// not depend on the host's real `$HOME`.
+fn legacy_notice_for(legacy: &Path, canonical: &Path) -> Option<String> {
+    let non_empty = std::fs::read_dir(legacy)
+        .map(|mut entries| entries.next().is_some())
+        .unwrap_or(false);
+    non_empty.then(|| {
+        format!(
+            "notice: legacy stack data found at {legacy} -- new runs write to {canonical}; \
+             old runs stay readable in place. Migrate manually with: mv {legacy}/* {canonical}/",
+            legacy = legacy.display(),
+            canonical = canonical.display(),
+        )
+    })
 }
 
 /// What was (or would be) removed by a purge call. Numbers are computed via
@@ -1483,16 +1521,53 @@ mod tests {
     }
 
     #[test]
-    fn stack_root_uses_dotkoto_under_home() {
-        // Audit lock: the `.koto/stacks/` location is pinned by #176, and
-        // a refactor that drops the constant would silently relocate
-        // every existing user's run history. This test fails loudly the
-        // moment the path changes.
+    fn stack_root_uses_dotkuro_under_home() {
+        // Audit lock: `~/.kuro/stacks/` is the canonical location since
+        // #398 (superseding the `.koto/` pin from #176). A refactor that
+        // moves this again would relocate every user's run history --
+        // this test fails loudly the moment the path changes.
         let root = stack_root();
         assert!(
-            root.ends_with(".koto/stacks") || root.ends_with(".koto\\stacks"),
-            "stack_root must end with .koto/stacks, got {}",
+            root.ends_with(".kuro/stacks") || root.ends_with(".kuro\\stacks"),
+            "stack_root must end with .kuro/stacks, got {}",
             root.display()
         );
+    }
+
+    #[test]
+    fn legacy_stack_root_stays_dotkoto_under_home() {
+        // The legacy reader contract (#398): pre-rename run history lives
+        // at `~/.koto/stacks/` and must stay reachable there.
+        let root = legacy_stack_root();
+        assert!(
+            root.ends_with(".koto/stacks") || root.ends_with(".koto\\stacks"),
+            "legacy_stack_root must end with .koto/stacks, got {}",
+            root.display()
+        );
+    }
+
+    #[test]
+    fn legacy_notice_only_when_legacy_dir_non_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let legacy = home.path().join(".koto/stacks");
+        let canonical = home.path().join(".kuro/stacks");
+
+        // Missing legacy dir: no notice.
+        assert!(legacy_notice_for(&legacy, &canonical).is_none());
+
+        // Empty legacy dir: still no notice -- nothing to migrate.
+        std::fs::create_dir_all(&legacy).unwrap();
+        assert!(legacy_notice_for(&legacy, &canonical).is_none());
+
+        // Non-empty legacy dir: notice names both paths and the manual
+        // migration command, and promises the data stays readable.
+        std::fs::create_dir_all(legacy.join("myproject")).unwrap();
+        let notice = legacy_notice_for(&legacy, &canonical).expect("notice expected");
+        assert!(notice.contains(&legacy.display().to_string()), "{notice}");
+        assert!(
+            notice.contains(&canonical.display().to_string()),
+            "{notice}"
+        );
+        assert!(notice.contains("mv "), "{notice}");
     }
 }

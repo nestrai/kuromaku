@@ -276,7 +276,7 @@ struct ShowOutputArgs {
     step: Option<String>,
     /// Optional flow name. When provided, the stack path is resolved
     /// through that flow's `stack.path` -- which is what `run_flow` writes
-    /// to. Without it, the default `~/.koto/stacks/<project>/` is used,
+    /// to. Without it, the default `~/.kuro/stacks/<project>/` is used,
     /// which only matches runs from flows that did not override `stack.path`.
     #[serde(default)]
     flow: Option<String>,

@@ -160,7 +160,7 @@ fn run_kuro(
 
 /// Locate the manifest the binary just produced under the test HOME.
 fn read_manifest(home: &Path, project_name: &str) -> String {
-    let stacks = home.join(".koto/stacks").join(project_name);
+    let stacks = home.join(".kuro/stacks").join(project_name);
     let entries: Vec<PathBuf> = std::fs::read_dir(&stacks)
         .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
         .filter_map(|e| e.ok())
@@ -308,7 +308,7 @@ esac
     // per-step records are persisted live as the driver walks. Assert
     // that at least one verify-shell-step landed on disk and that its
     // meta.yaml records `type: shell` with a non-zero exit code.
-    let stacks = home.path().join(".koto/stacks").join(&project_name);
+    let stacks = home.path().join(".kuro/stacks").join(&project_name);
     let run_dir = std::fs::read_dir(&stacks)
         .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
         .filter_map(Result::ok)
@@ -505,7 +505,7 @@ esac
     // Step files: exactly one for `design`, none for `ask`. The pause
     // contract is that the human state writes nothing -- mirroring the
     // final-state convention.
-    let stacks = home.path().join(".koto/stacks").join(&project_name);
+    let stacks = home.path().join(".kuro/stacks").join(&project_name);
     let run_dir = std::fs::read_dir(&stacks)
         .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
         .filter_map(Result::ok)
@@ -608,7 +608,7 @@ fn resume_kuro(
 /// Locate the (single) run dir for the given project under the test HOME.
 /// Returns the path so callers can read step files / the manifest.
 fn latest_run_dir(home: &Path, project_name: &str) -> PathBuf {
-    let stacks = home.join(".koto/stacks").join(project_name);
+    let stacks = home.join(".kuro/stacks").join(project_name);
     std::fs::read_dir(&stacks)
         .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
         .filter_map(Result::ok)

@@ -104,7 +104,7 @@ fn install_shim(body: &str) -> (tempfile::TempDir, PathBuf, PathBuf) {
 }
 
 /// Spawn `kuro run --file <flow>` from inside `project`, with HOME pointed
-/// at `home_dir` so `~/.koto/stacks/...` writes land inside the test
+/// at `home_dir` so `~/.kuro/stacks/...` writes land inside the test
 /// sandbox. `OLLAMA_PATH` is wired to our shim. We strip `RUST_LOG` so the
 /// existing assertions that grep stderr aren't polluted by debug logs the
 /// developer might have exported.
@@ -122,11 +122,11 @@ fn run_kuro(project: &Path, flow: &Path, shim: &Path, home_dir: &Path) -> std::p
 }
 
 /// Locate the run directory the binary just produced. Graph-flow runs
-/// land at `<HOME>/.koto/stacks/<project-basename>/<run-id>/`. There is
+/// land at `<HOME>/.kuro/stacks/<project-basename>/<run-id>/`. There is
 /// exactly one entry per test invocation because each test uses a fresh
 /// HOME.
 fn find_run_dir(home: &Path, project_name: &str) -> PathBuf {
-    let stacks = home.join(".koto/stacks").join(project_name);
+    let stacks = home.join(".kuro/stacks").join(project_name);
     let mut entries: Vec<PathBuf> = std::fs::read_dir(&stacks)
         .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
         .filter_map(|e| e.ok())
