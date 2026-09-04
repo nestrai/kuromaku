@@ -37,6 +37,19 @@ Fix all lint issues before pushing. `just lint` runs both clippy and format chec
 
 After code changes that affect CLI behavior, run `just release` so the local `kuro` binary reflects the latest code. This is the dogfooding workflow -- the maintainer uses the locally built binary to run flows against the repo itself.
 
+## Running flows
+
+Long-running `kuro run` commands must be started in a tmux window of the session `kuro`, never as hidden background processes. The developer follows the output live and keeps the scrollback as the record of the run:
+
+```
+tmux new-window -t kuro -n <name> -c <repo-root>
+tmux send-keys -t kuro:<name> './target/debug/kuro run <flow> --var id=<N>' Enter
+```
+
+Monitor progress with `tmux capture-pane -t kuro:<name> -p`. If the session `kuro` does not exist, create it first (`tmux new-session -d -s kuro`).
+
+This is an interim convention until kuro itself can list and attach to running flows (see #7 for a status command and #277 for the live TUI). Once that lands, this section gets replaced.
+
 ## Issues
 
 Development is issue-driven. Every change starts as a GitHub issue; no branch, PR, or commit without one (only trivial one-line fixes are exempt).
