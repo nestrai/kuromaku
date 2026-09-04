@@ -34,7 +34,9 @@ kuro context         # shows what agents, rules and flows are active
 ```
 
 `kuro init` scaffolds agents, a rule stub and a starter flow. From there you
-edit YAML: add agents, wire flows, reference shared seed libraries.
+edit YAML: add agents, wire flows, reference shared seed libraries. To share
+a seed library across repositories, pin it as a commit-pinned Git submodule --
+see [docs/seed-pinning.md](docs/seed-pinning.md) for the supported pattern.
 
 ## How it works
 
