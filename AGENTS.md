@@ -46,6 +46,7 @@ Preferred: split a pane in the current window so the run sits next to the ongoin
 ```
 pane=$(tmux split-window -h -c <repo-root> -P -F '#{pane_id}')
 tmux select-pane -t "$pane" -T 'issue-<N>'
+tmux set-option -w pane-border-status top   # make pane titles visible in this window
 tmux send-keys -t "$pane" './target/debug/kuro run <flow> --var id=<N>' Enter
 ```
 
