@@ -37,6 +37,14 @@ Fix all lint issues before pushing. `just lint` runs both clippy and format chec
 
 After code changes that affect CLI behavior, run `just release` so the local `kuro` binary reflects the latest code. This is the dogfooding workflow -- the maintainer uses the locally built binary to run flows against the repo itself.
 
+## Issues
+
+Development is issue-driven. Every change starts as a GitHub issue; no branch, PR, or commit without one (only trivial one-line fixes are exempt).
+
+- Only pick up issues carrying the `ready-for-implementation` label. That label is the maintainer's handoff that the issue meets the quality bar (see `.kuro/rules/issue-quality.md`). An unlabeled issue is not ready -- do not start it.
+- When you discover new work mid-task (a bug, a missing test, an idea), create an issue with `gh issue create` and stay on your current task. Never write local todo files (`Todo.md`, `TODO.txt`) into the repository, and never fix out-of-scope problems inline.
+- `TODO` comments in code are acceptable only as pointers to an issue: `// TODO(#123): ...`.
+
 ## Workflow
 
 The full lifecycle for every issue is:
