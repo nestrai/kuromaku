@@ -26,7 +26,10 @@
         rec {
           kuro = pkgs.rustPlatform.buildRustPackage {
             pname = "kuromaku";
-            version = "2026.4.0";
+            # Single source of truth: Cargo.toml. Read at eval time so the
+            # nix package version cannot drift from the crate version
+            # (#398); `just check-version` guards the remaining seams.
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = ./.;
             cargoLock = {
               lockFile = ./Cargo.lock;
