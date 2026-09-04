@@ -39,14 +39,18 @@ After code changes that affect CLI behavior, run `just release` so the local `ku
 
 ## Running flows
 
-Long-running `kuro run` commands must be started in a tmux window of the session `kuro`, never as hidden background processes. The developer follows the output live and keeps the scrollback as the record of the run:
+Long-running `kuro run` commands must be visible in the developer's current tmux session, never hidden background processes. The developer follows the output live and keeps the scrollback as the record of the run.
+
+Preferred: split a pane in the current window so the run sits next to the ongoing work:
 
 ```
-tmux new-window -t kuro -n <name> -c <repo-root>
-tmux send-keys -t kuro:<name> './target/debug/kuro run <flow> --var id=<N>' Enter
+pane=$(tmux split-window -h -c <repo-root> -P -F '#{pane_id}')
+tmux send-keys -t "$pane" './target/debug/kuro run <flow> --var id=<N>' Enter
 ```
 
-Monitor progress with `tmux capture-pane -t kuro:<name> -p`. If the session `kuro` does not exist, create it first (`tmux new-session -d -s kuro`).
+Alternative: a single dedicated window named `kuro` in the current session. Create it once with `tmux new-window -d -n kuro -c <repo-root>`, reuse it for later runs via `tmux send-keys -t kuro ...`.
+
+Do not create a separate tmux session or one window per run. Monitor progress with `tmux capture-pane -t <target> -p`.
 
 This is an interim convention until kuro itself can list and attach to running flows (see #7 for a status command and #277 for the live TUI). Once that lands, this section gets replaced.
 
