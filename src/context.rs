@@ -409,7 +409,7 @@ pub(crate) fn rebase_seeds_for_cwd(seeds: Seeds, cwd: &Path) -> Seeds {
 fn seed_contribution(seed: &Seed, project_roles: &HashMap<String, String>) -> SeedContribution {
     match &seed.source {
         SeedSource::Local { display, path } => {
-            let exists = path.is_dir();
+            let exists = is_seed_dir(path);
             let seed_md = if exists { read_seed_md(path) } else { None };
             let agents = if exists {
                 enumerate_agents_in_seed(path, display)
