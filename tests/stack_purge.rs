@@ -169,7 +169,7 @@ fn fake_legacy_project_under(home: &Path, project: &str) -> PathBuf {
 fn purge_falls_back_to_legacy_root_when_project_only_there() {
     // Erasure (#398 / GDPR Art. 17) must reach pre-rename data: a project
     // that only exists under `~/.koto/stacks/` is still purgeable, with a
-    // notice naming the legacy root.
+    // preview naming the legacy root.
     let home = tempfile::tempdir().unwrap();
     let legacy_dir = fake_legacy_project_under(home.path(), "ikno");
 
@@ -183,16 +183,15 @@ fn purge_falls_back_to_legacy_root_when_project_only_there() {
 
     let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
     assert!(
-        stderr.contains("legacy stack root"),
+        stderr.contains("legacy stack 'ikno'"),
         "fallback must announce the legacy root, got: {stderr}"
     );
     assert!(!legacy_dir.exists(), "legacy project dir must be gone");
 }
 
 #[test]
-fn purge_prefers_canonical_root_over_legacy() {
-    // Same project name under both roots: only the canonical copy is
-    // deleted -- the legacy copy is old data the user did not target.
+fn purge_removes_canonical_and_legacy_copies() {
+    // Same project name under both roots: erasure must remove both copies.
     let home = tempfile::tempdir().unwrap();
     let canonical_dir = fake_project_under(home.path(), "ikno");
     let legacy_dir = fake_legacy_project_under(home.path(), "ikno");
@@ -209,7 +208,7 @@ fn purge_prefers_canonical_root_over_legacy() {
         !canonical_dir.exists(),
         "canonical project dir must be gone"
     );
-    assert!(legacy_dir.exists(), "legacy copy must stay untouched");
+    assert!(!legacy_dir.exists(), "legacy project dir must be gone");
 }
 
 #[test]

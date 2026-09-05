@@ -371,43 +371,37 @@ fn cmd_context(format: ContextFormat) -> Result<()> {
 /// dragging confirmation logic along.
 fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
     print_legacy_stacks_notice();
-    // Canonical root first; a project that only exists under the legacy
-    // pre-#398 root (`~/.kuro/stacks/`) is still purgeable -- erasure
-    // (GDPR Art. 17) must reach old data too, without forcing the user
-    // to migrate it first. Any error other than "not found under the
-    // canonical root" surfaces immediately.
     let canonical = stack::stack_root();
-    // `plan_purge` runs the full validation chain (string shape,
-    // containment) and returns the same diagnostics `purge_project` would
-    // -- so dry-run and live mode behave identically up to the deletion.
-    let (root, report) = match stack::plan_purge(&canonical, project) {
-        Ok(report) => (canonical, report),
-        Err(canonical_err @ stack::StackError::ProjectNotFound(_, _)) => {
-            let legacy = stack::legacy_stack_root();
-            match stack::plan_purge(&legacy, project) {
-                Ok(report) => {
-                    eprintln!(
-                        "notice: '{project}' found under legacy stack root {}",
-                        legacy.display()
-                    );
-                    (legacy, report)
-                }
-                // Report against the canonical root -- that is where new
-                // data lives and where the user should look first.
-                Err(_) => return Err(format_purge_error(canonical_err)),
-            }
+    let legacy = stack::legacy_stack_root();
+    // Plan both roots before confirming. An upgraded project can have run
+    // history in both locations; one purge must remove both copies.
+    let mut plans = Vec::new();
+    for root in [&canonical, &legacy] {
+        match stack::plan_purge(root, project) {
+            Ok(report) => plans.push((root, report)),
+            Err(stack::StackError::ProjectNotFound(_, _)) => {}
+            Err(e) => return Err(format_purge_error(e)),
         }
-        Err(e) => return Err(format_purge_error(e)),
-    };
+    }
+    if plans.is_empty() {
+        return Err(format_purge_error(stack::StackError::ProjectNotFound(
+            project.to_string(),
+            canonical.join(project),
+        )));
+    }
 
-    eprintln!(
-        "stack '{}': {} run(s), {} file(s), {} byte(s) at {}",
-        report.project,
-        report.run_count,
-        report.file_count,
-        report.byte_size,
-        report.path.display()
-    );
+    for (root, report) in &plans {
+        let label = if *root == &legacy { "legacy " } else { "" };
+        eprintln!(
+            "{label}stack '{}': {} run(s), {} file(s), {} byte(s) at {}",
+            report.project,
+            report.run_count,
+            report.file_count,
+            report.byte_size,
+            report.path.display()
+        );
+    }
+    let total_runs: usize = plans.iter().map(|(_, report)| report.run_count).sum();
 
     if dry_run {
         eprintln!("dry-run: nothing was deleted");
@@ -422,9 +416,8 @@ fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
             ));
         }
         eprint!(
-            "Permanently delete {} run(s) from {}? [y/N] ",
-            report.run_count,
-            report.path.display()
+            "Permanently delete {total_runs} run(s) from {} stack root(s)? [y/N] ",
+            plans.len()
         );
         std::io::stderr().flush().ok();
         let mut answer = String::new();
@@ -437,11 +430,17 @@ fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
         }
     }
 
-    let report = stack::purge_project(&root, project).map_err(format_purge_error)?;
-    eprintln!(
-        "deleted '{}': {} run(s), {} file(s), {} byte(s)",
-        report.project, report.run_count, report.file_count, report.byte_size
-    );
+    for (root, _) in plans {
+        let report = stack::purge_project(root, project).map_err(format_purge_error)?;
+        eprintln!(
+            "deleted '{}': {} run(s), {} file(s), {} byte(s) from {}",
+            report.project,
+            report.run_count,
+            report.file_count,
+            report.byte_size,
+            root.display()
+        );
+    }
     Ok(())
 }
 

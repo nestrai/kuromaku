@@ -12,7 +12,7 @@ seeds:
 
 tiers:
   reasoning: claude/claude-fable-5
-  general: claude/claude-fable-5
+  general: claude/claude-sonnet-4-6
   quick: claude/claude-haiku-4-5-20251001
 
 defaults:

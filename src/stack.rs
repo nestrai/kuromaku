@@ -626,8 +626,10 @@ pub fn stack_root() -> PathBuf {
 }
 
 /// Legacy stack root: `~/.koto/stacks/`, the pre-#398 location. Never
-/// written by new runs; kept so purge (and future readers like `kuro
-/// show`) can still reach old run history without a forced migration.
+/// written by new runs; resumed pre-#398 runs finish in place here, while
+/// new runs and new projects use [`stack_root`]. Kept so purge (and future
+/// readers like `kuro show`) can still reach old run history without a
+/// forced migration.
 pub fn legacy_stack_root() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
