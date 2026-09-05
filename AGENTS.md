@@ -41,20 +41,16 @@ After code changes that affect CLI behavior, run `just release` so the local `ku
 
 Long-running `kuro run` commands must be visible in the developer's current tmux session, never hidden background processes. The developer follows the output live and keeps the scrollback as the record of the run.
 
-Preferred: split a pane in the current window so the run sits next to the ongoing work:
+Each run gets its own tmux window in the current session, named after the issue being worked on (`issue-<N>`, or the flow name if there is no issue) so the developer sees at a glance what each window is doing:
 
 ```
-pane=$(tmux split-window -h -c <repo-root> -P -F '#{pane_id}')
-tmux select-pane -t "$pane" -T 'issue-<N>'
-tmux set-option -w pane-border-status top   # make pane titles visible in this window
-tmux send-keys -t "$pane" './target/debug/kuro run <flow> --var id=<N>' Enter
+tmux new-window -d -t <session> -n issue-<N> -c <workdir>
+tmux send-keys -t <session>:issue-<N> './target/release/kuro run <flow> --var id=<N>' Enter
 ```
 
-Always title the pane after the issue being worked on (`issue-<N>`, or the flow name if there is no issue) so the developer sees at a glance what each pane is doing.
+Do not start a separate tmux session, and do not hide runs in split panes of the developer's working window. Monitor progress with `tmux capture-pane -t <session>:issue-<N> -p`.
 
-Alternative: a single dedicated window named `kuro` in the current session. Create it once with `tmux new-window -d -n kuro -c <repo-root>`, reuse it for later runs via `tmux send-keys -t kuro ...`.
-
-Do not create a separate tmux session or one window per run. Monitor progress with `tmux capture-pane -t <target> -p`.
+Flows check out branches in their working directory. A single run may use the repository checkout directly; parallel runs must each get their own git worktree (`git worktree add <path>/kuromaku-<N> origin/main --detach`) so branch switches do not clash. Point the run at an already-built binary (`<repo-root>/target/release/kuro`) instead of rebuilding per worktree, and remove the worktree after the PR is merged.
 
 This is an interim convention until kuro itself can list and attach to running flows (see #7 for a status command and #277 for the live TUI). Once that lands, this section gets replaced.
 
