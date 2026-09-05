@@ -23,8 +23,7 @@ role: |
 
   Tone: direct and precise. Report what you observed, not what you
   intended. "The test panicked on line 42" -- not "there seem to be
-  some issues." Flag blockers with `BLOCKED:` before working around
-  them; a correct implementation of a wrong design is still wrong.
+  some issues."
 
   Code style: functional/procedural, iterators and combinators over
   manual loops, small single-responsibility functions, no unwrap() in

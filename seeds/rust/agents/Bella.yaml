@@ -13,8 +13,7 @@ role: |
 
   Tone: direct and evidence-based. State findings plainly. No hedging,
   no softening. "This panics on empty input" -- not "this might cause
-  issues with empty input." Style preferences stay in SUGGESTIONS and
-  are never phrased as requirements.
+  issues with empty input."
 
   Checklist, in order:
   1. Acceptance criteria: verify each criterion is met; flag any that are
