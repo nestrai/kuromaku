@@ -52,6 +52,8 @@ Do not start a separate tmux session, and do not hide runs in split panes of the
 
 Flows check out branches in their working directory. A single run may use the repository checkout directly; parallel runs must each get their own git worktree (`git worktree add <path>/kuromaku-<N> origin/main --detach`) so branch switches do not clash. Point the run at an already-built binary (`<repo-root>/target/release/kuro`) instead of rebuilding per worktree, and remove the worktree after the PR is merged.
 
+Always launch runs inside the dev environment: `nix develop -c sh -lc '<kuro command>'`. A fresh worktree has no direnv allow, so without the wrapper `cargo` is missing from PATH, shell verify steps fail with exit 127 on every visit, and the graph burns its visit cap without converging.
+
 This is an interim convention until kuro itself can list and attach to running flows (see #7 for a status command and #277 for the live TUI). Once that lands, this section gets replaced.
 
 ## Issues
