@@ -350,6 +350,24 @@ fn write_effective_section(
     writeln!(out, "  {label} ({}): {}", items.len(), rendered.join(", "))
 }
 
+// --- Seed presence check ---
+
+/// Names of subdirectories whose presence marks a directory as a usable seed.
+/// Shared between `context` (inventory) and `init` (planning) so the two sites
+/// cannot drift when subdirectory naming changes.
+pub(crate) const SEED_SUBDIRS: [&str; 3] = ["agents", "rules", "flows"];
+
+/// Returns `true` when `path` is an existing directory that contains at least
+/// one standard seed subdirectory (`agents/`, `rules/`, or `flows/`).
+///
+/// Used by `kuro init --seeds` to skip buckets that exist on disk but hold
+/// no seed content. A bucket with all three subdirectories present but empty
+/// still passes -- the loose predicate keeps the check reversible (tightening
+/// later breaks no one; loosening would invalidate configs already written).
+pub(crate) fn is_seed_dir(path: &Path) -> bool {
+    path.is_dir() && SEED_SUBDIRS.iter().any(|sub| path.join(sub).is_dir())
+}
+
 // --- Seed discovery ---
 
 /// Load the project's seed list, falling back to the implicit local
@@ -1770,5 +1788,42 @@ mod tests {
             }
             other => panic!("expected remote, got {other:?}"),
         }
+    }
+
+    // --- is_seed_dir ---
+
+    #[test]
+    fn is_seed_dir_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Missing path → false.
+        assert!(!is_seed_dir(&root.join("nonexistent")));
+
+        // Existing file (not dir) → false.
+        fs::write(root.join("afile"), "").unwrap();
+        assert!(!is_seed_dir(&root.join("afile")));
+
+        // Empty dir (no subdirs) → false.
+        fs::create_dir(root.join("empty")).unwrap();
+        assert!(!is_seed_dir(&root.join("empty")));
+
+        // Dir with only an `agents/` subdir → true.
+        fs::create_dir_all(root.join("with-agents/agents")).unwrap();
+        assert!(is_seed_dir(&root.join("with-agents")));
+
+        // Dir with only a `rules/` subdir → true.
+        fs::create_dir_all(root.join("with-rules/rules")).unwrap();
+        assert!(is_seed_dir(&root.join("with-rules")));
+
+        // Dir with only a `flows/` subdir → true.
+        fs::create_dir_all(root.join("with-flows/flows")).unwrap();
+        assert!(is_seed_dir(&root.join("with-flows")));
+
+        // Dir with all three subdirs → true.
+        fs::create_dir_all(root.join("full/agents")).unwrap();
+        fs::create_dir_all(root.join("full/rules")).unwrap();
+        fs::create_dir_all(root.join("full/flows")).unwrap();
+        assert!(is_seed_dir(&root.join("full")));
     }
 }

@@ -499,6 +499,22 @@ impl Seeds {
     }
 }
 
+/// Inverse of [`expand_tilde`]: replace an absolute path that starts with
+/// `home/` (or equals `home`) with a `~/`-prefixed string.
+///
+/// Returns `None` when `path` is not under `home` or `home` is not a prefix.
+/// Pure -- `home` is injected by the caller so tests can verify without
+/// touching the real `$HOME`.
+pub(crate) fn contract_tilde(path: &Path, home: &Path) -> Option<String> {
+    path.strip_prefix(home).ok().map(|rel| {
+        if rel.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rel.display())
+        }
+    })
+}
+
 /// Expand a leading `~/` or bare `~` to `$HOME`. Returns the input as a
 /// `PathBuf` unchanged when no tilde is present or `$HOME` cannot be located.
 fn expand_tilde(path: &str) -> PathBuf {
@@ -1981,5 +1997,39 @@ roles:
 ";
         let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
         assert!(err.to_string().contains("empty entry"), "got: {err}");
+    }
+
+    // --- contract_tilde ---
+
+    #[test]
+    fn contract_tilde_path_under_home() {
+        let home = std::path::PathBuf::from("/home/user");
+        let path = std::path::PathBuf::from("/home/user/seeds/github");
+        assert_eq!(
+            super::contract_tilde(&path, &home),
+            Some("~/seeds/github".to_string())
+        );
+    }
+
+    #[test]
+    fn contract_tilde_equals_home() {
+        let home = std::path::PathBuf::from("/home/user");
+        assert_eq!(super::contract_tilde(&home, &home), Some("~".to_string()));
+    }
+
+    #[test]
+    fn contract_tilde_not_under_home() {
+        let home = std::path::PathBuf::from("/home/user");
+        let path = std::path::PathBuf::from("/other/path");
+        assert_eq!(super::contract_tilde(&path, &home), None);
+    }
+
+    #[test]
+    fn contract_tilde_partial_match_not_contracted() {
+        // /home/username does not start with /home/user/ -- strip_prefix
+        // requires a full path component match, not a string prefix.
+        let home = std::path::PathBuf::from("/home/user");
+        let path = std::path::PathBuf::from("/home/username/data");
+        assert_eq!(super::contract_tilde(&path, &home), None);
     }
 }

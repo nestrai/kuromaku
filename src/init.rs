@@ -46,6 +46,120 @@ impl ProjectKind {
             ProjectKind::Generic => None,
         }
     }
+
+    /// Stack bucket path relative to the seed root for this project kind.
+    /// `None` for `Generic` projects which have no language-specific bucket.
+    ///
+    /// Matches the axis documented in the seeds README: `coding/<lang>/`.
+    fn seed_bucket(self) -> Option<&'static str> {
+        match self {
+            ProjectKind::Rust => Some("coding/rust"),
+            ProjectKind::Python => Some("coding/python"),
+            ProjectKind::Go => Some("coding/go"),
+            ProjectKind::Web => Some("coding/web"),
+            ProjectKind::Tex => Some("coding/tex"),
+            ProjectKind::Generic => None,
+        }
+    }
+}
+
+/// Validated seed cascade assembled before any file is written.
+///
+/// `entries` are the `path:` strings in cascade order that appear _after_
+/// the implicit `.kuro/` first entry. They are ready for insertion into the
+/// generated `config.yaml` seeds section.
+#[derive(Debug)]
+struct SeedPlan {
+    entries: Vec<String>,
+}
+
+/// Pure seed planning: probe `root_arg` for usable buckets and return the
+/// serialised cascade entries, or an error that describes exactly what was
+/// checked. No filesystem writes happen here.
+///
+/// `dir` is the project root (used to resolve relative `root_arg`).
+/// `home` is injected so tests can control tilde expansion/contraction
+/// without touching the real `$HOME`.
+fn plan_seeds(
+    dir: &Path,
+    kind: ProjectKind,
+    root_arg: &Path,
+    home: Option<&Path>,
+) -> Result<SeedPlan> {
+    use crate::context::is_seed_dir;
+    use crate::koto_config::contract_tilde;
+
+    // Expand a literal `~/` prefix (common when KURO_SEEDS is set without
+    // shell expansion). The rest of the resolution is path-based.
+    let probe_root: PathBuf = {
+        let s = root_arg.to_string_lossy();
+        if let Some(rest) = s.strip_prefix("~/") {
+            match home {
+                Some(h) => h.join(rest),
+                None => root_arg.to_path_buf(), // cannot expand; will fail the is_dir check
+            }
+        } else if root_arg.is_relative() {
+            dir.join(root_arg)
+        } else {
+            root_arg.to_path_buf()
+        }
+    };
+
+    if !probe_root.is_dir() {
+        return Err(eyre!(
+            "seed root \"{}\" does not exist or is not a directory",
+            root_arg.display()
+        ));
+    }
+
+    // Candidate buckets in cascade order: language bucket (if any), then
+    // shared cross-cutting buckets.
+    let mut candidates: Vec<&str> = Vec::new();
+    if let Some(lang) = kind.seed_bucket() {
+        candidates.push(lang);
+    }
+    candidates.push("github");
+    candidates.push("coding/common");
+
+    let survivors: Vec<&str> = candidates
+        .iter()
+        .copied()
+        .filter(|bucket| is_seed_dir(&probe_root.join(bucket)))
+        .collect();
+
+    if survivors.is_empty() {
+        let checked = candidates
+            .iter()
+            .map(|b| format!("  {}/{b}", root_arg.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(eyre!(
+            "no usable seed buckets found under \"{}\";\n  checked:\n{}",
+            root_arg.display(),
+            checked
+        ));
+    }
+
+    // Serialize the root for use in YAML `path:` strings.
+    // - Tilde-prefixed input or relative input stays as-is (display-ready).
+    // - Absolute input under home is contracted to `~/...`.
+    // - Other absolute paths stay absolute.
+    let s = root_arg.to_string_lossy();
+    let root_str = if s.starts_with("~/") || root_arg.is_relative() {
+        s.trim_end_matches('/').to_string()
+    } else {
+        // Absolute -- try contraction against the resolved home.
+        home.and_then(|h| contract_tilde(&probe_root, h))
+            .map(|t| t.trim_end_matches('/').to_string())
+            .unwrap_or_else(|| s.trim_end_matches('/').to_string())
+    };
+
+    let entries = survivors
+        .iter()
+        .map(|bucket| format!("{root_str}/{bucket}/"))
+        .collect();
+
+    Ok(SeedPlan { entries })
 }
 
 /// Marker files checked in order; first match wins. The order is the
@@ -72,7 +186,12 @@ const BACKEND_CANDIDATES: [(Backend, &str, &str); 3] = [
 /// Entry point for `kuro init`. Scaffolds `.kuro/` in `dir` and prints a
 /// summary plus next steps. Fails without writing anything when existing
 /// configuration (canonical or legacy) is present.
-pub fn run(dir: &Path) -> Result<()> {
+///
+/// `seed_root` is the root of a local seed library (from `--seeds ROOT` or
+/// `KURO_SEEDS`). When provided, `plan_seeds` probes for usable buckets and
+/// injects a `seeds:` section into the generated `config.yaml`. Any error
+/// during planning aborts before writing -- no partial state is left.
+pub fn run(dir: &Path, seed_root: Option<&Path>) -> Result<()> {
     if let Err(existing) = preflight(dir) {
         eprintln!("found existing configuration:");
         for path in &existing {
@@ -98,7 +217,13 @@ pub fn run(dir: &Path) -> Result<()> {
         }
     };
 
-    let files = render_files(kind, backend);
+    // Plan the seed cascade before touching the filesystem. Any error here
+    // keeps the project clean -- nothing has been written yet.
+    let seed_plan = seed_root
+        .map(|root| plan_seeds(dir, kind, root, dirs::home_dir().as_deref()))
+        .transpose()?;
+
+    let files = render_files(kind, backend, seed_plan.as_ref());
     write_files(dir, &files)?;
 
     match kind.language() {
@@ -113,6 +238,14 @@ pub fn run(dir: &Path) -> Result<()> {
     }
     for (path, _) in &files {
         println!("  created {}", path.display());
+    }
+    if let Some(ref plan) = seed_plan {
+        println!();
+        println!("Seeds:");
+        println!("  .kuro/");
+        for entry in &plan.entries {
+            println!("  {entry}");
+        }
     }
     println!();
     println!("Next steps:");
@@ -232,7 +365,12 @@ fn is_executable(path: &Path) -> bool {
 /// Render the starter files as (relative path, contents) pairs. Pure --
 /// no filesystem access -- so the unit tests can feed the rendered strings
 /// straight into the production loaders.
-fn render_files(kind: ProjectKind, backend: Backend) -> Vec<(PathBuf, String)> {
+///
+/// When `plan` is `Some`, the generated `config.yaml` includes a `seeds:`
+/// section with `.kuro/` as the first entry followed by the plan entries.
+/// When `plan` is `None`, the `seeds:` section is omitted and the config
+/// is byte-identical to the pre-#386 output (preserving the golden fixture).
+fn render_files(kind: ProjectKind, backend: Backend, plan: Option<&SeedPlan>) -> Vec<(PathBuf, String)> {
     // "a Rust project" / "this project" -- the only language-dependent
     // phrase in the agent role text.
     let project_desc = match kind.language() {
@@ -246,6 +384,20 @@ fn render_files(kind: ProjectKind, backend: Backend) -> Vec<(PathBuf, String)> {
         None => String::new(),
     };
 
+    // Build the seeds section for insertion into CONFIG_TEMPLATE. The
+    // empty string (no-seeds case) leaves the template's blank line intact
+    // so the no-seeds output stays byte-identical to the golden fixture.
+    let seeds_section = match plan {
+        None => String::new(),
+        Some(p) => {
+            let mut s = String::from("seeds:\n  - path: .kuro/\n");
+            for entry in &p.entries {
+                s.push_str(&format!("  - path: {entry}\n"));
+            }
+            s
+        }
+    };
+
     let render_agent = |template: &str| {
         template
             .replace("{backend}", backend.yaml_name())
@@ -255,7 +407,7 @@ fn render_files(kind: ProjectKind, backend: Backend) -> Vec<(PathBuf, String)> {
     vec![
         (
             PathBuf::from(".kuro/config.yaml"),
-            CONFIG_TEMPLATE.to_string(),
+            CONFIG_TEMPLATE.replace("{seeds_section}", &seeds_section),
         ),
         (
             PathBuf::from(".kuro/agents/Developer.yaml"),
@@ -313,9 +465,15 @@ fn write_files(dir: &Path, files: &[(PathBuf, String)]) -> Result<()> {
 /// the runtime backend -- the detected CLI goes into the agent files
 /// instead (see `RawAgentFile.backend`). Do not write `claude-cli` here;
 /// `KotoBackend` would reject it.
+///
+/// The `{seeds_section}` placeholder is replaced by `render_files`:
+/// - with an empty string (no-seeds case) so the blank line between
+///   `version:` and `defaults:` is preserved, keeping the output
+///   byte-identical to the golden fixture.
+/// - with a `seeds:` YAML block (seeds case) listing `.kuro/` first.
 const CONFIG_TEMPLATE: &str = r#"# Generated by `kuro init`. Edit freely -- this file is yours now.
 version: "1"
-
+{seeds_section}
 defaults:
   backend: cli
 
@@ -401,7 +559,7 @@ mod tests {
     use crate::koto_config::{KotoBackend, KotoConfig};
 
     fn write_rendered(dir: &Path, kind: ProjectKind, backend: Backend) {
-        write_files(dir, &render_files(kind, backend)).expect("write scaffold");
+        write_files(dir, &render_files(kind, backend, None)).expect("write scaffold");
     }
 
     // --- Generated output through the production loaders ---
@@ -490,7 +648,7 @@ mod tests {
 
     #[test]
     fn generic_scaffold_names_no_language() {
-        for (_, contents) in render_files(ProjectKind::Generic, Backend::ClaudeCli) {
+        for (_, contents) in render_files(ProjectKind::Generic, Backend::ClaudeCli, None) {
             for language in ["Rust", "Python", "Go", "JavaScript", "LaTeX"] {
                 assert!(
                     !contents.contains(language),
@@ -655,7 +813,7 @@ mod tests {
     fn write_failure_removes_created_kuro_dir() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let files = render_files(ProjectKind::Generic, Backend::ClaudeCli);
+        let files = render_files(ProjectKind::Generic, Backend::ClaudeCli, None);
 
         // Make the first write succeed, then break the world: read-only
         // .kuro/ so the agents/ subdir cannot be created.
@@ -674,6 +832,187 @@ mod tests {
         assert!(
             !dir.path().join(KOTO_DIR).exists(),
             "failed init must leave no {KOTO_DIR}/ behind"
+        );
+    }
+
+    // --- SeedPlan / plan_seeds ---
+
+    /// Create a bucket at `root/bucket/agents/` so `is_seed_dir` considers it usable.
+    fn make_bucket(root: &Path, bucket: &str) {
+        std::fs::create_dir_all(root.join(bucket).join("agents")).unwrap();
+    }
+
+    #[test]
+    fn plan_seeds_rust_full_cascade() {
+        // AC1: Rust project + all three buckets present → cascade in order.
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        make_bucket(r, "coding/rust");
+        make_bucket(r, "github");
+        make_bucket(r, "coding/common");
+
+        let proj = tempfile::tempdir().unwrap();
+        let plan = plan_seeds(proj.path(), ProjectKind::Rust, r, None).unwrap();
+        assert_eq!(
+            plan.entries,
+            vec![
+                format!("{}/coding/rust/", r.display()),
+                format!("{}/github/", r.display()),
+                format!("{}/coding/common/", r.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_seeds_language_bucket_missing_falls_back() {
+        // AC2: language bucket absent → cascade with github + coding/common only.
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        make_bucket(r, "github");
+        make_bucket(r, "coding/common");
+
+        let proj = tempfile::tempdir().unwrap();
+        let plan = plan_seeds(proj.path(), ProjectKind::Rust, r, None).unwrap();
+        assert_eq!(
+            plan.entries,
+            vec![
+                format!("{}/github/", r.display()),
+                format!("{}/coding/common/", r.display()),
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_seeds_generic_skips_language_bucket() {
+        // Generic projects have no language bucket; only shared buckets probed.
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        make_bucket(r, "github");
+
+        let proj = tempfile::tempdir().unwrap();
+        let plan = plan_seeds(proj.path(), ProjectKind::Generic, r, None).unwrap();
+        assert_eq!(plan.entries, vec![format!("{}/github/", r.display())]);
+    }
+
+    #[test]
+    fn plan_seeds_no_usable_buckets_errors() {
+        // AC3: root exists but no probed bucket is usable → error, no write.
+        let root = tempfile::tempdir().unwrap();
+        let proj = tempfile::tempdir().unwrap();
+        let err = plan_seeds(proj.path(), ProjectKind::Rust, root.path(), None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("no usable seed buckets"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_seeds_missing_root_errors() {
+        // AC4: root path does not exist → error before any write.
+        let proj = tempfile::tempdir().unwrap();
+        let err = plan_seeds(
+            proj.path(),
+            ProjectKind::Rust,
+            Path::new("/nonexistent/seeds-xyz"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("does not exist"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn plan_seeds_relative_root_resolves_from_dir() {
+        // Relative root "vendor/seeds" resolves against the project dir.
+        let proj = tempfile::tempdir().unwrap();
+        let vendor = proj.path().join("vendor/seeds");
+        make_bucket(&vendor, "github");
+
+        let plan =
+            plan_seeds(proj.path(), ProjectKind::Generic, Path::new("vendor/seeds"), None)
+                .unwrap();
+        // Serialized path keeps the relative form.
+        assert_eq!(plan.entries, vec!["vendor/seeds/github/"]);
+    }
+
+    #[test]
+    fn plan_seeds_relative_root_trailing_slash_normalised() {
+        // Trailing slash in root_arg must not produce a double slash.
+        let proj = tempfile::tempdir().unwrap();
+        let vendor = proj.path().join("vendor/seeds");
+        make_bucket(&vendor, "github");
+
+        let plan =
+            plan_seeds(proj.path(), ProjectKind::Generic, Path::new("vendor/seeds/"), None)
+                .unwrap();
+        assert_eq!(plan.entries, vec!["vendor/seeds/github/"]);
+    }
+
+    #[test]
+    fn plan_seeds_tilde_contraction_with_injected_home() {
+        // AC6: absolute path under home → contracted to ~/...
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("seeds");
+        make_bucket(&root, "github");
+
+        let proj = tempfile::tempdir().unwrap();
+        let plan =
+            plan_seeds(proj.path(), ProjectKind::Generic, &root, Some(home.path())).unwrap();
+        assert_eq!(plan.entries, vec!["~/seeds/github/"]);
+    }
+
+    #[test]
+    fn plan_seeds_home_unset_absolute_kept() {
+        // When home is None, absolute paths are serialized as-is.
+        let root = tempfile::tempdir().unwrap();
+        make_bucket(root.path(), "github");
+
+        let proj = tempfile::tempdir().unwrap();
+        let plan = plan_seeds(proj.path(), ProjectKind::Generic, root.path(), None).unwrap();
+        assert_eq!(
+            plan.entries,
+            vec![format!("{}/github/", root.path().display())]
+        );
+    }
+
+    #[test]
+    fn render_files_with_plan_includes_seeds_section() {
+        // Seeds section appears between version and defaults in the rendered config.
+        let seed_root = tempfile::tempdir().unwrap();
+        make_bucket(seed_root.path(), "github");
+
+        let proj = tempfile::tempdir().unwrap();
+        let plan =
+            plan_seeds(proj.path(), ProjectKind::Generic, seed_root.path(), None).unwrap();
+
+        let files = render_files(ProjectKind::Generic, Backend::ClaudeCli, Some(&plan));
+        let (_, config_yaml) = files
+            .iter()
+            .find(|(p, _)| p == &PathBuf::from(".kuro/config.yaml"))
+            .unwrap();
+
+        assert!(config_yaml.contains("seeds:"), "missing seeds: key");
+        assert!(config_yaml.contains("- path: .kuro/"), "missing .kuro/ entry");
+        // seeds: section must appear before defaults:
+        let seeds_pos = config_yaml.find("seeds:").unwrap();
+        let defaults_pos = config_yaml.find("defaults:").unwrap();
+        assert!(seeds_pos < defaults_pos, "seeds: must precede defaults:");
+    }
+
+    #[test]
+    fn render_files_no_plan_omits_seeds_section() {
+        // AC9: no seeds flag → config.yaml must not contain a seeds section.
+        let files = render_files(ProjectKind::Generic, Backend::ClaudeCli, None);
+        let (_, config_yaml) = files
+            .iter()
+            .find(|(p, _)| p == &PathBuf::from(".kuro/config.yaml"))
+            .unwrap();
+        assert!(
+            !config_yaml.contains("seeds:"),
+            "no-seeds config must omit the seeds section"
         );
     }
 }
