@@ -678,7 +678,8 @@ fn legacy_notice_for(legacy: &Path, canonical: &Path) -> Option<String> {
     non_empty.then(|| {
         format!(
             "notice: legacy stack data found at {legacy} -- new runs write to {canonical}; \
-             old runs stay readable in place. Migrate manually with: mkdir -p {canonical} && mv {legacy}/* {canonical}/",
+             old runs stay readable in place. Migrate per project to avoid nesting duplicate project directories: \
+             mkdir -p {canonical}/<project> && mv {legacy}/<project>/* {canonical}/<project>/",
             legacy = legacy.display(),
             canonical = canonical.display(),
         )

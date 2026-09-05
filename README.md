@@ -224,8 +224,10 @@ accidental:
   before the rename stay readable at `~/.koto/stacks/` -- stack-touching
   commands print a one-line notice while that directory holds data, and
   `kuro stack purge` reaches projects under either root. Migrate manually
-  with `mv ~/.koto/stacks/* ~/.kuro/stacks/` whenever you like; kuromaku
-  never moves your data on its own.
+  per project with `mkdir -p ~/.kuro/stacks/<project> && mv
+  ~/.koto/stacks/<project>/* ~/.kuro/stacks/<project>/`; this preserves both
+  histories if a project exists under both roots. kuromaku never moves your
+  data on its own.
 
 ## Status
 

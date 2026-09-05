@@ -415,10 +415,12 @@ fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
                 "refusing to purge non-interactively without --yes\n\nhint: pass --yes to confirm, or run with a TTY attached"
             ));
         }
-        eprint!(
-            "Permanently delete {total_runs} run(s) from {} stack root(s)? [y/N] ",
-            plans.len()
-        );
+        let roots = plans
+            .iter()
+            .map(|(root, _)| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        eprint!("Permanently delete {total_runs} run(s) from {roots}? [y/N] ");
         std::io::stderr().flush().ok();
         let mut answer = String::new();
         std::io::stdin()
