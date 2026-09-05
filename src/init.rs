@@ -370,7 +370,11 @@ fn is_executable(path: &Path) -> bool {
 /// section with `.kuro/` as the first entry followed by the plan entries.
 /// When `plan` is `None`, the `seeds:` section is omitted and the config
 /// is byte-identical to the pre-#386 output (preserving the golden fixture).
-fn render_files(kind: ProjectKind, backend: Backend, plan: Option<&SeedPlan>) -> Vec<(PathBuf, String)> {
+fn render_files(
+    kind: ProjectKind,
+    backend: Backend,
+    plan: Option<&SeedPlan>,
+) -> Vec<(PathBuf, String)> {
     // "a Rust project" / "this project" -- the only language-dependent
     // phrase in the agent role text.
     let project_desc = match kind.language() {
@@ -899,8 +903,7 @@ mod tests {
         // AC3: root exists but no probed bucket is usable → error, no write.
         let root = tempfile::tempdir().unwrap();
         let proj = tempfile::tempdir().unwrap();
-        let err = plan_seeds(proj.path(), ProjectKind::Rust, root.path(), None)
-            .unwrap_err();
+        let err = plan_seeds(proj.path(), ProjectKind::Rust, root.path(), None).unwrap_err();
         assert!(
             err.to_string().contains("no usable seed buckets"),
             "got: {err}"
@@ -918,10 +921,7 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(
-            err.to_string().contains("does not exist"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("does not exist"), "got: {err}");
     }
 
     #[test]
@@ -931,9 +931,13 @@ mod tests {
         let vendor = proj.path().join("vendor/seeds");
         make_bucket(&vendor, "github");
 
-        let plan =
-            plan_seeds(proj.path(), ProjectKind::Generic, Path::new("vendor/seeds"), None)
-                .unwrap();
+        let plan = plan_seeds(
+            proj.path(),
+            ProjectKind::Generic,
+            Path::new("vendor/seeds"),
+            None,
+        )
+        .unwrap();
         // Serialized path keeps the relative form.
         assert_eq!(plan.entries, vec!["vendor/seeds/github/"]);
     }
@@ -945,9 +949,13 @@ mod tests {
         let vendor = proj.path().join("vendor/seeds");
         make_bucket(&vendor, "github");
 
-        let plan =
-            plan_seeds(proj.path(), ProjectKind::Generic, Path::new("vendor/seeds/"), None)
-                .unwrap();
+        let plan = plan_seeds(
+            proj.path(),
+            ProjectKind::Generic,
+            Path::new("vendor/seeds/"),
+            None,
+        )
+        .unwrap();
         assert_eq!(plan.entries, vec!["vendor/seeds/github/"]);
     }
 
@@ -959,8 +967,7 @@ mod tests {
         make_bucket(&root, "github");
 
         let proj = tempfile::tempdir().unwrap();
-        let plan =
-            plan_seeds(proj.path(), ProjectKind::Generic, &root, Some(home.path())).unwrap();
+        let plan = plan_seeds(proj.path(), ProjectKind::Generic, &root, Some(home.path())).unwrap();
         assert_eq!(plan.entries, vec!["~/seeds/github/"]);
     }
 
@@ -985,8 +992,7 @@ mod tests {
         make_bucket(seed_root.path(), "github");
 
         let proj = tempfile::tempdir().unwrap();
-        let plan =
-            plan_seeds(proj.path(), ProjectKind::Generic, seed_root.path(), None).unwrap();
+        let plan = plan_seeds(proj.path(), ProjectKind::Generic, seed_root.path(), None).unwrap();
 
         let files = render_files(ProjectKind::Generic, Backend::ClaudeCli, Some(&plan));
         let (_, config_yaml) = files
@@ -995,7 +1001,10 @@ mod tests {
             .unwrap();
 
         assert!(config_yaml.contains("seeds:"), "missing seeds: key");
-        assert!(config_yaml.contains("- path: .kuro/"), "missing .kuro/ entry");
+        assert!(
+            config_yaml.contains("- path: .kuro/"),
+            "missing .kuro/ entry"
+        );
         // seeds: section must appear before defaults:
         let seeds_pos = config_yaml.find("seeds:").unwrap();
         let defaults_pos = config_yaml.find("defaults:").unwrap();

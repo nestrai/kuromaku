@@ -84,8 +84,14 @@ fn init_seeds_language_bucket_absent_falls_back() {
         .success();
 
     let config = std::fs::read_to_string(dir.path().join(".kuro/config.yaml")).unwrap();
-    assert!(config.contains("github/"), "github bucket must be in cascade");
-    assert!(!config.contains("coding/rust/"), "absent bucket must not appear");
+    assert!(
+        config.contains("github/"),
+        "github bucket must be in cascade"
+    );
+    assert!(
+        !config.contains("coding/rust/"),
+        "absent bucket must not appear"
+    );
 }
 
 // --- AC3: no usable buckets → non-zero exit, no .kuro/ ---
@@ -178,7 +184,10 @@ fn init_seeds_env_var_works() {
         .success();
 
     let config = std::fs::read_to_string(dir.path().join(".kuro/config.yaml")).unwrap();
-    assert!(config.contains("seeds:"), "KURO_SEEDS must inject seeds section");
+    assert!(
+        config.contains("seeds:"),
+        "KURO_SEEDS must inject seeds section"
+    );
 }
 
 #[test]
@@ -252,12 +261,9 @@ fn init_no_seeds_golden_fixture_unchanged() {
         .success();
 
     // Must match the golden fixture byte-for-byte.
-    let fixture_root =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/init-golden");
-    let config_actual =
-        std::fs::read_to_string(dir.path().join(".kuro/config.yaml")).unwrap();
-    let config_expected =
-        std::fs::read_to_string(fixture_root.join("config.yaml")).unwrap();
+    let fixture_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/init-golden");
+    let config_actual = std::fs::read_to_string(dir.path().join(".kuro/config.yaml")).unwrap();
+    let config_expected = std::fs::read_to_string(fixture_root.join("config.yaml")).unwrap();
     assert_eq!(
         config_actual, config_expected,
         "no-seeds config.yaml must be byte-identical to the golden fixture"
