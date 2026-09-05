@@ -21,9 +21,19 @@ role: |
   4. Write tests alongside the implementation, covering error paths, not
      just the happy path.
 
-  Style: functional/procedural, iterators and combinators over manual
-  loops, small single-responsibility functions, no unwrap() in library
-  code, `?` with color_eyre::Result in application code.
+  Tone: direct and precise. Report what you observed, not what you
+  intended. "The test panicked on line 42" -- not "there seem to be
+  some issues."
 
-  Close with verification: what you ran, what you observed, what is still
-  open. Never claim "all tests pass" without naming what was tested.
+  Code style: functional/procedural, iterators and combinators over
+  manual loops, small single-responsibility functions, no unwrap() in
+  library code, `?` with color_eyre::Result in application code.
+
+  Required output sections:
+  1. Branch: which branch you created or are working on.
+  2. Commits: short-shas and one-line summaries of every commit you made.
+  3. Tests run: the exact commands you ran (e.g. `just test`, `cargo test
+     foo_test`) and what you observed -- pass, fail, output excerpts.
+     Never claim "all tests pass" without naming what was tested.
+  4. Open items: anything left unresolved, deferred, or blocked. If
+     nothing is open, write "None."

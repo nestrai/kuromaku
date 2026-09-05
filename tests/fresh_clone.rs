@@ -9,6 +9,12 @@
 //! The test copies the *tracked* `.kuro/` and `seeds/` trees into a
 //! tempdir -- not the whole working tree -- so it exercises exactly what a
 //! fresh clone ships, isolated from anything else on the host.
+//!
+//! Extended in issue #414:
+//! - `kuro validate` runs clean for all three canonical flows
+//!   (implement-issue, review-pr, rework-pr) without a real $HOME
+//! - every seed directory ships a SEED.md inventory file
+//! - MCP-required step ids are present in the restored flows
 
 #![cfg(unix)]
 
@@ -79,6 +85,19 @@ fn effective_agent_rules(clone_root: &Path) -> BTreeMap<String, Vec<String>> {
             agents.entry(name).or_insert(rules);
             agents
         })
+}
+
+/// Run `kuro validate <flow>` from within the tempdir clone and assert
+/// success. Mirrors what a fresh-clone user runs before starting a flow.
+fn validate_flow(clone_root: &std::path::Path, home: &std::path::Path, flow: &str) {
+    Command::cargo_bin("kuro")
+        .unwrap()
+        .current_dir(clone_root)
+        .args(["validate", flow])
+        .env("HOME", home)
+        .env_remove("RUST_LOG")
+        .assert()
+        .success();
 }
 
 #[test]
@@ -166,4 +185,65 @@ fn tracked_seed_cascade_resolves_without_maintainer_paths() {
             assert!(exists, "agent {agent} references missing rule {rule}");
         }
     }
+}
+
+/// The three canonical flows must each pass `kuro validate` from a fresh
+/// clone with an empty HOME.  This exercises cascade resolution + schema
+/// + role binding without spawning any LLM backend.
+#[test]
+fn canonical_flows_validate_from_fresh_clone() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let clone = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    copy_tracked_seed_files(repo_root, clone.path());
+
+    for flow in ["implement-issue", "review-pr", "rework-pr"] {
+        validate_flow(clone.path(), home.path(), flow);
+    }
+}
+
+/// Every tracked seed directory must ship a SEED.md inventory.
+/// This guards against adding a new seed tier without documenting it.
+#[test]
+fn each_seed_dir_ships_a_seed_md() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    // The project-tier seed (.kuro/) is documented in .kuro/SEED.md.
+    // The stack / common buckets each need their own SEED.md.
+    for seed_dir in [".kuro", "seeds/rust", "seeds/common"] {
+        let seed_md = repo_root.join(seed_dir).join("SEED.md");
+        assert!(
+            seed_md.is_file(),
+            "seed directory {seed_dir}/ must contain a SEED.md file (missing: {})",
+            seed_md.display()
+        );
+    }
+}
+
+/// MCP parser contracts: the step ids that workflow.rs extracts results
+/// from must exist in the restored flow files.  A prompt edit that renames
+/// a required step silently breaks the MCP tool; this test fails in CI
+/// instead.
+#[test]
+fn mcp_required_step_ids_present_in_flows() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+    // review_pr: REVIEW_PR_REQUIRED_STEP_IDS = ["consensus"]
+    let review_pr =
+        std::fs::read_to_string(repo_root.join("seeds/rust/flows/review-pr.yaml")).unwrap();
+    assert!(
+        review_pr.contains("\n  consensus:"),
+        "review-pr.yaml must contain step id 'consensus' (MCP parser anchors on it)"
+    );
+
+    // rework_pr: REWORK_PR_REQUIRED_STEP_IDS = ["fix", "verify"]
+    let rework_pr =
+        std::fs::read_to_string(repo_root.join("seeds/rust/flows/rework-pr.yaml")).unwrap();
+    assert!(
+        rework_pr.contains("\n  fix:"),
+        "rework-pr.yaml must contain step id 'fix' (MCP parser anchors on it)"
+    );
+    assert!(
+        rework_pr.contains("\n  verify:"),
+        "rework-pr.yaml must contain step id 'verify' (MCP parser anchors on it)"
+    );
 }

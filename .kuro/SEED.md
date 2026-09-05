@@ -35,10 +35,11 @@ source -- run `kuro context` for the full picture.
 ## What the lower-priority in-repo seeds provide
 
 - `seeds/rust/` -- the Rust-stack bucket: the generic developer /
-  reviewer / architect personas (`Noah`, `Bella`, `Levi`) and the
-  example `implement-issue` graph flow.
+  reviewer / architect personas (`Noah`, `Bella`, `Levi`), the example
+  `implement-issue` graph flow, and the two canonical GitHub PR lifecycle
+  flows (`review-pr`, `rework-pr`). See `seeds/rust/SEED.md`.
 - `seeds/common/` -- the cross-cutting bucket: facilitator and
-  fetcher personas (`Mika`, `Minion`).
+  fetcher personas (`Mika`, `Minion`). See `seeds/common/SEED.md`.
 
 These are sanitized, self-contained copies (#398): the tracked
 cascade resolves from a fresh clone with no external directories.
