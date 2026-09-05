@@ -362,6 +362,13 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
+/// Wrap a string in YAML double-quotes, escaping backslashes and inner
+/// double-quotes. Prevents a seed path containing ` : ` or ` #` from
+/// producing syntactically broken YAML when inlined into the config template.
+fn yaml_quoted(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// Render the starter files as (relative path, contents) pairs. Pure --
 /// no filesystem access -- so the unit tests can feed the rendered strings
 /// straight into the production loaders.
@@ -396,7 +403,7 @@ fn render_files(
         Some(p) => {
             let mut s = String::from("seeds:\n  - path: .kuro/\n");
             for entry in &p.entries {
-                s.push_str(&format!("  - path: {entry}\n"));
+                s.push_str(&format!("  - path: {}\n", yaml_quoted(entry)));
             }
             s
         }
