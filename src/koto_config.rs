@@ -392,7 +392,11 @@ impl Seeds {
 
     /// Build from raw config entries. Validates each entry has exactly one
     /// of `path:` / `repo:`, and that local paths exist on disk.
-    fn from_raw_entries(raw: &[RawSeed]) -> Result<Self, KotoConfigError> {
+    ///
+    /// Relative paths are resolved against `base_dir`, not the process CWD.
+    /// This matters when the config is loaded by MCP discovery with a
+    /// caller-supplied project directory rather than the daemon CWD.
+    fn from_raw_entries(raw: &[RawSeed], base_dir: &Path) -> Result<Self, KotoConfigError> {
         if raw.is_empty() {
             return Err(KotoConfigError::Validation(
                 "seeds list must contain at least one entry".to_string(),
@@ -421,7 +425,15 @@ impl Seeds {
                         )));
                     }
                     let expanded = expand_tilde(path_str);
-                    if !expanded.exists() {
+                    // Relative paths must be resolved against the config file's
+                    // directory, not the process CWD, so that MCP discovery
+                    // (which passes an explicit project dir) resolves correctly.
+                    let resolved = if expanded.is_relative() {
+                        base_dir.join(&expanded)
+                    } else {
+                        expanded
+                    };
+                    if !resolved.exists() {
                         return Err(KotoConfigError::Validation(format!(
                             "seed path \"{path_str}\" does not exist"
                         )));
@@ -429,7 +441,7 @@ impl Seeds {
                     Seed {
                         source: SeedSource::Local {
                             display: path_str.to_string(),
-                            path: expanded,
+                            path: resolved,
                         },
                     }
                 }
@@ -499,6 +511,22 @@ impl Seeds {
     }
 }
 
+/// Inverse of [`expand_tilde`]: replace an absolute path that starts with
+/// `home/` (or equals `home`) with a `~/`-prefixed string.
+///
+/// Returns `None` when `path` is not under `home` or `home` is not a prefix.
+/// Pure -- `home` is injected by the caller so tests can verify without
+/// touching the real `$HOME`.
+pub(crate) fn contract_tilde(path: &Path, home: &Path) -> Option<String> {
+    path.strip_prefix(home).ok().map(|rel| {
+        if rel.as_os_str().is_empty() {
+            "~".to_string()
+        } else {
+            format!("~/{}", rel.display())
+        }
+    })
+}
+
 /// Expand a leading `~/` or bare `~` to `$HOME`. Returns the input as a
 /// `PathBuf` unchanged when no tilde is present or `$HOME` cannot be located.
 fn expand_tilde(path: &str) -> PathBuf {
@@ -533,7 +561,7 @@ impl KotoConfig {
         let path = dir.join(KOTO_CONFIG_FILE);
         if path.exists() {
             let contents = std::fs::read_to_string(&path)?;
-            return Ok(Some(Self::from_yaml_str(&contents)?));
+            return Ok(Some(Self::parse_in_dir(&contents, dir)?));
         }
         // Legacy 1: `.koto/config.yaml` -- former canonical path before the
         // `.kuro/` rename. Falls back transparently for one migration cycle.
@@ -541,7 +569,7 @@ impl KotoConfig {
         if legacy_koto.exists() {
             eprintln!("warning: {KOTO_CONFIG_FILE_LEGACY_KOTO} is deprecated, run: mv .koto .kuro");
             let contents = std::fs::read_to_string(&legacy_koto)?;
-            let cfg = Self::from_yaml_str(&contents)?;
+            let cfg = Self::parse_in_dir(&contents, dir)?;
             return Ok(Some(rebase_default_seeds_for_legacy(cfg)));
         }
         // Legacy 2: pre-`.koto/` layout -- config in the repo root. Kept
@@ -553,13 +581,17 @@ impl KotoConfig {
                 "warning: {KOTO_CONFIG_FILE_LEGACY_ROOT} is deprecated, move config to {KOTO_CONFIG_FILE}"
             );
             let contents = std::fs::read_to_string(&legacy_root)?;
-            let cfg = Self::from_yaml_str(&contents)?;
+            let cfg = Self::parse_in_dir(&contents, dir)?;
             return Ok(Some(rebase_default_seeds_for_legacy(cfg)));
         }
         Ok(None)
     }
 
-    pub fn from_yaml_str(contents: &str) -> Result<Self, KotoConfigError> {
+    /// Parse config YAML and resolve relative seed paths against `base_dir`.
+    ///
+    /// All internal callers that know the project directory should use this
+    /// variant so that relative seed paths work regardless of process CWD.
+    fn parse_in_dir(contents: &str, base_dir: &Path) -> Result<Self, KotoConfigError> {
         let raw: RawKotoConfig = serde_yaml::from_str(contents)?;
 
         for key in raw.unknown.keys() {
@@ -578,8 +610,6 @@ impl KotoConfig {
             )));
         }
 
-        // Iterate in sorted order so error messages for invalid tiers are
-        // deterministic across runs -- HashMap iteration order is not stable.
         let mut tier_names: Vec<&String> = raw.tiers.keys().collect();
         tier_names.sort();
         for tier_name in tier_names {
@@ -591,7 +621,6 @@ impl KotoConfig {
             validate_model_format(&raw.tiers[tier_name])?;
         }
 
-        // Validate roles in sorted order for deterministic error messages.
         let mut role_names: Vec<&String> = raw.roles.keys().collect();
         role_names.sort();
         let mut roles: HashMap<String, KotoRole> = HashMap::new();
@@ -628,12 +657,8 @@ impl KotoConfig {
             );
         }
 
-        // Seeds: when the section is absent we use the `.koto/` default to
-        // preserve v0 behavior. Explicit empty list (`seeds: []`) is rejected
-        // because it would point lookups nowhere -- the user almost certainly
-        // meant to write actual entries.
         let seeds = match raw.seeds {
-            Some(entries) => Seeds::from_raw_entries(&entries)?,
+            Some(entries) => Seeds::from_raw_entries(&entries, base_dir)?,
             None => Seeds::default_local(),
         };
 
@@ -645,6 +670,18 @@ impl KotoConfig {
             roles,
             seeds,
         })
+    }
+
+    /// Parse config YAML. Relative seed paths are resolved against the process
+    /// CWD. Prefer [`KotoConfig::parse_in_dir`] when the project directory is
+    /// known so that relative seeds work regardless of the caller's CWD.
+    // Used extensively in #[cfg(test)] blocks; the binary has no non-test
+    // callers because all production load paths go through load_optional which
+    // calls parse_in_dir directly.
+    #[allow(dead_code)]
+    pub fn from_yaml_str(contents: &str) -> Result<Self, KotoConfigError> {
+        let base = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        Self::parse_in_dir(contents, &base)
     }
 
     /// Project-level role bindings as a plain `role -> agent` map.
@@ -1981,5 +2018,39 @@ roles:
 ";
         let err = KotoConfig::from_yaml_str(yaml).unwrap_err();
         assert!(err.to_string().contains("empty entry"), "got: {err}");
+    }
+
+    // --- contract_tilde ---
+
+    #[test]
+    fn contract_tilde_path_under_home() {
+        let home = std::path::PathBuf::from("/home/user");
+        let path = std::path::PathBuf::from("/home/user/seeds/github");
+        assert_eq!(
+            super::contract_tilde(&path, &home),
+            Some("~/seeds/github".to_string())
+        );
+    }
+
+    #[test]
+    fn contract_tilde_equals_home() {
+        let home = std::path::PathBuf::from("/home/user");
+        assert_eq!(super::contract_tilde(&home, &home), Some("~".to_string()));
+    }
+
+    #[test]
+    fn contract_tilde_not_under_home() {
+        let home = std::path::PathBuf::from("/home/user");
+        let path = std::path::PathBuf::from("/other/path");
+        assert_eq!(super::contract_tilde(&path, &home), None);
+    }
+
+    #[test]
+    fn contract_tilde_partial_match_not_contracted() {
+        // /home/username does not start with /home/user/ -- strip_prefix
+        // requires a full path component match, not a string prefix.
+        let home = std::path::PathBuf::from("/home/user");
+        let path = std::path::PathBuf::from("/home/username/data");
+        assert_eq!(super::contract_tilde(&path, &home), None);
     }
 }

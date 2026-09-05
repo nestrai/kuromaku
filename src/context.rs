@@ -105,10 +105,20 @@ pub struct SeedContribution {
     /// Absolute filesystem path for local seeds, `None` for remote.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
-    /// `true` for local seeds whose directory exists on disk, `false`
-    /// for local seeds that resolve to a missing path. Always `false`
-    /// for remote seeds (not fetched in v1).
+    /// `true` when the local seed directory exists on disk (`path.is_dir()`).
+    /// `false` for local seeds that resolve to a missing path and always
+    /// `false` for remote seeds (not fetched in v1).
+    ///
+    /// Stable v1 wire field -- semantics must not change without a schema
+    /// version bump. Use [`SeedContribution::usable`] to test whether the
+    /// directory contains recognised seed content.
     pub exists: bool,
+    /// `true` when `exists` is `true` **and** the directory contains at
+    /// least one of `agents/`, `rules/`, or `flows/` (i.e. `is_seed_dir`
+    /// returns `true`). Enumeration and `SEED.md` loading are gated on
+    /// this field, not on `exists`, so a bare directory that holds no
+    /// seed content is surfaced to the user without being walked.
+    pub usable: bool,
     /// Verbatim contents of the seed-root `SEED.md` if present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed_md: Option<String>,
@@ -222,7 +232,13 @@ pub fn render_human(ctx: &ResolvedContext, out: &mut dyn Write) -> io::Result<()
     writeln!(out, "Seeds (top wins on conflict):")?;
     for (i, seed) in ctx.seeds.iter().enumerate() {
         let idx = i + 1;
-        let exists_tag = if seed.exists { "exists" } else { "missing" };
+        let exists_tag = if seed.usable {
+            "usable"
+        } else if seed.exists {
+            "exists, no seed content"
+        } else {
+            "missing"
+        };
         writeln!(
             out,
             "  [{idx}] {display:<38} ({kind}, {exists_tag})",
@@ -350,6 +366,24 @@ fn write_effective_section(
     writeln!(out, "  {label} ({}): {}", items.len(), rendered.join(", "))
 }
 
+// --- Seed presence check ---
+
+/// Names of subdirectories whose presence marks a directory as a usable seed.
+/// Shared between `context` (inventory) and `init` (planning) so the two sites
+/// cannot drift when subdirectory naming changes.
+pub(crate) const SEED_SUBDIRS: [&str; 3] = ["agents", "rules", "flows"];
+
+/// Returns `true` when `path` is an existing directory that contains at least
+/// one standard seed subdirectory (`agents/`, `rules/`, or `flows/`).
+///
+/// Used by `kuro init --seeds` to skip buckets that exist on disk but hold
+/// no seed content. A bucket with all three subdirectories present but empty
+/// still passes -- the loose predicate keeps the check reversible (tightening
+/// later breaks no one; loosening would invalidate configs already written).
+pub(crate) fn is_seed_dir(path: &Path) -> bool {
+    path.is_dir() && SEED_SUBDIRS.iter().any(|sub| path.join(sub).is_dir())
+}
+
 // --- Seed discovery ---
 
 /// Load the project's seed list, falling back to the implicit local
@@ -392,18 +426,19 @@ fn seed_contribution(seed: &Seed, project_roles: &HashMap<String, String>) -> Se
     match &seed.source {
         SeedSource::Local { display, path } => {
             let exists = path.is_dir();
-            let seed_md = if exists { read_seed_md(path) } else { None };
-            let agents = if exists {
+            let usable = is_seed_dir(path);
+            let seed_md = if usable { read_seed_md(path) } else { None };
+            let agents = if usable {
                 enumerate_agents_in_seed(path, display)
             } else {
                 Vec::new()
             };
-            let rules = if exists {
+            let rules = if usable {
                 enumerate_rules_in_seed(path, display)
             } else {
                 Vec::new()
             };
-            let flows = if exists {
+            let flows = if usable {
                 enumerate_flows_in_seed(path, display, project_roles)
             } else {
                 Vec::new()
@@ -413,6 +448,7 @@ fn seed_contribution(seed: &Seed, project_roles: &HashMap<String, String>) -> Se
                 kind: "local",
                 path: Some(path.clone()),
                 exists,
+                usable,
                 seed_md,
                 agents,
                 rules,
@@ -430,6 +466,7 @@ fn seed_contribution(seed: &Seed, project_roles: &HashMap<String, String>) -> Se
                 kind: "remote",
                 path: None,
                 exists: false,
+                usable: false,
                 seed_md: None,
                 agents: Vec::new(),
                 rules: Vec::new(),
@@ -932,6 +969,7 @@ mod tests {
             !seed.exists,
             "default .kuro/ in empty tempdir does not exist"
         );
+        assert!(!seed.usable, "non-existent .kuro/ must not be usable");
         assert!(seed.agents.is_empty());
         assert!(seed.rules.is_empty());
         assert!(seed.flows.is_empty());
@@ -1055,8 +1093,7 @@ mod tests {
         let seed = tmp.path().join("seed");
         let body = "## seed\n\nHello.\n";
         write(&seed.join("SEED.md"), body);
-        // Need an agents/ dir (or any dir) so `exists` is true and the
-        // walk runs.
+        // Need an agents/ dir so `usable` is true and the walk runs.
         fs::create_dir_all(seed.join("agents")).unwrap();
         let contribution = seed_contribution_no_roles(&Seed {
             source: SeedSource::Local {
@@ -1670,6 +1707,7 @@ mod tests {
         assert_eq!(contribution.kind, "remote");
         assert!(contribution.path.is_none());
         assert!(!contribution.exists);
+        assert!(!contribution.usable);
         assert!(contribution.agents.is_empty());
         assert!(contribution.rules.is_empty());
         assert!(contribution.flows.is_empty());
@@ -1770,5 +1808,42 @@ mod tests {
             }
             other => panic!("expected remote, got {other:?}"),
         }
+    }
+
+    // --- is_seed_dir ---
+
+    #[test]
+    fn is_seed_dir_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // Missing path → false.
+        assert!(!is_seed_dir(&root.join("nonexistent")));
+
+        // Existing file (not dir) → false.
+        fs::write(root.join("afile"), "").unwrap();
+        assert!(!is_seed_dir(&root.join("afile")));
+
+        // Empty dir (no subdirs) → false.
+        fs::create_dir(root.join("empty")).unwrap();
+        assert!(!is_seed_dir(&root.join("empty")));
+
+        // Dir with only an `agents/` subdir → true.
+        fs::create_dir_all(root.join("with-agents/agents")).unwrap();
+        assert!(is_seed_dir(&root.join("with-agents")));
+
+        // Dir with only a `rules/` subdir → true.
+        fs::create_dir_all(root.join("with-rules/rules")).unwrap();
+        assert!(is_seed_dir(&root.join("with-rules")));
+
+        // Dir with only a `flows/` subdir → true.
+        fs::create_dir_all(root.join("with-flows/flows")).unwrap();
+        assert!(is_seed_dir(&root.join("with-flows")));
+
+        // Dir with all three subdirs → true.
+        fs::create_dir_all(root.join("full/agents")).unwrap();
+        fs::create_dir_all(root.join("full/rules")).unwrap();
+        fs::create_dir_all(root.join("full/flows")).unwrap();
+        assert!(is_seed_dir(&root.join("full")));
     }
 }

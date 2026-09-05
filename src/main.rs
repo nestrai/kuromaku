@@ -104,6 +104,21 @@ enum Command {
         /// Currently a no-op -- init never prompts.
         #[arg(long, short = 'y')]
         yes: bool,
+
+        /// Root of a local seed library (e.g. `--seeds vendor/kuromaku-seeds`).
+        ///
+        /// Probes for usable language, GitHub and common buckets under ROOT
+        /// and injects a `seeds:` cascade into the generated `.kuro/config.yaml`.
+        /// Relative paths are resolved against the current directory.
+        ///
+        /// Falls back to the `KURO_SEEDS` environment variable when this flag
+        /// is absent. An empty `KURO_SEEDS=""` is treated as unset. The flag
+        /// always takes precedence over the environment variable.
+        ///
+        /// If the root or every probed bucket is absent, init exits non-zero
+        /// without writing anything.
+        #[arg(long, value_name = "ROOT")]
+        seeds: Option<PathBuf>,
     },
     /// Run a flow
     Run(RunArgs),
@@ -284,7 +299,16 @@ async fn main() -> Result<()> {
         // `yes` is a forward-compatibility no-op (see the arg doc); the
         // underscore keeps the destructuring exhaustive so a future field
         // does not get silently ignored here.
-        Command::Init { yes: _ } => init::run(Path::new("."))?,
+        Command::Init { yes: _, seeds } => {
+            // Flag takes precedence over the environment variable.
+            // Empty KURO_SEEDS="" is treated as unset (filter it out).
+            let seed_root = seeds.or_else(|| {
+                std::env::var_os("KURO_SEEDS")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            });
+            init::run(Path::new("."), seed_root.as_deref())?
+        }
         Command::Run(args) => run_flow(&args).await?,
         Command::Resume {
             run_id,
