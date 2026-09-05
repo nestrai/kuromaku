@@ -635,6 +635,29 @@ pub fn legacy_stack_root() -> PathBuf {
         .join("stacks")
 }
 
+/// Return `canonical_run` when it exists, otherwise locate the same run
+/// below the legacy root. New runs always use [`stack_root`]; this is only a
+/// read-side compatibility bridge for pre-#398 run history.
+pub fn existing_run_path(canonical_run: &Path) -> PathBuf {
+    existing_run_path_in_roots(canonical_run, &stack_root(), &legacy_stack_root())
+}
+
+fn existing_run_path_in_roots(
+    canonical_run: &Path,
+    canonical_root: &Path,
+    legacy_root: &Path,
+) -> PathBuf {
+    if canonical_run.is_dir() {
+        return canonical_run.to_path_buf();
+    }
+    canonical_run
+        .strip_prefix(canonical_root)
+        .ok()
+        .map(|relative| legacy_root.join(relative))
+        .filter(|legacy_run| legacy_run.is_dir())
+        .unwrap_or_else(|| canonical_run.to_path_buf())
+}
+
 /// One-time-per-invocation notice for users with pre-#398 run history.
 /// Returns `Some` when the legacy root exists and is non-empty. The data
 /// is deliberately NOT auto-migrated -- moving user data without asking
@@ -653,7 +676,7 @@ fn legacy_notice_for(legacy: &Path, canonical: &Path) -> Option<String> {
     non_empty.then(|| {
         format!(
             "notice: legacy stack data found at {legacy} -- new runs write to {canonical}; \
-             old runs stay readable in place. Migrate manually with: mv {legacy}/* {canonical}/",
+             old runs stay readable in place. Migrate manually with: mkdir -p {canonical} && mv {legacy}/* {canonical}/",
             legacy = legacy.display(),
             canonical = canonical.display(),
         )
@@ -1544,6 +1567,24 @@ mod tests {
             "legacy_stack_root must end with .koto/stacks, got {}",
             root.display()
         );
+    }
+
+    #[test]
+    fn existing_run_path_falls_back_to_legacy_root() {
+        let home = tempfile::tempdir().unwrap();
+        let canonical = home.path().join(".kuro/stacks");
+        let legacy = home.path().join(".koto/stacks");
+        let run = canonical.join("project/run-id");
+        let legacy_run = legacy.join("project/run-id");
+        std::fs::create_dir_all(&legacy_run).unwrap();
+
+        assert_eq!(
+            existing_run_path_in_roots(&run, &canonical, &legacy),
+            legacy_run
+        );
+
+        std::fs::create_dir_all(&run).unwrap();
+        assert_eq!(existing_run_path_in_roots(&run, &canonical, &legacy), run);
     }
 
     #[test]

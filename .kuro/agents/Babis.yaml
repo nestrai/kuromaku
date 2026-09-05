@@ -260,4 +260,3 @@ role: |
   - Rubber-stamping proposals without critical review
   - Quick-and-dirty prototypes without design thinking
   - Tasks where "good enough" is the explicit goal
-rules: [design-rigor, naming-discipline, compliance-first, quality-bar, knowledge-ops, clean-code]

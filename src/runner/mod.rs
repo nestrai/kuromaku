@@ -3781,7 +3781,7 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
         // v1 (#338); the v1 invocation is `kuro resume <run-id>` from
         // the same project the original run was started in.
         let stack_path = resolve_stack_path("");
-        let run_path = stack_path.join(run_id);
+        let run_path = stack::existing_run_path(&stack_path.join(run_id));
         if !run_path.is_dir() {
             return Err(eyre!(
                 "run-id '{run_id}' not found under {}\n\nhint: run `ls {}` to see available runs",

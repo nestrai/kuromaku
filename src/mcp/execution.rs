@@ -344,8 +344,13 @@ impl Tool for ShowOutput {
 }
 
 fn do_show_output(stack_path: &Path, run_id: &str, step: Option<&str>) -> Result<Value, McpError> {
-    let outputs = stack::read_run(stack_path, run_id, step)
-        .map_err(|e| internal(format!("read run: {e}")))?;
+    let run_path = stack::existing_run_path(&stack_path.join(run_id));
+    let outputs = stack::read_run(
+        run_path.parent().expect("run path always has a parent"),
+        run_id,
+        step,
+    )
+    .map_err(|e| internal(format!("read run: {e}")))?;
     if outputs.status == RunStatus::NotFound {
         return Err(McpError::with_details(
             McpErrorCode::RunNotFound,
