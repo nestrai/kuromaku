@@ -597,9 +597,10 @@ mod tests {
 
     #[test]
     fn build_claude_command_strips_claude_tier_provider() {
-        let cmd = build_claude_command("claude/haiku-4-5", None, "write tests", &[]);
-        assert!(cmd.contains("haiku-4-5"));
-        assert!(!cmd.contains("claude/haiku-4-5"));
+        let cmd =
+            build_claude_command("claude/claude-haiku-4-5-20251001", None, "write tests", &[]);
+        assert!(cmd.contains("claude-haiku-4-5-20251001"));
+        assert!(!cmd.contains("claude/claude-haiku-4-5-20251001"));
     }
 
     #[test]
