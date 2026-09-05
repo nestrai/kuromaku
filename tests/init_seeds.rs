@@ -288,13 +288,21 @@ fn init_seeds_context_resolves_written_cascade() {
         .assert()
         .success();
 
-    // kuro context must succeed -- it reads the seeds: section and resolves paths.
-    kuro()
+    // kuro context must succeed and the github bucket must appear in the JSON
+    // output -- a silently-dropped seeds: block would pass a bare .success()
+    // check while making AC10 meaningless.
+    let out = kuro()
         .current_dir(dir.path())
         .args(["context", "--format", "json"])
         .env_remove("RUST_LOG")
-        .assert()
-        .success();
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "kuro context exited non-zero");
+    let json = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        json.contains("github"),
+        "github bucket must appear in context JSON, got: {json}"
+    );
 }
 
 // --- Relative --seeds path ---
