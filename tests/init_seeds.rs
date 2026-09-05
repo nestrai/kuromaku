@@ -31,6 +31,25 @@ fn kuro() -> Command {
     Command::cargo_bin("kuro").unwrap()
 }
 
+/// Apply the same tilde contraction that `init` applies when writing seed
+/// paths to `config.yaml`. Paths under `$HOME` are written as `~/...`;
+/// everything else is written verbatim as an absolute path.
+///
+/// Use this instead of `.display().to_string()` in assertions that compare
+/// against the written config, because `tempfile::TempDir` can land under
+/// `$HOME` on GitHub Actions (TMPDIR inside HOME), making raw absolute-path
+/// assertions fail on CI while passing locally.
+fn written_form(p: &std::path::Path) -> String {
+    let abs = p.display().to_string();
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => match abs.strip_prefix(&home) {
+            Some(rest) => format!("~{rest}"),
+            None => abs,
+        },
+        _ => abs,
+    }
+}
+
 // --- AC1: Rust project + full seed library → documented cascade ---
 
 #[test]
@@ -209,15 +228,17 @@ fn init_seeds_flag_wins_over_env() {
         .success();
 
     let config = std::fs::read_to_string(dir.path().join(".kuro/config.yaml")).unwrap();
-    // The flag seed's path appears in the cascade.
+    // The flag seed's path appears in the cascade. Use written_form() so the
+    // assertion matches the tilde-contracted form init writes when TMPDIR is
+    // under HOME (the GitHub Actions condition that caused CI failures).
     assert!(
-        config.contains(&flag_seeds.path().display().to_string()),
-        "flag seed path must be in cascade"
+        config.contains(&written_form(flag_seeds.path())),
+        "flag seed path must be in cascade; config was:\n{config}"
     );
     // The env seed's path does not appear.
     assert!(
-        !config.contains(&env_seeds.path().display().to_string()),
-        "env seed path must not appear when flag wins"
+        !config.contains(&written_form(env_seeds.path())),
+        "env seed path must not appear when flag wins; config was:\n{config}"
     );
 }
 
