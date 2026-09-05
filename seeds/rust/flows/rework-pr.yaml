@@ -1,0 +1,327 @@
+# Apply PR review feedback as fixup commits: fetch -> fix -> verify -> push.
+#
+# Topology: linear, 4 steps (fetch, fix, verify, push).
+# fix applies Blocking comments as fixup commits; verify reads the diffs to
+# confirm resolution; push is gated on FINAL_VERDICT from verify.
+#
+# Usage: kuro run rework-pr --var id=119
+# MCP:   rework_pr {"pr": 119}  (bare_args map id -> {{vars.id}})
+#
+# MCP parser contracts (workflow.rs must stay in sync):
+#   - step ids "fix" and "verify" must exist: REWORK_PR_REQUIRED_STEP_IDS pins them
+#   - fix must emit "- Fixup SHA: <sha>" bullets (parse_fixup_shas reads these)
+#   - fix must emit "- Deferred suggestions: N" in its Summary (parse_summary_count)
+#   - verify must emit "FINAL_VERDICT: DONE" or "FINAL_VERDICT: INCOMPLETE" exactly
+#     once (in the Summary section only -- the parser has no dedup guard, so do
+#     not quote the literal token elsewhere in the task body outside the Summary)
+#   - verify's early-exit path (NO_REVIEW_COMMENTS) must also emit FINAL_VERDICT: DONE
+#   Renaming these step ids or removing those output tokens breaks MCP extraction.
+version: "1"
+name: rework-pr
+prompt: |
+  Apply the review feedback on PR #{{vars.id}} as fixup commits in this repository.
+
+roles:
+  fetcher:
+    default: Minion
+  developer:
+    default: Noah
+  reviewer:
+    default: Bella
+
+flow:
+  fetch:
+    role: fetcher
+    task: |
+      Fetch everything needed to rework PR #{{vars.id}}. Run, in order:
+
+      - gh pr view {{vars.id}}
+      - gh pr view {{vars.id}} --json headRefName,headRefOid,baseRefName
+      - gh pr diff {{vars.id}}
+      - gh api repos/{owner}/{repo}/pulls/{{vars.id}}/comments
+      - gh api repos/{owner}/{repo}/issues/{{vars.id}}/comments
+
+      Two types of review comments exist:
+
+      1. INLINE comments (`pulls/.../comments`) -- anchored to a
+         specific file:line in the diff. Each carries `path`, `line`
+         (or `original_line`), `commit_id`, `body`, `user.login`.
+      2. GENERAL PR comments (`issues/.../comments`) -- posted on
+         the conversation tab, not anchored to code. Each carries
+         `body`, `user.login`, `created_at`. No `path` or `line`.
+
+      Both are valid review feedback. Fetch both. Preserve all
+      fields. Label each comment's source ("inline" or "general")
+      in the output so downstream steps know which type they have.
+
+      Output the raw results as-is. Do not analyze, do not summarize,
+      do not filter. The downstream steps need the full data.
+
+  fix:
+    role: developer
+    input: [fetch]
+    print_output: true
+    task: |
+      ## Critical scope (read first, re-read at the end)
+
+      Apply the review feedback from PR #{{vars.id}} as fixup commits. Do
+      not commit on main -- always check out the PR branch first.
+
+      ## Step 1: check out the PR branch (mandatory)
+
+      Run `gh pr checkout {{vars.id}}` before doing anything else.
+
+      If checkout fails (dirty worktree, conflicts, missing remote,
+      etc.): STOP. Report the failure verbatim and exit. Do NOT
+      stash, do NOT force, do NOT continue on whatever branch you
+      happen to be on. A silent stash hides work and risks data loss.
+
+      ## Step 2: handle the no-comments case
+
+      If BOTH comment sources from fetch (inline and general) are
+      empty arrays, or contain zero unresolved comments addressed to
+      the author, output exactly this single line and stop:
+
+          NO_REVIEW_COMMENTS
+
+      Do not create any commits. Do not push. The verify step maps
+      this sentinel to FINAL_VERDICT: DONE.
+
+      ## Step 3: classify every comment
+
+      For each comment from fetch (inline or general), classify it:
+
+      - Blocking: bug, regression, missing error handling on a
+        production path, factually wrong code, broken test.
+      - Suggestion: better-but-not-required design or naming choice,
+        a different pattern, a "could also do X".
+      - Nit: pure formatting, comment wording, ordering.
+
+      Address ALL Blocking comments. DEFER Suggestions and Nits with
+      a one-sentence reason for each. Do not silently ignore them.
+
+      ## Step 4: fix Blocking comments
+
+      For each Blocking comment, in order:
+
+      1. Read the cited file at the cited line, plus 10 lines of
+         surrounding context. For general comments that reference
+         file:line in their body text, find and read those locations.
+         Never fix blind from the comment text alone -- the line may
+         already differ from when the comment was written.
+      2. Make the smallest change that resolves the concern. No
+         feature creep. No "while I'm here" refactors.
+      3. Stage only the files you changed.
+      4. Create a fixup commit:
+         - Inline comments: `git commit --fixup=<comment.commit_id>`
+           (commit_id comes from the inline-comments API response).
+         - General comments: `git commit --fixup=HEAD` (no specific
+           commit anchor; target the branch head).
+
+      ## Required output format
+
+      For each comment processed, output:
+
+      ### Comment by @<user> on <path>:<line> (inline) | (general)
+      - Severity: Blocking | Suggestion | Nit
+      - Action: Fixed | Deferred | Skipped (nit)
+      - Fixup SHA: <short-sha or "n/a">
+      - Reasoning: [one sentence -- why this fix, or why deferred]
+
+      End with:
+
+      ### Summary
+      - Blocking addressed: N / M
+      - Deferred suggestions: N
+      - Skipped nits: N
+      - New fixup commits: N
+
+      ## Anti-pattern (do not produce this)
+
+      BAD: "Applied all review feedback. All fixups created."
+      Why bad: No per-comment classification, no fixup SHAs, no
+      deferral reasoning. The verify step cannot check correctness
+      from this.
+
+      GOOD: "Comment by @reviewer on src/runner.rs:88. Severity:
+      Blocking. Action: Fixed. Fixup SHA: a1b2c3d. Reasoning:
+      replaced unwrap with `?` so the missing-config path returns
+      ConfigError instead of panicking."
+
+      ## Final check (anti-sycophancy)
+
+      Before submitting: are all your fixes actual code changes that
+      a reviewer would accept, or did you reword the comment as a
+      code comment and call it fixed? If any "fix" is just a
+      comment, redo it.
+
+      REMINDER: never commit on main. If you are on main when you
+      are about to commit, stop and report.
+
+  verify:
+    role: reviewer
+    input: [fetch, fix]
+    print_output: true
+    task: |
+      ## Critical scope (read first, re-read at the end)
+
+      Verify that the fixup commits from the fix step ACTUALLY
+      resolve the Blocking review comments from fetch. Read the
+      diff. Do not trust the fix step's self-report.
+
+      Use the output format defined in this task. The downstream
+      push step depends on finding `FINAL_VERDICT: DONE` or
+      `FINAL_VERDICT: INCOMPLETE` exactly as specified below. This
+      exact prefix appears once in your output (Summary section
+      only).
+
+      ## No-comments early exit
+
+      If fix output is exactly the line `NO_REVIEW_COMMENTS`, output:
+
+          ### Summary
+          - Blocking comments: 0
+          - FINAL_VERDICT: DONE
+
+      and stop. Nothing else to verify.
+
+      ## How to verify
+
+      1. List the fixup commits ahead of the base branch:
+         `git log --oneline origin/$(gh pr view {{vars.id}} --json baseRefName -q .baseRefName)..HEAD`
+         Confirm they all start with `fixup!`.
+      2. For each Blocking comment from fetch:
+         a. Locate the corresponding fixup (by `commit_id` or by
+            file:line in the diff).
+         b. Read the diff: `git show <fixup-sha>`.
+         c. Read the cited file at the cited line POST-fixup.
+         d. Decide: does the change resolve the concern raised in
+            the comment, or only paper over it?
+
+      Clean code that does NOT resolve the comment is INCOMPLETE.
+      A messy fix that does resolve it is DONE.
+
+      ## Required output format
+
+      For each Blocking comment, output exactly:
+
+      ### Comment by @<user> on <path>:<line> (inline) | (general)
+      - Concern: [what the reviewer asked for]
+      - Fixup: <short-sha or "missing">
+      - Diff check: [what the fixup actually changed]
+      - Resolves concern: yes | no -- [one sentence]
+
+      End with:
+
+      ### Summary
+      - Blocking comments: N
+      - Resolved: N
+      - Unresolved: [list of file:line or "none"]
+      - FINAL_VERDICT: DONE | INCOMPLETE
+
+      The `FINAL_VERDICT:` line must appear exactly once and on its
+      own line. Do not repeat the literal token elsewhere in your
+      response.
+
+      ## Severity rules for the verdict
+
+      - DONE: every Blocking comment has a fixup that materially
+        resolves it. Deferred Suggestions/Nits do not block DONE.
+      - INCOMPLETE: at least one Blocking comment lacks a fixup, or
+        has a fixup that does not actually resolve the concern.
+
+      ## Few-shot examples
+
+      GOOD: "Comment by @reviewer on src/runner.rs:88. Concern:
+      unwrap() will panic on missing config. Fixup: a1b2c3d. Diff
+      check: replaced `unwrap()` with `?` and added ConfigError
+      variant. Resolves concern: yes -- the panic path is gone."
+
+      GOOD: "Comment by @reviewer on src/dag.rs:124. Concern: cycle
+      detection broken. Fixup: missing. Diff check: no fixup found
+      for this commit_id. Resolves concern: no -- the bug is still
+      present."
+
+      ## Anti-patterns (do not do this)
+
+      BAD: "All fixups created. DONE."
+      Why bad: No per-comment check, no diff inspection.
+
+      BAD: "Looks like the issues were addressed. PASS."
+      Why bad: Wrong verdict token, no evidence.
+
+      ## Final check
+
+      If every Blocking comment shows "Resolves concern: yes" but
+      you did not actually open `git show` for any of them, redo
+      the verification. The verdict has to be evidence-based.
+
+      REMINDER: clean code that does the wrong thing is INCOMPLETE.
+
+  push:
+    role: developer
+    input: [verify]
+    print_output: true
+    task: |
+      Check the verify step's verdict. Look for the line
+      `FINAL_VERDICT: DONE` or `FINAL_VERDICT: INCOMPLETE` (this
+      prefix appears once in the verify output, in the Summary).
+
+      ## Branch DONE: push the fixup commits
+
+      Required pre-push gate: at least one `fixup!` commit must be
+      ahead of `origin/$branch`. Run:
+
+          git log --oneline origin/$(gh pr view {{vars.id}} --json headRefName -q .headRefName)..HEAD
+
+      Count the lines whose subject starts with `fixup!`. If zero,
+      do NOT push. Output:
+
+          Nothing to push -- no fixup commits ahead of origin.
+
+      and stop. (This is the no-comments early-exit case.)
+
+      If at least one fixup commit is present, push atomically:
+
+          branch=$(gh pr view {{vars.id}} --json headRefName -q .headRefName) && git push origin "$branch"
+
+      Run that as a single shell statement -- branch resolution and
+      push must be one command so a transient `gh` failure cannot
+      leave you pushing to the wrong branch. After push, output:
+
+      - PR URL
+      - Number of fixup commits pushed
+      - Reminder: run `git rebase --autosquash <baseRef>` after
+        final review approval.
+
+      ## Branch INCOMPLETE: do NOT push
+
+      - Output the unresolved Blocking concerns from verify
+        verbatim.
+      - Output the local fixup SHAs (so the developer can inspect
+        with `git show`).
+      - Output: "Push skipped -- verdict INCOMPLETE. Resolve the
+        items above and rerun rework-pr."
+      - Stop. Do not force, do not push partial work.
+
+      ## Branch unclear: neither token found
+
+      If neither `FINAL_VERDICT: DONE` nor `FINAL_VERDICT:
+      INCOMPLETE` appears in the verify output:
+
+      - Do NOT push.
+      - Output: "Verify verdict unclear. Expected
+        'FINAL_VERDICT: DONE' or 'FINAL_VERDICT: INCOMPLETE' in
+        verify output."
+      - Stop.
+
+      ## Final check (anti-sycophancy)
+
+      Before pushing: did verify cite a specific fixup SHA AND a
+      diff check for every Blocking comment marked resolved? If
+      verify reported DONE without per-comment evidence, treat that
+      as an unclear verdict and refuse to push.
+
+      REMINDER: never push when the verdict is INCOMPLETE or
+      unclear. The fixup commits stay on the local branch -- the
+      developer fixes them and reruns.
