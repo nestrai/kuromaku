@@ -237,7 +237,7 @@ pub fn build_claude_command(
     let mut parts = vec![claude_bin];
     parts.push("--print".to_string());
     parts.push("--model".to_string());
-    parts.push(shell_escape(model));
+    parts.push(shell_escape(claude_cli_model(model)));
     parts.push("--output-format".to_string());
     parts.push("stream-json".to_string());
     parts.push("--verbose".to_string());
@@ -255,6 +255,12 @@ pub fn build_claude_command(
     parts.push(shell_escape(user_prompt));
 
     parts.join(" ")
+}
+
+/// Translate the provider-qualified tier wire format into the model id that
+/// the Claude CLI accepts. Literal agent models remain unchanged.
+fn claude_cli_model(model: &str) -> &str {
+    model.strip_prefix("claude/").unwrap_or(model)
 }
 
 /// Build a `tokio::process::Command` for an interactive Claude CLI session
@@ -297,7 +303,7 @@ pub fn build_claude_interactive_command(
 ) -> tokio::process::Command {
     let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
     let mut cmd = tokio::process::Command::new(claude_bin);
-    cmd.arg("--model").arg(model);
+    cmd.arg("--model").arg(claude_cli_model(model));
     cmd.arg("--input-format").arg("stream-json");
     cmd.arg("--output-format").arg("stream-json");
     cmd.arg("--verbose");
@@ -340,7 +346,7 @@ pub fn build_claude_chat_command(
 ) -> tokio::process::Command {
     let claude_bin = std::env::var("CLAUDE_CLI_PATH").unwrap_or_else(|_| "claude".to_string());
     let mut cmd = tokio::process::Command::new(claude_bin);
-    cmd.arg("--model").arg(model);
+    cmd.arg("--model").arg(claude_cli_model(model));
     let combined_system = compose_claude_system_prompt(system_prompt);
     cmd.arg("--append-system-prompt").arg(combined_system);
     for arg in extra_args {
@@ -587,6 +593,13 @@ mod tests {
         assert!(cmd.contains("--print"));
         assert!(cmd.contains("--system-prompt"));
         assert!(cmd.contains(PREAMBLE_MARKER));
+    }
+
+    #[test]
+    fn build_claude_command_strips_claude_tier_provider() {
+        let cmd = build_claude_command("claude/haiku-4-5", None, "write tests", &[]);
+        assert!(cmd.contains("haiku-4-5"));
+        assert!(!cmd.contains("claude/haiku-4-5"));
     }
 
     #[test]
