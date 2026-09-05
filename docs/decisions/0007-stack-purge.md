@@ -1,5 +1,10 @@
 # ADR-0007: Per-project stack purge
 
+> Note (#398, ADR-0010): the canonical stack root has since moved to
+> `~/.kuro/stacks/`; the `~/.koto/stacks/` paths below are the legacy
+> location, which `kuro stack purge` still reaches via fallback. The
+> purge semantics decided here are unchanged.
+
 **Status:** accepted
 **Date:** 2026-05-04
 **Issue:** [#232](https://github.com/nestrai/kuromaku/issues/232)

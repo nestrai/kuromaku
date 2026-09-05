@@ -111,12 +111,12 @@ enum Command {
     ///
     /// Re-enters a previously paused run at the state recorded in its
     /// manifest. The `<run-id>` is the directory name under
-    /// `~/.koto/stacks/<project>/<run-id>/`; `kuro stack` and the
+    /// `~/.kuro/stacks/<project>/<run-id>/`; `kuro stack` and the
     /// terminal output of the original `kuro run` both name it. The
     /// project is derived from the cwd, identical to `kuro run` --
     /// cross-project resume is not in v1's scope.
     Resume {
-        /// Run identifier as it appears under `~/.koto/stacks/<project>/`.
+        /// Run identifier as it appears under `~/.kuro/stacks/<project>/`.
         run_id: String,
 
         /// Inline human input body (issue #360).
@@ -258,7 +258,7 @@ enum StackAction {
     /// derive it from the cwd, since the typical erasure use case is
     /// targeting a project that is no longer the active directory.
     Purge {
-        /// Project name as it appears under `~/.koto/stacks/`. Must be a
+        /// Project name as it appears under `~/.kuro/stacks/`. Must be a
         /// single path segment (no `/`, `..`, or leading `.`).
         project: String,
 
@@ -370,20 +370,38 @@ fn cmd_context(format: ContextFormat) -> Result<()> {
 /// usable from non-CLI callers (a future MCP tool, scripted use) without
 /// dragging confirmation logic along.
 fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
-    let root = stack::stack_root();
-    // `plan_purge` runs the full validation chain (string shape,
-    // containment) and returns the same diagnostics `purge_project` would
-    // -- so dry-run and live mode behave identically up to the deletion.
-    let report = stack::plan_purge(&root, project).map_err(format_purge_error)?;
+    print_legacy_stacks_notice();
+    let canonical = stack::stack_root();
+    let legacy = stack::legacy_stack_root();
+    // Plan both roots before confirming. An upgraded project can have run
+    // history in both locations; one purge must remove both copies.
+    let mut plans = Vec::new();
+    for root in [&canonical, &legacy] {
+        match stack::plan_purge(root, project) {
+            Ok(report) => plans.push((root, report)),
+            Err(stack::StackError::ProjectNotFound(_, _)) => {}
+            Err(e) => return Err(format_purge_error(e)),
+        }
+    }
+    if plans.is_empty() {
+        return Err(format_purge_error(stack::StackError::ProjectNotFound(
+            project.to_string(),
+            canonical.join(project),
+        )));
+    }
 
-    eprintln!(
-        "stack '{}': {} run(s), {} file(s), {} byte(s) at {}",
-        report.project,
-        report.run_count,
-        report.file_count,
-        report.byte_size,
-        report.path.display()
-    );
+    for (root, report) in &plans {
+        let label = if *root == &legacy { "legacy " } else { "" };
+        eprintln!(
+            "{label}stack '{}': {} run(s), {} file(s), {} byte(s) at {}",
+            report.project,
+            report.run_count,
+            report.file_count,
+            report.byte_size,
+            report.path.display()
+        );
+    }
+    let total_runs: usize = plans.iter().map(|(_, report)| report.run_count).sum();
 
     if dry_run {
         eprintln!("dry-run: nothing was deleted");
@@ -397,11 +415,12 @@ fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
                 "refusing to purge non-interactively without --yes\n\nhint: pass --yes to confirm, or run with a TTY attached"
             ));
         }
-        eprint!(
-            "Permanently delete {} run(s) from {}? [y/N] ",
-            report.run_count,
-            report.path.display()
-        );
+        let roots = plans
+            .iter()
+            .map(|(root, _)| root.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" and ");
+        eprint!("Permanently delete {total_runs} run(s) from {roots}? [y/N] ");
         std::io::stderr().flush().ok();
         let mut answer = String::new();
         std::io::stdin()
@@ -413,12 +432,27 @@ fn cmd_stack_purge(project: &str, dry_run: bool, yes: bool) -> Result<()> {
         }
     }
 
-    let report = stack::purge_project(&root, project).map_err(format_purge_error)?;
-    eprintln!(
-        "deleted '{}': {} run(s), {} file(s), {} byte(s)",
-        report.project, report.run_count, report.file_count, report.byte_size
-    );
+    for (root, _) in plans {
+        let report = stack::purge_project(root, project).map_err(format_purge_error)?;
+        eprintln!(
+            "deleted '{}': {} run(s), {} file(s), {} byte(s) from {}",
+            report.project,
+            report.run_count,
+            report.file_count,
+            report.byte_size,
+            root.display()
+        );
+    }
     Ok(())
+}
+
+/// Surface the pre-#398 legacy-stacks notice on stack-touching commands.
+/// One line on stderr, only when `~/.kuro/stacks/` still holds data --
+/// silent for fresh installs and for users who already migrated.
+fn print_legacy_stacks_notice() {
+    if let Some(notice) = stack::legacy_stacks_notice() {
+        eprintln!("{notice}");
+    }
 }
 
 /// Translate a `StackError` from the purge surface into a `color_eyre`
@@ -446,6 +480,7 @@ fn parse_key_value_args(args: &[String]) -> Result<std::collections::HashMap<Str
 }
 
 async fn run_task(agent_names: &[String], task: &str, include_project_context: bool) -> Result<()> {
+    print_legacy_stacks_notice();
     let task_start = Instant::now();
     let koto_dir = Path::new(KOTO_DIR);
 
@@ -610,6 +645,7 @@ async fn run_task(agent_names: &[String], task: &str, include_project_context: b
 /// resolution, audit, run-context construction, step execution, manifest write,
 /// summary print) lives in the library API so MCP and other harnesses share it.
 async fn run_flow(run_args: &RunArgs) -> Result<()> {
+    print_legacy_stacks_notice();
     let role_overrides: Vec<resolver::RoleOverride> = run_args
         .role_overrides
         .iter()
@@ -673,6 +709,7 @@ async fn resume_flow(
 ) -> Result<()> {
     use std::io::{IsTerminal, Read};
 
+    print_legacy_stacks_notice();
     let stdin = std::io::stdin();
     let stdin_isatty = stdin.is_terminal();
     let local = collect_local_human_input(message, message_file, stdin_isatty, || {

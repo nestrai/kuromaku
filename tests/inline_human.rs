@@ -191,7 +191,7 @@ fn run_kuro_inline(
 }
 
 fn latest_run_dir(home: &Path, project_name: &str) -> PathBuf {
-    let stacks = home.join(".koto/stacks").join(project_name);
+    let stacks = home.join(".kuro/stacks").join(project_name);
     std::fs::read_dir(&stacks)
         .unwrap_or_else(|e| panic!("read stacks dir {}: {e}", stacks.display()))
         .filter_map(Result::ok)

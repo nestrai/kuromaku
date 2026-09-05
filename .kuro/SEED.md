@@ -1,10 +1,10 @@
 # kuromaku seed
 
-This seed lives inside the kuromaku repo itself and overlays the
-generic `nestrai/seeds/rust/` cascade with kuromaku-specific
-artefacts. AI assistants working in the kuromaku repo see this seed
-as the highest-priority source -- run `kuro context` for the full
-picture.
+This seed lives inside the kuromaku repo itself and sits at the top of
+the tracked, fully in-repo cascade (`.kuro/` > `seeds/rust/` >
+`seeds/common/`, declared in `.kuro/config.yaml`). AI assistants
+working in the kuromaku repo see this seed as the highest-priority
+source -- run `kuro context` for the full picture.
 
 ## What it contributes
 
@@ -28,19 +28,22 @@ picture.
   verify state runs `just lint && just test`; failure loops back to
   implement with captured output. Local override of the generic
   `implement-issue` from `seeds/rust/` so kuromaku can iterate on
-  its own pipeline without bumping the shared seed.
+  its own pipeline without touching the shared seed.
 - **validate-issues** (graph) -- batch-validates open issues against
   the `issue-quality` rule and reports which ones miss criteria.
 
-## What it does NOT provide
+## What the lower-priority in-repo seeds provide
 
-- Generic developer / reviewer / architect / facilitator personas
-  (`Noah`, `Bella`, `Levi`, `Mika`, ...) -- those come from the
-  `nestrai/seeds/rust/` seed at lower priority.
-- Generic rules (`code-review`, `clean-code`, `extensibility`, ...) --
-  same story.
-- Plan / review / rework flows (`plan-feature`, `review-pr`,
-  `rework-pr`) -- inherited from the rust seed.
+- `seeds/rust/` -- the Rust-stack bucket: the generic developer /
+  reviewer / architect personas (`Noah`, `Bella`, `Levi`) and the
+  example `implement-issue` graph flow.
+- `seeds/common/` -- the cross-cutting bucket: facilitator and
+  fetcher personas (`Mika`, `Minion`).
+
+These are sanitized, self-contained copies (#398): the tracked
+cascade resolves from a fresh clone with no external directories.
+A richer private persona library can be layered on top locally via
+additional seed entries or `--role` overrides.
 
 ## Entry points
 

@@ -19,8 +19,14 @@ Thumbs.db
 .direnv/
 .envrc
 
-# koto runtime state
+# kuro runtime state (plus the legacy .koto/ layout)
+.kuro/state/
 .koto/state/
+
+# Local demo scaffolding -- not a published asset (#398, coordinate with
+# #378). Tracked here instead of .git/info/exclude so the decision travels
+# with the repo and cannot be committed by accident.
+kuro-demo-python-cli/
 
 # AI tool configs
 .claude/

@@ -17,6 +17,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Tag guard (#398): refuse to cut a release whose tag disagrees with
+      # the crate version. Runs in the flake devShell like every other job
+      # (ADR-0008: no setup-just/floating toolchains in workflows).
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - uses: DeterminateSystems/magic-nix-cache-action@v8
+      - run: nix develop --command just check-release-tag "$GITHUB_REF_NAME"
       - run: gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}

@@ -32,11 +32,11 @@ use crate::ui::{self, StepInfo, StepState};
 pub struct RunContext {
     /// Run-ID, format `<flow>-<YYYYMMDD-HHmmss>` (issue #31).
     /// Sortable, human-readable, embeds the flow name so multiple flow types
-    /// can share a project's `~/.koto/stacks/<project>/` directory.
+    /// can share a project's `~/.kuro/stacks/<project>/` directory.
     pub run_id: String,
     pub flow_name: String,
     pub task: String,
-    /// Project-level stack directory (`~/.koto/stacks/<project>/`). Kept for
+    /// Project-level stack directory (`~/.kuro/stacks/<project>/`). Kept for
     /// backward compat -- legacy flat-file callers and tests still reference
     /// it. New runs write into [`RunContext::run_path`].
     pub stack_path: PathBuf,
@@ -114,7 +114,7 @@ impl RunContext {
     /// 1. The caller supplies the existing `run_id` / `run_path` /
     ///    `started_at` instead of generating fresh values. The pause /
     ///    resume contract says the run keeps its original identity --
-    ///    same directory under `~/.koto/stacks/<project>/`, same
+    ///    same directory under `~/.kuro/stacks/<project>/`, same
     ///    timestamp on the manifest -- so that operators see one run,
     ///    not two related ones.
     /// 2. No call to [`unique_run_path`]: the directory already exists
@@ -2142,9 +2142,10 @@ mod flow_api {
     }
 
     /// Resolve the project's stack directory. Explicit config > default of
-    /// `~/.koto/stacks/<project>/`. The `.koto/` home root is intentional
-    /// (see comment trail in #176): a rename here would orphan existing
-    /// users' run history without a migration path.
+    /// `~/.kuro/stacks/<project>/`. The `.kuro/` home root is canonical
+    /// since #398 (superseding the `.koto/` pin from #176); pre-rename run
+    /// history stays readable under `~/.koto/stacks/` and stack-touching
+    /// commands surface a legacy notice instead of migrating user data.
     ///
     /// The home root itself comes from [`crate::stack::stack_root`] so a
     /// future relocation has one source of truth -- and so `kuro stack
@@ -3780,7 +3781,7 @@ Either drop overlays on one binding or fork the agent into separate IDs.",
         // v1 (#338); the v1 invocation is `kuro resume <run-id>` from
         // the same project the original run was started in.
         let stack_path = resolve_stack_path("");
-        let run_path = stack_path.join(run_id);
+        let run_path = stack::existing_run_path(&stack_path.join(run_id));
         if !run_path.is_dir() {
             return Err(eyre!(
                 "run-id '{run_id}' not found under {}\n\nhint: run `ls {}` to see available runs",
